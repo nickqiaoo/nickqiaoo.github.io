@@ -21,7 +21,8 @@ jobs:
       - name: Install pnpm
         uses: pnpm/action-setup@v4
         with:
-          version: 10
+          # 版本由 package.json 的 packageManager 字段决定，
+          # 此处不能再指定 version，否则 action 会因重复声明而报错
           run_install: false
 
       - name: Setup node

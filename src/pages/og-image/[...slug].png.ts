@@ -68,7 +68,9 @@ export async function GET(context: APIContext) {
 	});
 	const svg = await satori(markup(title, postDate), ogOptions);
 	const png = new Resvg(svg).render().asPng();
-	return new Response(png, {
+	// asPng() 返回 Buffer<ArrayBufferLike>，其底层缓冲区可能是 SharedArrayBuffer，
+	// 因而不被 BodyInit 接受；转为 Uint8Array 以满足类型要求。
+	return new Response(new Uint8Array(png), {
 		headers: {
 			"Cache-Control": "public, max-age=31536000, immutable",
 			"Content-Type": "image/png",
