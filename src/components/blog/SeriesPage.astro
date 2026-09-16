@@ -1,0 +1,120 @@
+---
+// Agents 专题页的正文。中文版列全部文章；英文版以中文列表为准，
+// 有译文的换成译文，长文没译文的标"仅中文"并链到中文版，每日追踪没译文的不列。
+import type { CollectionEntry } from "astro:content";
+import FormattedDate from "@/components/FormattedDate.astro";
+import { getAllPosts, getSeriesPosts, getUniqueTagsWithCount, postSlug, postUrl } from "@/data/post";
+import { type Lang, t, tagPath } from "@/i18n";
+
+interface Props {
+	lang: Lang;
+}
+
+const { lang } = Astro.props;
+type Post = CollectionEntry<"post">;
+
+const zhPosts = await getAllPosts("zh");
+const { guide, updates } = getSeriesPosts(zhPosts, "agents");
+
+const enBySlug = new Map<string, Post>();
+if (lang === "en") {
+	for (const p of await getAllPosts("en")) enBySlug.set(postSlug(p), p);
+}
+
+const guideItems = guide.map((zh) => {
+	const en = enBySlug.get(postSlug(zh));
+	return { post: lang === "en" && en ? en : zh, zhOnly: lang === "en" && !en };
+});
+const updateItems =
+	lang === "en"
+		? updates.flatMap((zh) => enBySlug.get(postSlug(zh)) ?? [])
+		: updates;
+const zhOnlyUpdates = updates.length - updateItems.length;
+
+// 标签来自当前语言列出的文章
+const tags = getUniqueTagsWithCount([...guideItems.map((g) => g.post), ...updateItems]);
+---
+
+<h1 class="title mb-4">{t(lang, "series.name")}</h1>
+<p class="mb-4">{t(lang, "series.intro")}</p>
+{
+	tags.length > 0 && (
+		<ul class="flex flex-wrap gap-x-3 gap-y-1 text-sm">
+			{tags.map(([tag, count]) => (
+				<li>
+					<a class="cactus-link" href={tagPath(lang, tag)}>#{tag}</a>
+					<span class="ms-1 text-gray-600 dark:text-gray-400">{count}</span>
+				</li>
+			))}
+		</ul>
+	)
+}
+
+<section class="mt-12">
+	<h2 class="title text-accent mb-2 text-xl">{t(lang, "series.guide")}</h2>
+	<p class="mb-6 text-sm text-gray-600 dark:text-gray-400">{t(lang, "series.guideHint")}</p>
+	{
+		guideItems.length === 0 ? (
+			<p>{t(lang, "series.empty")}</p>
+		) : (
+			<ol class="space-y-5">
+				{guideItems.map(({ post, zhOnly }, i) => (
+					<li class="grid grid-cols-[2rem_1fr] gap-x-2">
+						<span class="text-accent font-semibold">{i + 1}</span>
+						<div>
+							<a class="cactus-link font-semibold" data-astro-prefetch href={postUrl(post)}>
+								{post.data.title}
+							</a>
+							{zhOnly && (
+								<span class="bg-quote/5 text-quote ms-2 rounded-lg px-2 py-0.5 text-xs">
+									{t(lang, "series.zhOnly")}
+								</span>
+							)}
+							<p class="mt-1 text-sm text-gray-600 dark:text-gray-400">{post.data.description}</p>
+						</div>
+					</li>
+				))}
+			</ol>
+		)
+	}
+</section>
+
+<section class="mt-16">
+	<h2 class="title text-accent mb-6 text-xl">{t(lang, "series.updates")}</h2>
+	{
+		updateItems.length === 0 ? (
+			<p>{t(lang, "series.empty")}</p>
+		) : (
+			<ul class="space-y-6">
+				{updateItems.map((p) => (
+					<li class="grid gap-x-4 gap-y-1 sm:grid-cols-[auto_1fr]">
+						<FormattedDate
+							class="min-w-30 font-semibold text-gray-600 dark:text-gray-400"
+							date={p.data.publishDate}
+						/>
+						<div>
+							<a class="cactus-link" data-astro-prefetch href={postUrl(p)}>
+								{p.data.title}
+							</a>
+							<p class="mt-1 text-sm text-gray-600 dark:text-gray-400">{p.data.description}</p>
+							{p.data.tags.length > 0 && (
+								<p class="mt-1 text-sm">
+									{p.data.tags.map((tag) => (
+										<a class="hover:text-link me-2" href={tagPath(lang, tag)}>#{tag}</a>
+									))}
+								</p>
+							)}
+						</div>
+					</li>
+				))}
+			</ul>
+		)
+	}
+	{
+		zhOnlyUpdates > 0 && (
+			<p class="mt-6 text-sm text-gray-600 dark:text-gray-400">
+				<a class="cactus-link" href="/agents/">{t(lang, "series.moreZh", { n: zhOnlyUpdates })}</a>
+			</p>
+		)
+	}
+</section>

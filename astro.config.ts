@@ -16,6 +16,7 @@ import rehypeUnwrapImages from "rehype-unwrap-images";
 // Remark plugins
 import remarkDirective from "remark-directive"; /* Handle ::: directives as nodes */
 import remarkMath from "remark-math";
+import { rehypeScrollableTables } from "./src/plugins/rehype-scrollable-tables";
 import { remarkAdmonitions } from "./src/plugins/remark-admonitions"; /* Add admonitions */
 import { remarkGithubCard } from "./src/plugins/remark-github-card";
 import { remarkReadingTime } from "./src/plugins/remark-reading-time";
@@ -24,6 +25,11 @@ import { expressiveCodeOptions, siteConfig } from "./src/site.config";
 // https://astro.build/config
 export default defineConfig({
 	site: siteConfig.url,
+	i18n: {
+		defaultLocale: "zh",
+		locales: ["zh", "en"],
+		routing: { prefixDefaultLocale: false },
+	},
 	image: {
 		domains: ["webmention.io"],
 	},
@@ -70,6 +76,7 @@ export default defineConfig({
 	],
 	markdown: {
 		rehypePlugins: [
+			rehypeScrollableTables,
 			rehypeHeadingIds,
 			[rehypeAutolinkHeadings, { behavior: "wrap", properties: { className: ["not-prose"] } }],
 			[
@@ -94,6 +101,9 @@ export default defineConfig({
 	vite: {
 		optimizeDeps: {
 			exclude: ["@resvg/resvg-js"],
+			// Only loaded via dynamic import(), so Vite would discover them late and re-optimize,
+			// leaving already-loaded pages with a stale "Outdated Optimize Dep" (504) URL.
+			include: ["mermaid", "svg-pan-zoom"],
 		},
 		plugins: [tailwind(), rawFonts([".ttf", ".woff"])],
 	},

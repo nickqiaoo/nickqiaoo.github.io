@@ -1,0 +1,63 @@
+---
+// 首页正文：自我介绍、最近文章、最近笔记。每日追踪只在专题页显示，不占首页。
+import type { CollectionEntry } from "astro:content";
+import SocialList from "@/components/SocialList.astro";
+import PostPreview from "@/components/blog/PostPreview.astro";
+import Note from "@/components/note/Note.astro";
+import { getAllNotes } from "@/data/note";
+import { getAllPosts, isSeriesUpdate } from "@/data/post";
+import { type Lang, notesPath, postsPath, t } from "@/i18n";
+import { collectionDateSort } from "@/utils/date";
+
+interface Props {
+	lang: Lang;
+}
+const { lang } = Astro.props;
+
+const MAX_POSTS = 10;
+const posts = (await getAllPosts(lang))
+	.filter((p) => !isSeriesUpdate(p))
+	.sort(collectionDateSort)
+	.slice(0, MAX_POSTS) as CollectionEntry<"post">[];
+
+const MAX_NOTES = 5;
+const notes = (await getAllNotes(lang)).sort(collectionDateSort).slice(0, MAX_NOTES);
+---
+
+<section>
+	<h1 class="title mb-6">{t(lang, "home.greeting")}</h1>
+	<p class="mb-4">{t(lang, "home.intro")}</p>
+	<SocialList />
+</section>
+{
+	posts.length > 0 && (
+		<section class="mt-16">
+			<h2 class="title text-accent mb-6 text-xl">
+				<a href={postsPath(lang)}>{t(lang, "home.posts")}</a>
+			</h2>
+			<ul class="space-y-6" role="list">
+				{posts.map((p) => (
+					<li class="grid gap-2 sm:grid-cols-[auto_1fr]">
+						<PostPreview post={p} />
+					</li>
+				))}
+			</ul>
+		</section>
+	)
+}
+{
+	notes.length > 0 && (
+		<section class="mt-16">
+			<h2 class="title text-accent mb-6 text-xl">
+				<a href={notesPath(lang)}>{t(lang, "home.notes")}</a>
+			</h2>
+			<ul class="space-y-6" role="list">
+				{notes.map((note) => (
+					<li>
+						<Note note={note} as="h3" isPreview />
+					</li>
+				))}
+			</ul>
+		</section>
+	)
+}

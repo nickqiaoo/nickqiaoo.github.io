@@ -1,0 +1,30 @@
+---
+// 标签总览页正文
+import { getAllPosts, getUniqueTagsWithCount } from "@/data/post";
+import { type Lang, t, tagPath } from "@/i18n";
+
+interface Props {
+	lang: Lang;
+}
+const { lang } = Astro.props;
+const allTags = getUniqueTagsWithCount(await getAllPosts(lang));
+---
+
+<h1 class="title mb-6">{t(lang, "tags.title")}</h1>
+<ul class="space-y-6">
+	{
+		allTags.map(([tag, val]) => (
+			<li class="flex items-center gap-x-2">
+				<a
+					class="cactus-link inline-block"
+					data-astro-prefetch
+					href={tagPath(lang, tag)}
+					title={`${t(lang, "tags.viewWith")}: ${tag}`}
+				>
+					&#35;{tag}
+				</a>
+				<span class="inline-block">- {t(lang, "tags.count", { n: val })}</span>
+			</li>
+		))
+	}
+</ul>

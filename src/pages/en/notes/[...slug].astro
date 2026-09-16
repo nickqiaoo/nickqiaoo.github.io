@@ -1,0 +1,28 @@
+---
+import Note from "@/components/note/Note.astro";
+import { getAllNotes, getNoteTranslation, noteSlug, noteUrl } from "@/data/note";
+import PageLayout from "@/layouts/Base.astro";
+import type { GetStaticPaths, InferGetStaticPropsType } from "astro";
+
+export const getStaticPaths = (async () => {
+	const allNotes = await getAllNotes("en");
+	return allNotes.map((note) => ({
+		params: { slug: noteSlug(note) },
+		props: { note },
+	}));
+}) satisfies GetStaticPaths;
+
+export type Props = InferGetStaticPropsType<typeof getStaticPaths>;
+
+const { note } = Astro.props;
+const translation = await getNoteTranslation(note);
+const meta = {
+	alternateHref: translation ? noteUrl(translation) : undefined,
+	description: note.data.description || note.data.title,
+	title: note.data.title,
+};
+---
+
+<PageLayout meta={meta}>
+	<Note as="h1" note={note} />
+</PageLayout>

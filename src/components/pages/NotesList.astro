@@ -1,0 +1,40 @@
+---
+// 笔记列表页正文
+import type { CollectionEntry } from "astro:content";
+import Pagination from "@/components/Paginator.astro";
+import Note from "@/components/note/Note.astro";
+import { type Lang, langPrefix, t } from "@/i18n";
+import type { Page } from "astro";
+import { Icon } from "astro-icon/components";
+
+interface Props {
+	lang: Lang;
+	page: Page<CollectionEntry<"note">>;
+}
+const { lang, page } = Astro.props;
+
+const paginationProps = {
+	...(page.url.prev && { prevUrl: { text: t(lang, "page.prev"), url: page.url.prev } }),
+	...(page.url.next && { nextUrl: { text: t(lang, "page.next"), url: page.url.next } }),
+};
+---
+
+<section>
+	<h1 class="title mb-6 flex items-center gap-3">
+		{t(lang, "notes.title")}
+		<a class="text-accent" href={`${langPrefix(lang)}/notes/rss.xml`} target="_blank">
+			<span class="sr-only">RSS feed</span>
+			<Icon aria-hidden="true" class="h-6 w-6" focusable="false" name="mdi:rss" />
+		</a>
+	</h1>
+	<ul class="mt-6 space-y-8 text-start">
+		{
+			page.data.map((note) => (
+				<li>
+					<Note note={note} as="h2" isPreview />
+				</li>
+			))
+		}
+	</ul>
+	<Pagination {...paginationProps} />
+</section>

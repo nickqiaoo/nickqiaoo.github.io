@@ -1,0 +1,398 @@
+<script>
+	const diagrams = new Map<HTMLElement, { source: string; output: HTMLDivElement }>();
+	let revision = 0;
+	let queue = Promise.resolve();
+
+	function renderDiagrams() {
+		const current = ++revision;
+		queue = queue
+			.then(async () => {
+				if (current !== revision) return;
+				for (const pre of document.querySelectorAll<HTMLElement>('pre[data-language="mermaid"]')) {
+					if (diagrams.has(pre)) continue;
+					const lines = pre.querySelectorAll(".ec-line .code");
+					const source = lines.length
+						? Array.from(lines, (line) => line.textContent ?? "").join("\n")
+						: (pre.textContent ?? "");
+					const output = document.createElement("div");
+					output.className = "mermaid-diagram not-prose";
+					output.hidden = true;
+					(pre.closest(".expressive-code") ?? pre).after(output);
+					diagrams.set(pre, { source, output });
+				}
+				if (!diagrams.size) return;
+				const { default: mermaid } = await import("mermaid");
+				mermaid.initialize({
+					startOnLoad: false,
+					securityLevel: "strict",
+					suppressErrorRendering: true,
+					theme: document.documentElement.dataset.theme === "dark" ? "dark" : "default",
+				});
+				let index = 0;
+				for (const [pre, { source, output }] of diagrams) {
+					if (!pre.isConnected) {
+						diagrams.delete(pre);
+						continue;
+					}
+					if (current !== revision) return;
+					const original = pre.closest<HTMLElement>(".expressive-code") ?? pre;
+					try {
+						const { svg, bindFunctions } = await mermaid.render(
+							`mermaid-${current}-${index++}`,
+							source,
+						);
+						output.innerHTML = svg;
+						output.hidden = false;
+						original.hidden = true;
+						bindFunctions?.(output);
+						const open = document.createElement("button");
+						open.className = "mermaid-open";
+						open.innerHTML =
+							'<svg aria-hidden="true" viewBox="0 0 24 24" width="18" height="18"><path fill="currentColor" d="M10 21v-2H6.41l4.5-4.5l-1.41-1.41l-4.5 4.5V14H3v7zm4.5-10.09l4.5-4.5V10h2V3h-7v2h3.59l-4.5 4.5z"/></svg><span>查看大图</span>';
+						open.type = "button";
+						open.addEventListener("click", () => {
+							openViewer(output).catch((error) =>
+								console.error("Diagram viewer could not be opened", error),
+							);
+						});
+						output.prepend(open);
+					} catch (error) {
+						original.hidden = false;
+						output.hidden = true;
+						console.error("Mermaid diagram could not be rendered", error);
+					}
+				}
+			})
+			.catch((error) => console.error("Mermaid could not be loaded", error));
+	}
+
+	const touchEvents = ["touchstart", "touchmove", "touchend", "touchcancel"] as const;
+
+	// svg-pan-zoom has no pinch support: one finger pans, two fingers zoom around their midpoint.
+	function createTouchHandler() {
+		let listener: ((event: TouchEvent) => void) | undefined;
+		let svgElement: SVGSVGElement | undefined;
+		return {
+			haltEventListeners: ["touchstart", "touchmove", "touchend", "touchleave", "touchcancel"],
+			init({ svgElement: svg, instance }: { svgElement: SVGSVGElement; instance: SvgPanZoom.Instance }) {
+				let last: { x: number; y: number; distance: number; count: number } | undefined;
+				svgElement = svg;
+				listener = (event) => {
+					event.preventDefault();
+					const touches = Array.from(event.touches).slice(0, 2);
+					if (!touches.length) {
+						last = undefined;
+						return;
+					}
+					const rect = svg.getBoundingClientRect();
+					const x = touches.reduce((sum, touch) => sum + touch.clientX, 0) / touches.length - rect.left;
+					const y = touches.reduce((sum, touch) => sum + touch.clientY, 0) / touches.length - rect.top;
+					const distance =
+						touches.length === 2
+							? Math.hypot(
+									touches[0]!.clientX - touches[1]!.clientX,
+									touches[0]!.clientY - touches[1]!.clientY,
+								)
+							: 0;
+					// A finger was added or lifted: start a new gesture from the current position.
+					if (last?.count === touches.length) {
+						if (distance && last.distance) instance.zoomAtPointBy(distance / last.distance, { x, y });
+						instance.panBy({ x: x - last.x, y: y - last.y });
+					}
+					last = { x, y, distance, count: touches.length };
+				};
+				for (const type of touchEvents) svg.addEventListener(type, listener, { passive: false });
+			},
+			destroy() {
+				if (!listener || !svgElement) return;
+				for (const type of touchEvents) svgElement.removeEventListener(type, listener);
+			},
+		};
+	}
+
+	async function openViewer(output: HTMLDivElement) {
+		const { default: svgPanZoom } = await import("svg-pan-zoom");
+		if (document.querySelector(".mermaid-viewer[open]")) return;
+		const svg = output.querySelector<SVGSVGElement>(":scope > svg");
+		if (!svg) return;
+		const dialog = document.createElement("dialog");
+		dialog.className = "mermaid-viewer";
+		dialog.setAttribute("aria-label", "图表大图查看器");
+		dialog.innerHTML = `<header class="mermaid-header"><div><strong>图表预览</strong><span>使用 ＋ / − 缩放 · 拖动平移</span></div><button type="button" data-action="close" aria-label="关闭" title="关闭 (Esc)" autofocus><svg aria-hidden="true" viewBox="0 0 24 24" width="18" height="18"><path fill="currentColor" d="M19 6.41L17.59 5L12 10.59L6.41 5L5 6.41L10.59 12L5 17.59L6.41 19L12 13.41L17.59 19L19 17.59L13.41 12z"/></svg></button></header><div class="mermaid-canvas" tabindex="0" aria-label="图表"></div><div class="mermaid-toolbar" role="toolbar" aria-label="图表缩放"><button type="button" data-action="out" aria-label="缩小" title="缩小"><svg aria-hidden="true" viewBox="0 0 24 24" width="18" height="18"><path fill="currentColor" d="M19 13H5v-2h14z"/></svg></button><button type="button" data-action="in" aria-label="放大" title="放大"><svg aria-hidden="true" viewBox="0 0 24 24" width="18" height="18"><path fill="currentColor" d="M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6z"/></svg></button><span class="mermaid-divider"></span><button type="button" data-action="fit"><svg aria-hidden="true" viewBox="0 0 24 24" width="18" height="18"><path fill="currentColor" d="M17 4h3c1.1 0 2 .9 2 2v2h-2V6h-3zM4 8V6h3V4H4c-1.1 0-2 .9-2 2v2zm16 8v2h-3v2h3c1.1 0 2-.9 2-2v-2zM7 18H4v-2H2v2c0 1.1.9 2 2 2h3zm9-8v4H8v-4zm2-2H6v8h12z"/></svg><span>适应窗口</span></button><button type="button" data-action="actual" title="原始大小">100%</button></div>`;
+		const canvas = dialog.querySelector<HTMLDivElement>(".mermaid-canvas")!;
+		// Move the SVG instead of cloning it: Mermaid's IDs and marker references stay unique.
+		const placeholder = document.createComment("diagram");
+		svg.replaceWith(placeholder);
+		canvas.append(svg);
+		const originalStyle = svg.getAttribute("style");
+		const originalMarkup = svg.innerHTML;
+		const originalViewBox = svg.getAttribute("viewBox");
+		svg.style.cssText = "width:100%;height:100%;max-width:none";
+		document.body.append(dialog);
+		dialog.showModal();
+		const panZoom = svgPanZoom(svg, {
+			fit: true,
+			center: true,
+			minZoom: 0.1,
+			maxZoom: 30,
+			customEventsHandler: createTouchHandler(),
+		});
+		dialog.querySelector('[data-action="in"]')!.addEventListener("click", () => panZoom.zoomIn());
+		dialog.querySelector('[data-action="out"]')!.addEventListener("click", () => panZoom.zoomOut());
+		dialog
+			.querySelector('[data-action="fit"]')!
+			.addEventListener("click", () => panZoom.resize().fit().center());
+		dialog.querySelector('[data-action="actual"]')!.addEventListener("click", () => {
+			panZoom.zoom(panZoom.getZoom() / panZoom.getSizes().realZoom);
+			panZoom.center();
+		});
+		let lastWidth = canvas.clientWidth;
+		let lastHeight = canvas.clientHeight;
+		const resize = new ResizeObserver(() => {
+			if (canvas.clientWidth === lastWidth && canvas.clientHeight === lastHeight) return;
+			lastWidth = canvas.clientWidth;
+			lastHeight = canvas.clientHeight;
+			panZoom.resize().fit().center();
+		});
+		resize.observe(canvas);
+		// Block background scrolling inside the dialog instead of toggling body overflow:
+		// iOS Safari can leave the page unscrollable after restoring it.
+		const blockScroll = (event: Event) => event.preventDefault();
+		dialog.addEventListener("wheel", blockScroll, { passive: false });
+		dialog.addEventListener("touchmove", blockScroll, { passive: false });
+		// Stop iOS Safari's native page pinch-zoom while the viewer is open.
+		dialog.addEventListener("gesturestart", blockScroll);
+		let closed = false;
+		// Runs from the close button directly and from the close event (Esc, back gesture), so the
+		// diagram always returns to the page even if the event never fires or svg-pan-zoom throws.
+		const cleanup = () => {
+			if (closed) return;
+			closed = true;
+			resize.disconnect();
+			try {
+				panZoom.destroy();
+			} catch (error) {
+				console.error("Diagram viewer could not be destroyed", error);
+			}
+			svg.innerHTML = originalMarkup;
+			if (originalViewBox !== null) svg.setAttribute("viewBox", originalViewBox);
+			if (originalStyle === null) svg.removeAttribute("style");
+			else svg.setAttribute("style", originalStyle);
+			placeholder.replaceWith(svg);
+			if (dialog.open) dialog.close();
+			dialog.remove();
+		};
+		dialog.querySelector('[data-action="close"]')!.addEventListener("click", cleanup);
+		dialog.addEventListener("close", cleanup, { once: true });
+	}
+
+	renderDiagrams();
+	document.addEventListener("astro:page-load", renderDiagrams);
+	new MutationObserver(renderDiagrams).observe(document.documentElement, {
+		attributes: true,
+		attributeFilter: ["data-theme"],
+	});
+</script>
+
+<style is:global>
+	.mermaid-diagram {
+		margin-block: 1.5rem;
+		overflow-x: auto;
+		text-align: center;
+	}
+	.mermaid-diagram svg {
+		display: block;
+		margin-inline: auto;
+		height: auto;
+	}
+
+	.mermaid-open,
+	.mermaid-viewer button {
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		gap: 6px;
+		border: 0;
+		border-radius: 7px;
+		background: transparent;
+		color: inherit;
+		font:
+			500 13px/1.4 system-ui,
+			sans-serif;
+		cursor: pointer;
+		transition:
+			background 150ms,
+			color 150ms;
+	}
+	.mermaid-open {
+		display: flex;
+		width: fit-content;
+		margin: 0 0 12px auto;
+		padding: 7px 10px;
+		color: color-mix(in srgb, var(--color-global-text) 70%, transparent);
+		background: color-mix(in srgb, var(--color-global-text) 5%, transparent);
+	}
+	.mermaid-open > svg {
+		width: 15px;
+		height: 15px;
+		margin: 0;
+	}
+	.mermaid-open:hover,
+	.mermaid-viewer button:hover {
+		background: color-mix(in srgb, var(--color-global-text) 9%, transparent);
+		color: var(--color-accent-2);
+	}
+	.mermaid-open:focus-visible,
+	.mermaid-viewer button:focus-visible,
+	.mermaid-canvas:focus-visible {
+		outline: 2px solid var(--color-link);
+		outline-offset: 3px;
+	}
+	.mermaid-viewer {
+		--viewer-line: color-mix(in srgb, var(--color-global-text) 12%, transparent);
+		box-sizing: border-box;
+		position: fixed;
+		inset: 0;
+		margin: auto;
+		width: calc(100vw - 64px);
+		height: calc(100dvh - 64px);
+		max-width: 1600px;
+		max-height: none;
+		padding: 0;
+		overflow: hidden;
+		overscroll-behavior: contain;
+		touch-action: none;
+		border: 1px solid var(--viewer-line);
+		border-radius: 16px;
+		background: var(--color-global-bg);
+		color: var(--color-global-text);
+		box-shadow: 0 24px 100px #0004;
+		font-family: system-ui, sans-serif;
+	}
+	.mermaid-viewer::backdrop {
+		background: #10151880;
+		backdrop-filter: blur(5px);
+	}
+	.mermaid-viewer[open] {
+		display: flex;
+		flex-direction: column;
+	}
+	.mermaid-header {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		flex-shrink: 0;
+		padding: 16px 20px;
+		border-bottom: 1px solid var(--viewer-line);
+	}
+	.mermaid-header > div {
+		display: flex;
+		align-items: baseline;
+		gap: 16px;
+	}
+	.mermaid-header strong {
+		font-size: 14px;
+		font-weight: 600;
+	}
+	.mermaid-header span {
+		font-size: 12px;
+		opacity: 0.6;
+	}
+	.mermaid-header button {
+		width: 32px;
+		height: 32px;
+	}
+	.mermaid-toolbar {
+		position: absolute;
+		bottom: 20px;
+		left: 50%;
+		transform: translateX(-50%);
+		display: flex;
+		align-items: center;
+		gap: 3px;
+		padding: 5px;
+		border: 1px solid var(--viewer-line);
+		border-radius: 10px;
+		background: var(--color-global-bg);
+		box-shadow: 0 4px 20px #0001;
+	}
+	.mermaid-toolbar button {
+		min-width: 36px;
+		height: 34px;
+		padding: 0 10px;
+		white-space: nowrap;
+	}
+	.mermaid-divider {
+		height: 18px;
+		border-left: 1px solid var(--viewer-line);
+		margin: 0 4px;
+	}
+	.mermaid-canvas {
+		position: relative;
+		flex: 1;
+		min-height: 0;
+		margin: 24px 24px 80px;
+		overflow: hidden;
+		cursor: grab;
+		touch-action: none;
+		user-select: none;
+	}
+	.mermaid-canvas:active {
+		cursor: grabbing;
+	}
+	@media (max-width: 600px), (max-height: 500px) and (max-width: 950px) {
+		.mermaid-viewer {
+			width: 100%;
+			height: 100dvh;
+			max-width: 100%;
+			margin: 0;
+			border: 0;
+			border-radius: 0;
+			padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom)
+				env(safe-area-inset-left);
+		}
+		.mermaid-header {
+			padding: 8px 12px;
+			gap: 8px;
+		}
+		.mermaid-header > div {
+			display: grid;
+			min-width: 0;
+			gap: 3px;
+		}
+		.mermaid-header button {
+			flex: 0 0 44px;
+			height: 44px;
+		}
+		.mermaid-canvas {
+			min-width: 0;
+			margin: 8px;
+		}
+		.mermaid-toolbar {
+			position: static;
+			transform: none;
+			align-self: stretch;
+			flex: 0 0 auto;
+			justify-content: center;
+			gap: 2px;
+			padding: 8px;
+			border-width: 1px 0 0;
+			border-radius: 0;
+			box-shadow: none;
+		}
+		.mermaid-toolbar button {
+			min-width: 44px;
+			height: 44px;
+			padding: 0 8px;
+		}
+		.mermaid-divider {
+			margin: 0 2px;
+		}
+	}
+	@media (prefers-reduced-motion: reduce) {
+		.mermaid-open,
+		.mermaid-viewer button {
+			transition: none;
+		}
+	}
+</style>

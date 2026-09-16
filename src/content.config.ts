@@ -1,5 +1,22 @@
 import { defineCollection, z } from "astro:content";
 import { glob } from "astro/loaders";
+import { slug as slugify } from "github-slugger";
+
+/**
+ * 文章和笔记的 id 规则。和 Astro 默认规则一样按路径生成，
+ * 只多一条：文件名以 .en 结尾（index.en.md、foo.en.md）是英文版，id 加 en/ 前缀。
+ */
+function localizedId({ entry }: { entry: string }) {
+	const withoutExt = entry.replace(/\.mdx?$/, "");
+	const isEn = withoutExt.endsWith(".en");
+	const clean = isEn ? withoutExt.slice(0, -3) : withoutExt;
+	const id = clean
+		.split("/")
+		.map((segment) => slugify(segment))
+		.join("/")
+		.replace(/\/index$/, "");
+	return isEn ? `en/${id}` : id;
+}
 
 function removeDupsAndLowerCase(array: string[]) {
 	return [...new Set(array.map((str) => str.toLowerCase()))];
@@ -12,7 +29,7 @@ const baseSchema = z.object({
 });
 
 const post = defineCollection({
-	loader: glob({ base: "./src/content/post", pattern: "**/*.{md,mdx}" }),
+	loader: glob({ base: "./src/content/post", pattern: "**/*.{md,mdx}", generateId: localizedId }),
 	schema: ({ image }) =>
 		baseSchema.extend({
 			description: z.string(),
@@ -23,6 +40,10 @@ const post = defineCollection({
 				})
 				.optional(),
 			draft: z.boolean().default(false),
+			// 所属专题。目前只有 agents 一个，写错构建时会报错。
+			series: z.enum(["agents"]).optional(),
+			// 专题内的阅读顺序。有这个字段的文章进专题页的"从这里开始读"，没有的算日常更新。
+			seriesOrder: z.number().optional(),
 			ogImage: z.string().optional(),
 			tags: z.array(z.string()).default([]).transform(removeDupsAndLowerCase),
 			publishDate: z
@@ -37,7 +58,7 @@ const post = defineCollection({
 });
 
 const note = defineCollection({
-	loader: glob({ base: "./src/content/note", pattern: "**/*.{md,mdx}" }),
+	loader: glob({ base: "./src/content/note", pattern: "**/*.{md,mdx}", generateId: localizedId }),
 	schema: baseSchema.extend({
 		description: z.string().optional(),
 		publishDate: z

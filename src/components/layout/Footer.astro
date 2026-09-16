@@ -1,6 +1,12 @@
 ---
-import { menuLinks, siteConfig } from "@/site.config";
+import { type Lang, menuLinks, t } from "@/i18n";
+import { siteConfig } from "@/site.config";
 
+interface Props {
+	lang: Lang;
+}
+
+const { lang } = Astro.props;
 const year = new Date().getFullYear();
 ---
 
@@ -15,9 +21,9 @@ const year = new Date().getFullYear();
 		aria-labelledby="footer_links"
 		class="flex gap-x-2 sm:gap-x-0 sm:divide-x sm:divide-gray-500"
 	>
-		<p id="footer_links" class="sr-only">More on this site</p>
+		<p id="footer_links" class="sr-only">{t(lang, "nav.footer")}</p>
 		{
-			menuLinks.map((link) => (
+			menuLinks(lang).map((link) => (
 				<a class="hover:text-global-text px-4 py-2 hover:underline sm:py-0" href={link.path}>
 					{link.title}
 				</a>

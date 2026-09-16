@@ -1,0 +1,15 @@
+---
+import SeriesPage from "@/components/blog/SeriesPage.astro";
+import { t } from "@/i18n";
+import PageLayout from "@/layouts/Base.astro";
+
+const meta = {
+	alternateHref: "/agents/",
+	description: t("en", "series.desc"),
+	title: t("en", "series.name"),
+};
+---
+
+<PageLayout meta={meta}>
+	<SeriesPage lang="en" />
+</PageLayout>

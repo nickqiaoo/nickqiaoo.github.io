@@ -1,6 +1,6 @@
 import RobotoMonoBold from "@/assets/roboto-mono-700.ttf";
 import RobotoMono from "@/assets/roboto-mono-regular.ttf";
-import { getAllPosts } from "@/data/post";
+import { getAllPostsAllLangs } from "@/data/post";
 import { siteConfig } from "@/site.config";
 import { getFormattedDate } from "@/utils/date";
 import { Resvg } from "@resvg/resvg-js";
@@ -77,7 +77,7 @@ export async function GET(context: APIContext) {
 }
 
 export async function getStaticPaths() {
-	const posts = await getAllPosts();
+	const posts = await getAllPostsAllLangs();
 	return posts
 		.filter(({ data }) => !data.ogImage)
 		.map((post) => ({

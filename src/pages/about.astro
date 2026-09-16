@@ -1,43 +1,16 @@
 ---
+import AboutContent from "@/components/AboutContent.astro";
+import { t } from "@/i18n";
 import PageLayout from "@/layouts/Base.astro";
 
 const meta = {
-	description: "I'm a starter theme for Astro.build",
-	title: "About",
+	alternateHref: "/en/about/",
+	description: t("zh", "about.title"),
+	title: t("zh", "about.title"),
 };
 ---
 
 <PageLayout meta={meta}>
-	<h1 class="title mb-6">About</h1>
-	<div class="prose prose-sm prose-cactus max-w-none">
-		<p>
-			Hi, I'm nickqiao. I’m a software engineer with broad technical experience, including game development at 
-			Shanda Games and web microservices at Bilibili and Baidu.
-		</p>
-		<p>I have experience with game backends, microservices, distributed systems, and Web3 architecture. 
-			Passionate about low-level systems, I enjoy exploring how things work under the hood. 
-			Skilled in C, C++, Go, TypeScript, Linux system programming, and network programming. 
-			Well-versed in blockchain technologies, including Layer2 and zero-knowledge proofs, 
-			I built <a
-				class="cactus-link inline-block"
-				href="https://btceden.org"
-				rel="noreferrer"
-				target="_blank">BTCEden</a
-			> with others, the “L2BEAT” of BTC Layer2. Currently, I'm diving into AI, enjoying vibe coding with
-			claudecode and built these projects:</p>
-		<ul class="list-inside list-disc" role="list">
-			<li><a
-				class="cactus-link inline-block"
-				href="https://augy.nickqiao.asia"
-				rel="noreferrer"
-				target="_blank">Augy</a>  An AI-powered GUI agent with built-in vm.</li>
-			<li><a
-				class="cactus-link inline-block"
-				href="https://chatcode.top"
-				rel="noreferrer"
-				target="_blank">ChatCode</a> A vibe coding telegram bot integrated with ClaudeCode.</li>
-		</ul>
-		<p>I'm also interested in finance and follow a long-term value investing philosophy, with a firm belief in Tesla as a long-term shareholder.</p>
-		<p>I'm deeply curious about new technologies and passionate about continuous learning.</p>
-	</div>
+	<h1 class="title mb-6">{t("zh", "about.title")}</h1>
+	<AboutContent />
 </PageLayout>

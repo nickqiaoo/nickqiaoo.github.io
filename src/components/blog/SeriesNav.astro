@@ -1,0 +1,68 @@
+---
+// 文章页顶部的专题导航：这篇属于哪个专题、第几篇，以及上一篇和下一篇。
+import type { CollectionEntry } from "astro:content";
+import { getAllPosts, getSeriesPosts, postLang, postUrl } from "@/data/post";
+import { seriesPath, t } from "@/i18n";
+
+interface Props {
+	post: CollectionEntry<"post">;
+}
+
+const { post } = Astro.props;
+const series = post.data.series;
+const lang = postLang(post);
+
+let position = "";
+let prev: CollectionEntry<"post"> | undefined;
+let next: CollectionEntry<"post"> | undefined;
+
+if (series) {
+	// 上一篇下一篇只在同语言的文章里找
+	const { guide, updates } = getSeriesPosts(await getAllPosts(lang), series);
+	const isGuide = post.data.seriesOrder !== undefined;
+	// 长文按阅读顺序排；每日追踪按时间排，"上一篇"指更早的一天
+	const list = isGuide ? guide : [...updates].reverse();
+	const i = list.findIndex((p) => p.id === post.id);
+	prev = list[i - 1];
+	next = list[i + 1];
+	const label = isGuide ? t(lang, "series.guide") : t(lang, "series.updates");
+	position = `${label} · ${t(lang, "series.position", { i: i + 1, n: list.length })}`;
+}
+---
+
+{
+	series && (
+		<nav
+			aria-label={t(lang, "series.nav")}
+			class="border-accent/40 bg-accent/5 mb-8 rounded-lg border px-4 py-3 text-sm"
+			data-pagefind-ignore
+		>
+			<div class="flex flex-wrap items-baseline justify-between gap-2">
+				<a class="cactus-link font-semibold" href={seriesPath(lang)}>
+					{t(lang, "series.name")}
+				</a>
+				<span class="text-gray-600 dark:text-gray-400">{position}</span>
+			</div>
+			{(prev || next) && (
+				<div class="mt-2 grid gap-2 sm:grid-cols-2">
+					<div>
+						{prev && (
+							<a class="hover:text-link" href={postUrl(prev)}>
+								<span aria-hidden="true">← </span>
+								{prev.data.title}
+							</a>
+						)}
+					</div>
+					<div class="sm:text-end">
+						{next && (
+							<a class="hover:text-link" href={postUrl(next)}>
+								{next.data.title}
+								<span aria-hidden="true"> →</span>
+							</a>
+						)}
+					</div>
+				</div>
+			)}
+		</nav>
+	)
+}

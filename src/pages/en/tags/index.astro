@@ -1,0 +1,12 @@
+---
+import TagsIndex from "@/components/pages/TagsIndex.astro";
+import { t } from "@/i18n";
+import PageLayout from "@/layouts/Base.astro";
+
+const lang = "en";
+const meta = { alternateHref: "/tags/", description: t(lang, "tags.desc"), title: t(lang, "tags.title") };
+---
+
+<PageLayout meta={meta}>
+	<TagsIndex lang={lang} />
+</PageLayout>

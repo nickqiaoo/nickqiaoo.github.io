@@ -82,3 +82,30 @@
 	--tw-prose-quotes: var(--color-quote);
 	--tw-prose-th-borders: #666;
 }
+
+/* 行内代码：去掉 Typography 默认的前后反引号，改成浅底小圆角。代码块里的 code 不受影响。 */
+.prose .table-scroll {
+	max-width: 100%;
+	overflow-x: auto;
+	overscroll-behavior-x: contain;
+	margin-block: 2em;
+}
+
+.prose .table-scroll > table {
+	margin-block: 0;
+}
+
+.prose .table-scroll:focus-visible {
+	outline: 2px solid var(--color-link);
+	outline-offset: 2px;
+}
+
+.prose :not(pre) > code {
+	@apply rounded-md px-1.5 py-0.5 font-normal;
+	background-color: color-mix(in oklch, var(--color-global-text) 8%, transparent);
+	border: none;
+}
+.prose :not(pre) > code::before,
+.prose :not(pre) > code::after {
+	content: none;
+}

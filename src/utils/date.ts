@@ -1,18 +1,19 @@
 import type { CollectionEntry } from "astro:content";
+import { type Lang, dateLocale } from "@/i18n";
 import { siteConfig } from "@/site.config";
+
+const zhOptions: Intl.DateTimeFormatOptions = { year: "numeric", month: "long", day: "numeric" };
 
 export function getFormattedDate(
 	date: Date | undefined,
 	options?: Intl.DateTimeFormatOptions,
+	lang: Lang = "zh",
 ): string {
 	if (date === undefined) {
 		return "Invalid Date";
 	}
-
-	return new Intl.DateTimeFormat(siteConfig.date.locale, {
-		...(siteConfig.date.options as Intl.DateTimeFormatOptions),
-		...options,
-	}).format(date);
+	const base = lang === "zh" ? zhOptions : (siteConfig.date.options as Intl.DateTimeFormatOptions);
+	return new Intl.DateTimeFormat(dateLocale[lang], { ...base, ...options }).format(date);
 }
 
 export function collectionDateSort(

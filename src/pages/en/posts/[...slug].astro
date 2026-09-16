@@ -1,0 +1,24 @@
+---
+import { render } from "astro:content";
+import { getAllPosts, postSlug } from "@/data/post";
+import PostLayout from "@/layouts/BlogPost.astro";
+import type { GetStaticPaths, InferGetStaticPropsType } from "astro";
+
+// 英文文章页：只给有 index.en.md 的文章生成
+export const getStaticPaths = (async () => {
+	const posts = await getAllPosts("en");
+	return posts.map((post) => ({
+		params: { slug: postSlug(post) },
+		props: { post },
+	}));
+}) satisfies GetStaticPaths;
+
+type Props = InferGetStaticPropsType<typeof getStaticPaths>;
+
+const { post } = Astro.props;
+const { Content } = await render(post);
+---
+
+<PostLayout post={post}>
+	<Content />
+</PostLayout>

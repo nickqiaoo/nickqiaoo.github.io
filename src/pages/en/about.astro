@@ -1,0 +1,16 @@
+---
+import AboutContent from "@/components/AboutContent.astro";
+import { t } from "@/i18n";
+import PageLayout from "@/layouts/Base.astro";
+
+const meta = {
+	alternateHref: "/about/",
+	description: t("en", "about.title"),
+	title: t("en", "about.title"),
+};
+---
+
+<PageLayout meta={meta}>
+	<h1 class="title mb-6">{t("en", "about.title")}</h1>
+	<AboutContent />
+</PageLayout>

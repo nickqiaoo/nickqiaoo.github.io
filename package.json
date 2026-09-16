@@ -27,6 +27,7 @@
 		"astro-robots-txt": "^1.0.0",
 		"astro-webmanifest": "^1.0.0",
 		"cssnano": "^7.0.7",
+		"github-slugger": "^2.0.0",
 		"hastscript": "^9.0.0",
 		"katex": "^0.16.22",
 		"mdast-util-directive": "^3.0.0",
@@ -42,6 +43,7 @@
 		"satori": "0.15.2",
 		"satori-html": "^0.3.2",
 		"sharp": "^0.34.2",
+		"svg-pan-zoom": "^3.6.2",
 		"unified": "^11.0.5",
 		"unist-util-visit": "^5.0.0"
 	},
@@ -73,5 +75,6 @@
 			"esbuild",
 			"sharp"
 		]
-	}
+	},
+	"packageManager": "pnpm@10.33.0+sha512.10568bb4a6afb58c9eb3630da90cc9516417abebd3fabbe6739f0ae795728da1491e9db5a544c76ad8eb7570f5c4bb3d6c637b2cb41bfdcdb47fa823c8649319"
 }

@@ -1,13 +1,15 @@
 ---
 import { WEBMENTION_PINGBACK, WEBMENTION_URL } from "astro:env/client";
+import { type Lang, htmlLang, ogLocale, otherLang } from "@/i18n";
 import { siteConfig } from "@/site.config";
 import type { SiteMeta } from "@/types";
 import "@/styles/global.css";
 import "katex/dist/katex.min.css";
 
-type Props = SiteMeta;
+type Props = SiteMeta & { lang: Lang };
 
-const { articleDate, description, ogImage, title } = Astro.props;
+const { alternateHref, articleDate, description, lang, ogImage, title } = Astro.props;
+const alternateURL = alternateHref ? new URL(alternateHref, Astro.site) : undefined;
 
 const titleSeparator = "•";
 const siteTitle = `${title} ${titleSeparator} ${siteConfig.title}`;
@@ -35,6 +37,15 @@ const socialImageURL = new URL(ogImage ? ogImage : "/social-card.png", Astro.url
 
 {/* Canonical URL */}
 <link href={canonicalURL} rel="canonical" />
+{
+	/* 中英文版本互相声明，搜索引擎按语言分发 */
+	alternateURL && (
+		<>
+			<link href={canonicalURL} hreflang={htmlLang[lang]} rel="alternate" />
+			<link href={alternateURL} hreflang={htmlLang[otherLang(lang)]} rel="alternate" />
+		</>
+	)
+}
 
 {/* Primary Meta Tags */}
 <meta content={siteTitle} name="title" />
@@ -47,7 +58,7 @@ const socialImageURL = new URL(ogImage ? ogImage : "/social-card.png", Astro.url
 <meta content={description} property="og:description" />
 <meta content={canonicalURL} property="og:url" />
 <meta content={siteConfig.title} property="og:site_name" />
-<meta content={siteConfig.ogLocale} property="og:locale" />
+<meta content={ogLocale[lang]} property="og:locale" />
 <meta content={socialImageURL} property="og:image" />
 <meta content="1200" property="og:image:width" />
 <meta content="630" property="og:image:height" />
@@ -71,8 +82,8 @@ const socialImageURL = new URL(ogImage ? ogImage : "/social-card.png", Astro.url
 <link href="/sitemap-index.xml" rel="sitemap" />
 
 {/* RSS auto-discovery */}
-<link href="/rss.xml" title="Blog" rel="alternate" type="application/rss+xml" />
-<link href="/notes/rss.xml" title="Notes" rel="alternate" type="application/rss+xml" />
+<link href={lang === "en" ? "/en/rss.xml" : "/rss.xml"} title="Blog" rel="alternate" type="application/rss+xml" />
+<link href={lang === "en" ? "/en/notes/rss.xml" : "/notes/rss.xml"} title="Notes" rel="alternate" type="application/rss+xml" />
 
 {/* Webmentions */}
 {

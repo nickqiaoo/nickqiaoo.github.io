@@ -1,0 +1,49 @@
+---
+// 单个标签的文章列表正文
+import { type CollectionEntry, render } from "astro:content";
+import Pagination from "@/components/Paginator.astro";
+import PostPreview from "@/components/blog/PostPreview.astro";
+import { type Lang, t, tagsPath } from "@/i18n";
+import type { Page } from "astro";
+import { Icon } from "astro-icon/components";
+
+interface Props {
+	lang: Lang;
+	page: Page<CollectionEntry<"post">>;
+	tag: string;
+	tagMeta: CollectionEntry<"tag"> | undefined;
+}
+const { lang, page, tag, tagMeta } = Astro.props;
+
+const TagContent = tagMeta ? (await render(tagMeta)).Content : null;
+
+const paginationProps = {
+	...(page.url.prev && { prevUrl: { text: t(lang, "page.prev"), url: page.url.prev } }),
+	...(page.url.next && { nextUrl: { text: t(lang, "page.next"), url: page.url.next } }),
+};
+---
+
+<nav class="mb-8" aria-label="Breadcrumbs">
+	<ul class="flex items-center">
+		<li class="flex items-center">
+			<a class="text-accent" href={tagsPath(lang)}>{t(lang, "tags.title")}</a>
+			<Icon aria-hidden="true" name="mdi:chevron-right" class="mx-1.5" />
+		</li>
+		<li aria-current="page" class=""><span aria-hidden="true">#</span>{tag}</li>
+	</ul>
+</nav>
+<h1 class="title capitalize">{tagMeta?.data.title ?? t(lang, "tags.about", { tag })}</h1>
+<div class="prose prose-sm prose-cactus mb-16 max-w-none">
+	{tagMeta?.data.description && <p>{tagMeta.data.description}</p>}
+	{TagContent && <TagContent />}
+</div>
+<ul class="space-y-6">
+	{
+		page.data.map((p) => (
+			<li class="grid gap-2 sm:grid-cols-[auto_1fr]">
+				<PostPreview as="h2" post={p} />
+			</li>
+		))
+	}
+</ul>
+<Pagination {...paginationProps} />

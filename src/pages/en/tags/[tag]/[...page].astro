@@ -1,0 +1,36 @@
+---
+import TagPosts from "@/components/pages/TagPosts.astro";
+import { getAllPosts, getTagMeta, getUniqueTags } from "@/data/post";
+import { t } from "@/i18n";
+import PageLayout from "@/layouts/Base.astro";
+import { collectionDateSort } from "@/utils/date";
+import type { GetStaticPaths, InferGetStaticPropsType } from "astro";
+
+const lang = "en";
+
+export const getStaticPaths = (async ({ paginate }) => {
+	const allPosts = await getAllPosts("en");
+	const sortedPosts = allPosts.sort(collectionDateSort);
+	const uniqueTags = getUniqueTags(sortedPosts);
+
+	return uniqueTags.flatMap((tag) => {
+		const postsWithTag = sortedPosts.filter((post) => post.data.tags.includes(tag));
+		return paginate(postsWithTag, { pageSize: 10, params: { tag } });
+	});
+}) satisfies GetStaticPaths;
+
+type Props = InferGetStaticPropsType<typeof getStaticPaths>;
+
+const { page } = Astro.props as Props;
+const { tag } = Astro.params;
+const tagMeta = await getTagMeta(tag);
+
+const meta = {
+	description: tagMeta?.data.description ?? t(lang, "tags.about", { tag }),
+	title: tagMeta?.data.title ?? t(lang, "tags.about", { tag }),
+};
+---
+
+<PageLayout meta={meta}>
+	<TagPosts lang={lang} page={page} tag={tag} tagMeta={tagMeta} />
+</PageLayout>

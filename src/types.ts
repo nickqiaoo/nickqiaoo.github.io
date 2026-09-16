@@ -18,6 +18,8 @@ export interface PaginationLink {
 }
 
 export interface SiteMeta {
+	/** 当前页面另一种语言版本的地址，有才显示语言切换到对应页 */
+	alternateHref?: string | undefined;
 	articleDate?: string | undefined;
 	description?: string;
 	ogImage?: string | undefined;

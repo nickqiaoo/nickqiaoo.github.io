@@ -1,0 +1,34 @@
+---
+import type { CollectionEntry } from "astro:content";
+import PostsList from "@/components/pages/PostsList.astro";
+import { getAllPosts, getUniqueTags } from "@/data/post";
+import { t } from "@/i18n";
+import PageLayout from "@/layouts/Base.astro";
+import { collectionDateSort } from "@/utils/date";
+import type { GetStaticPaths, Page } from "astro";
+
+const lang = "en";
+
+export const getStaticPaths = (async ({ paginate }) => {
+	const MAX_POSTS_PER_PAGE = 10;
+	const MAX_TAGS = 7;
+	const allPosts = await getAllPosts("en");
+	const uniqueTags = getUniqueTags(allPosts).slice(0, MAX_TAGS);
+	return paginate(allPosts.sort(collectionDateSort), {
+		pageSize: MAX_POSTS_PER_PAGE,
+		props: { uniqueTags },
+	});
+}) satisfies GetStaticPaths;
+
+interface Props {
+	page: Page<CollectionEntry<"post">>;
+	uniqueTags: string[];
+}
+
+const { page, uniqueTags } = Astro.props;
+const meta = { alternateHref: "/posts/", description: t(lang, "posts.desc"), title: t(lang, "posts.title") };
+---
+
+<PageLayout meta={meta}>
+	<PostsList lang={lang} page={page} uniqueTags={uniqueTags} />
+</PageLayout>
