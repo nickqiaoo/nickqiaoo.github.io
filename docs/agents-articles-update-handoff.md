@@ -193,6 +193,17 @@ turn_input 路由（StartOrSteer/StartIfIdle/Steer）、ActiveTurn/TurnState/Tas
 
 ---
 
+### 4.4 第二轮（2026-10-08，对照 `1cc7e23612..529cd6b860`，490 个提交）
+
+已改：
+- §11 即时打断：`InstantInterrupt` 已默认开启（#51812，阶段仍是 UnderDevelopment）；`CodeModeInterrupt` 改为 Stable、默认开启（#51835）；steer 时序图注明画的是开关关闭时的情况。
+- §7 请求组装：请求体删掉了 `instructions` 字段，base instructions 改成 `input` 开头的一条 developer 消息，普通 Responses 和 Lite 的写法统一了（#51156）；补充了开发中、默认关闭的 `incremental_tools`（#50464，只对 Lite 生效）。
+- §6/§12/§13 压缩：`InitialContextInjection` 已删除，四个时机的压缩都调用 `build_compaction_replacement_history`，当场重建上下文并设好两套基线（#51117）；锚点只会在新线程和重放回滚标记时为空。
+- §11 邮箱：新增 `MessagePhase::PartialAnswer`（#51241/#51249），它不会让邮箱切到 `NextTurn`。
+- 其他：StepContext 新增 `extension_data`（#50050）；`SessionConfigured` 去掉了 `initial_messages`；TUI 退回进程内 app-server 的条件多了几种；修正 3 处行号和类图里两个原本就不存在的类型名（`ResponsesEndpoint`、`ToolSpecs`）。
+
+还没做（4.2 遗留项照旧）：AgentControl 重构详述、预热、扩展钩子、Guardian。另外这一轮还有一些新东西没写：world-state 快照随渲染上下文一起持久化、prediction fork、删除只带部分历史的子 agent fork（#51329）、turn lineage。
+
 ## 5. kimi-code（暂无文章，供参考）
 
 版本从 0.43 升到 2.1.1。2.0.0 只是因为新增了 `/desktop`（#3849），不是架构变更。

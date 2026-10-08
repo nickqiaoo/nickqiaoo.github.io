@@ -29,9 +29,9 @@ graph TD
   SBX["sandboxing · linux-sandbox · windows-sandbox-rs · execpolicy<br/>平台沙箱 · 执行策略"]
 ```
 
-TUI、`codex exec`、SDK 这些客户端都不直接碰 core，而是通过 app-server 的 JSON-RPC 接口来建线程、发输入、收事件。TUI 现在默认连一个共享的本地后台 app-server daemon：`DaemonAutoStart` 已经是 Stable 且默认开启（`features/src/lib.rs`，#47179），`tui/src/startup_orchestration.rs` 在启动时判断要不要拉起 daemon，连接目标是 `AppServerTarget::{Embedded, LocalDaemon, Remote}` 三选一（`tui/src/lib.rs:312`）。加 `--no-daemon`、打开 agents 总览或连远程工作区时才退回进程内 app-server。`codex exec` 仍然固定走进程内。真正的执行循环和状态都在 core 里，这也是本篇要重点看的部分。
+TUI、`codex exec`、SDK 这些客户端都不直接碰 core，而是通过 app-server 的 JSON-RPC 接口来建线程、发输入、收事件。TUI 现在默认连一个共享的本地后台 app-server daemon：`DaemonAutoStart` 已经是 Stable 且默认开启（`features/src/lib.rs`，#47179），`tui/src/startup_orchestration.rs` 在启动时判断要不要拉起 daemon，连接目标是 `AppServerTarget::{Embedded, LocalDaemon, Remote}` 三选一（`tui/src/lib.rs:321`）。加 `--no-daemon`、打开 agents 总览或连远程工作区时才退回进程内 app-server；另外还有几种情况也会退回：要先走 Bedrock 登录向导，WSL 的 codex home 放在 Windows 盘上，Windows 下以管理员权限启动（无法拉起分离的后台进程），以及本地开关和已在跑的 daemon 对不上。`codex exec` 仍然固定走进程内。真正的执行循环和状态都在 core 里，这也是本篇要重点看的部分。
 
-下文沿着 app-server → core 这条路径往下讲，源码路径都以 `codex-rs/` 为根。主要入口在 `core/src/thread_manager.rs`、`core/src/session/turn_input.rs`、`core/src/tasks/` 和 `core/src/session/turn.rs`。这里分析的是开源仓库的代码，线上托管服务实际跑的是哪个版本不在讨论范围内。
+下文沿着 app-server → core 这条路径往下讲，源码路径都以 `codex-rs/` 为根。主要入口在 `core/src/thread_manager.rs`、`core/src/session/turn_input.rs`、`core/src/tasks/` 和 `core/src/session/turn.rs`。这里分析的是开源仓库的代码（最近一次对照的是 2026-10-08 的 `529cd6b860`），线上托管服务实际跑的是哪个版本不在讨论范围内。
 
 ---
 
@@ -61,7 +61,7 @@ sequenceDiagram
   SN->>SN: 准备对话历史
   SN->>SN: 准备模型客户端、执行策略和 hooks 等服务
   SN->>SN: 创建空闲状态的 Session
-  SN->>EC: send_event_raw(SessionConfigured { thread_id, model, cwd, rollout_path, initial_messages })
+  SN->>EC: send_event_raw(SessionConfigured { thread_id, model, cwd, rollout_path, ... })
   SN->>SN: install_initial_mcp_runtime → start_mcp_prewarm_worker
   SN->>SN: schedule_startup_prewarm(base_instructions) 预热 HTTP/WS 连接
   SN->>SN: record_initial_history(New / Resumed / Forked)
@@ -729,6 +729,7 @@ classDiagram
     environments: TurnEnvironmentSnapshot
     selected_capability_roots: Vec
     executor_capability_discovery: Option~Arc~
+    extension_data: ExtensionData
     mcp: Arc~McpBinding~
     tool_router: Arc~ToolRouter~
     loaded_agents_md: Option~Arc~LoadedAgentsMd~~
@@ -790,7 +791,7 @@ sequenceDiagram
 
 第一步在持有 `active_turn` 锁的情况下，同时读 `next_step_settings` 和环境快照。后面加载 AGENTS.md、发现 capability、刷新 MCP、构建工具，中间哪怕要等，也一直用这一份 settings 和环境，捕获过程中新来的设置不会混进来。AGENTS.md 的加载和工具准备现在是用 `tokio::join!` 并行跑的（#47458），以前是先加载 AGENTS.md 再准备工具。
 
-`StepContext` 还多了两个字段：`preempt` 是打开 `InstantInterrupt` 时才有的取消令牌，用户 steer 时靠它打断正在进行的模型请求（见 §11）；`realtime` 是这一步开始时实时语音会话的状态快照。
+`StepContext` 还多了两个字段：`preempt` 是开启 `InstantInterrupt`（现在默认开启）时才有的取消令牌，用户 steer 时靠它打断正在进行的模型请求（见 §11）；`realtime` 是这一步开始时实时语音会话的状态快照。10 月又加了 `extension_data`（#50050）：这一步选中的 plugin、executor 的 skill 清单等扩展数据也存在这一步自己身上，构建工具和渲染 `WorldState` 用的是同一份，不会因为另一步同时刷新目录而串用。
 
 MCP binding 和工具推荐并行准备。拿到 binding 之后，`built_tools` 再结合模型能力、权限、环境、Apps/plugins、扩展工具，生成最终的 `ToolRouter`。做好的 `StepContext` 记到当前 `TurnState` 上，再交回 `run_turn`，后面构造 `WorldState` 和第一次模型请求都用它。这一步不写对话历史。
 
@@ -847,7 +848,7 @@ classDiagram
 | `items: Arc<Vec<ResponseItemEnvelope>>` | 对话历史。多个快照可以共享内容，只有修改时才按需复制 |
 | `history_version` / `user_message_revision` | 版本号，用来判断历史和用户消息有没有变过 |
 | `token_info: Option<TokenUsageInfo>` | 最近一次响应报的用量，`get_total_token_usage` 从它算 |
-| `reference_context_item: Option<TurnContextItem>` | 上下文 diff 的基线（§6）。`None` 表示下一轮要全量注入 |
+| `reference_context_item: Option<TurnContextItem>` | 上下文 diff 的基线（§6）。`None` 表示下一轮要全量注入（新线程、回滚删掉了最初的上下文时出现） |
 | `world_state_baseline` | 上次告诉模型的工作目录、Git 分支等状态，用来比较后面有没有变 |
 
 | 方法 | 干什么 | 谁调它 |
@@ -861,15 +862,18 @@ classDiagram
 
 ### 模型可见上下文的生成
 
-一次模型请求里，模型能看到的东西来自三个字段：
+一次模型请求里，模型能看到的东西来自两个字段：
 
 | 请求字段 | 来源 | 更新时机 |
 |---|---|---|
-| `instructions` | `Session::get_prompt_base_instructions()` 返回的 base instructions | 每次模型请求都会带上。创建 Session 时按“配置显式覆盖 → 恢复记录中的 base instructions → 当前模型模板”的顺序确定 |
-| `input` | `ContextManager::for_prompt()` 整理后的历史 | 用户消息、模型输出、工具结果，以及 Codex 追加的 developer / user 上下文都在这里 |
+| `input` | 开头是 base instructions（`Session::get_prompt_base_instructions()`），后面是 `ContextManager::for_prompt()` 整理后的历史 | base instructions 每次请求都放在最前面，创建 Session 时按“配置显式覆盖 → 恢复记录中的 base instructions → 当前模型模板”的顺序确定。历史部分是用户消息、模型输出、工具结果，以及 Codex 追加的 developer / user 上下文 |
 | `tools` | `StepContext.tool_router.model_visible_specs()` | 每次捕获新的 `StepContext` 时确定，和实际执行工具使用同一份绑定 |
 
-所以 base instructions 相当于常说的 system prompt。但要注意，AGENTS.md、权限、工作目录、skill 清单、多 agent 模式这些都不在里面，而是 `input` 里的消息。`Responses Lite` 是个例外：base instructions 会变成 `input` 开头的一条 developer 消息，工具定义也变成 `AdditionalTools` 条目，`instructions` 和 `tools` 两个字段留空。
+base instructions 相当于常说的 system prompt。请求体里已经没有单独的 `instructions` 字段了（#51156，10-05）：`build_responses_request` 把 base instructions 包成一条 developer 消息，插到 `input` 最前面。这条消息不存进历史，每次请求都重新生成；它的 id 由线程 id 和指令文本算出来（UUID v5），所以重试和恢复会话时 id 都不变。这样一来，普通 Responses 和 `Responses Lite` 的写法就统一了，只剩一个区别：Lite 模式下工具定义也会变成 `input` 开头的一条 `AdditionalTools` 条目（排在 base instructions 前面），`tools` 字段留空。
+
+要注意，AGENTS.md、权限、工作目录、skill 清单、多 agent 模式这些都不在 base instructions 里，而是历史里另外的消息。
+
+还有一个开发中、默认关闭的开关 `incremental_tools`（#50464），只对 Lite 模式生效。打开后，工具定义和 base instructions 不再每次请求都拼到 `input` 前面，而是作为两个 `WorldState` section（`TopLevelToolsState`、`BaseInstructionsState`）在每个上下文窗口开头写进历史一次。之后工具有增删，只追加一条描述变化的 `AdditionalTools` 或说明消息，不再整份重发。
 
 #### `WorldState` 的全量注入与增量更新
 
@@ -994,7 +998,9 @@ Codex 维护了两套基线，一套判断历史里还有没有完整可信的�
 - 是 `None`：不认为历史里还有完整上下文，重新注入全部 developer / contextual user 内容，并用这次的 `WorldState` 重建 `world_state_baseline`。
 - 不是 `None`：可以在已有上下文上接着来。这时才用 `world_state_baseline` 逐个 section 比较，只生成变了的部分；`TurnContextItem` 本身变了的话，还会调 extension 的 turn-context contributor。
 
-为什么不能只要一套？因为“记得上次各项是什么”和“历史里还留着上次的完整说明”是两回事。比如压缩把最早那段 AGENTS.md 上下文换成了摘要，但 AGENTS.md 文件本身没改：只看 `world_state_baseline` 的话，diff 会认为什么都不用补，结果模型就再也看不到 AGENTS.md 了。所以这种时候会把 `reference_context_item` 清掉，下一次强制全量注入，重新建立一个可信的锚点。重放旧 rollout 里的回滚标记时，如果删到了最初那批上下文，`drop_last_n_user_turns` 也会这样清掉锚点。
+为什么不能只要一套？因为“记得上次各项是什么”和“历史里还留着上次的完整说明”是两回事。比如回滚把最早那段 AGENTS.md 上下文删掉了，但 AGENTS.md 文件本身没改：只看 `world_state_baseline` 的话，diff 会认为什么都不用补，结果模型就再也看不到 AGENTS.md 了。所以重放旧 rollout 里的回滚标记时，如果删到了最初那批上下文，`drop_last_n_user_turns` 会把 `reference_context_item` 清掉，下一次强制全量注入，重新建立一个可信的锚点。
+
+压缩原来也会走这条“清锚点、下一轮再全量注入”的路，10-05 以后不再这样（#51117）：压缩当场就把完整上下文重新写进新历史，同时把两套基线设好，锚点一直有效，见 §12。
 
 举个例子，线程一开始在 `/repo`，分支是 `main`，加载了根目录的 AGENTS.md。之后发生几次变化，两套基线分别这样更新：
 
@@ -1003,7 +1009,7 @@ Codex 维护了两套基线，一套判断历史里还有没有完整可信的�
 | 第一次请求前 | 发现 `reference_context_item = None`，把 AGENTS.md、`/repo`、`main`、权限和 skill 清单等全部写入历史 | 保存当前轮次设置为 `T1`，作为“这份完整上下文还在历史里”的锚点 | 保存所有 section 的快照 `S1` |
 | 外部把分支切到 `feature/login` | 轮次设置仍是 `T1`，所以不用全量重发；`environments` section 用 `S1` 比较出分支变化，只追加一条环境更新 | 仍是 `T1` | 无论是否有其他 section 变化，都更新为最新快照 `S2`；rollout 保存 `S1 → S2` 的 patch |
 | 下一轮把 cwd 改成 `/repo/apps/web` | 新 `StepContext` 形成轮次设置 `T2`，并加载子目录的 AGENTS.md；Codex 追加 cwd 更新和“新指令替换旧指令”的消息 | 持久化并更新为 `T2` | 更新为包含新 cwd、新分支和新 AGENTS.md 的 `S3` |
-| 压缩把最初那批完整上下文换成了摘要 | 压缩后重建历史时清掉引用锚点。即使当前运行状态仍等于 `S3`，下一次也不能只算 diff，而要重新全量注入 | 先变成 `None`；全量注入成功后重新设为当前 `T2` | 用这次完整注入对应的快照重新建立 `S3` |
+| 压缩把最初那批完整上下文换成了摘要 | 压缩当场就用当前 `StepContext` 重新渲染完整上下文，放进新历史 | 直接设为当前 `T2`，不会出现 `None` | 用这次渲染对应的快照重新建立 `S3` |
 
 可以看到两套基线更新的节奏不一样：只切 Git 分支，模型看到的环境变了，`world_state_baseline` 要更新，但轮次设置没变，`reference_context_item` 不用动；cwd、模型、审批策略这些轮次设置变了，两个一般都会更新；锚点丢了，就不信现有的 diff 基线，直接全量重建。
 
@@ -1020,7 +1026,7 @@ Codex 维护了两套基线，一套判断历史里还有没有完整可信的�
 
 变化也可能发生在一轮中间。比如用户 steer 之后重新捕获了 `StepContext`，`run_turn` 会在下一次请求前调 `record_step_world_state_if_changed`，和本轮上一份 `WorldState` 比较，把 diff 写进历史。也就是说变化不用等到下一轮才生效。
 
-`reference_context_item` 丢失的情况有几种：新线程、压缩后重建上下文、重放旧回滚标记时删掉了最初的上下文。这时下一次就走全量注入，顺便重建 `world_state_baseline`。另外 `TurnContextItem` 和变化时的 `WorldStateItem` 也会写进 rollout，恢复会话后能接着从正确的基线比较，不用把所有上下文再塞一遍。
+`reference_context_item` 丢失的情况有两种：新线程、重放旧回滚标记时删掉了最初的上下文。（压缩原来也算一种，现在压缩会当场重建上下文，见 §12。）这时下一次就走全量注入，顺便重建 `world_state_baseline`。另外 `TurnContextItem` 和变化时的 `WorldStateItem` 也会写进 rollout，恢复会话后能接着从正确的基线比较，不用把所有上下文再塞一遍。
 
 ### 历史条目的生成与保存
 
@@ -1262,14 +1268,14 @@ classDiagram
   }
   class WebsocketSession {
     connection: Option~ApiWebSocketConnection~
-    endpoint: Option~ResponsesEndpoint~
+    connection_key: Option~ResponsesConnectionKey~
     auth_owner_generation: Option~u64~
     last_request: Option~ResponsesApiRequest~
     last_response_rx: Option~oneshot::Receiver~LastResponse~~
   }
   class Prompt {
     input: Vec~ResponseItem~
-    tools: Arc~ToolSpecs~
+    tools: Arc~[ToolSpec]~
     parallel_tool_calls: bool
     base_instructions: BaseInstructions
     output_schema: Option~Value~
@@ -1279,7 +1285,6 @@ classDiagram
   }
   class ResponsesApiRequest {
     model: String
-    instructions: String
     input: Vec~ResponseItem~
     tools: Option~ResponsesApiTools~
     tool_choice: String
@@ -1322,7 +1327,7 @@ classDiagram
 |---|---|
 | `ModelClient` | 会话级的模型客户端，管连接和认证，认证恢复之类的状态也从这里报出去 |
 | `ModelClientSession` | 一个 `run_turn` 用一个，新建或者拿预热的。里面缓存了 WebSocket 状态和 `x-codex-turn-state` 路由 token。源码里明确说它是 turn-scoped 的，不能跨轮复用 |
-| `WebsocketSession` | 记着上一次的请求和响应。配置没变、新输入又是在上次基础上追加的，就只发新增的部分 |
+| `WebsocketSession` | 记着上一次的请求和响应。配置没变、新输入又是在上次基础上追加的，就只发新增的部分。base instructions 现在是 `input` 的第一条，它一变，新输入就不再是旧输入的延续，会自动退回发完整请求（不带 `previous_response_id`） |
 | `Prompt` | 一次请求的数据结构。`tools` 是 `Arc<[ToolSpec]>` 直接指向 `ToolRouter.model_visible_specs` |
 | `ResponsesApiRequest` | 真正序列化的请求体，字段见 §7 |
 | `ResponseEvent` | provider 流被归一化成的 17 种事件。`Completed.end_turn` 是 `Option<bool>`：`Some(false)` 表示模型明确说"我还没完"，会置 `needs_follow_up` |
@@ -1335,8 +1340,7 @@ classDiagram
 | 字段 | 来源 | 每步会变吗 |
 |---|---|---|
 | `model` | `StepContext` 里选定的模型 | 轮次中途 `Op::TurnSettings` 换模型时下一步变 |
-| `instructions` | base instructions，按启用的能力做些调整；lite 模式下挪进 `input` | 不变 |
-| `input` | `for_prompt` 整理后的历史，加上工具调用记录。发给非 OpenAI 提供方时会去掉内部字段 | 每步增长；压缩后整体替换 |
+| `input` | 开头一条 developer 消息放 base instructions（lite 模式下前面还有一条 `AdditionalTools`），后面是 `for_prompt` 整理后的历史，加上工具调用记录。发给非 OpenAI 提供方时会去掉内部字段 | 每步增长；压缩后整体替换 |
 | `tools` | `ToolRouter.model_visible_specs()` | 同一轮内只在重新 `capture` 时变（steer 提到新 MCP） |
 | `tool_choice` | 常量 `"auto"` | 不变 |
 | `parallel_tool_calls` | `Prompt.parallel_tool_calls`（`build_prompt` 写死 `true`）且非 lite | 不变 |
@@ -1380,7 +1384,7 @@ sequenceDiagram
         HO->>S: 记录完成项并发送 UI 事件
         HO-->>SR: 更新 last_agent_message 等状态
       end
-      opt commentary / reasoning 后邮箱有新邮件
+      opt commentary / partial answer / reasoning 后邮箱有新邮件
         SR->>SR: 提前停止读取模型响应，让邮件参与下一步
       end
     else Completed
@@ -1773,7 +1777,7 @@ needs_follow_up |= output_result.needs_follow_up;
 | 收到可执行的工具调用 | `handle_output_item_done` 将 `output.needs_follow_up` 设为 `true`，随后通过 `|=` 合并 | 需要把工具结果交回模型 |
 | 工具调用解析返回 `RespondToModel` 错误 | 写入可供模型读取的错误结果，同样将 `output.needs_follow_up` 设为 `true` | 让模型看到错误并继续处理 |
 | 收到 `Completed`，且 `end_turn == Some(false)` | 直接将请求内的 `needs_follow_up` 设为 `true` | 模型明确表示还没有结束 |
-| 一条 commentary 或 reasoning 输出完成后，发现邮箱有待处理消息 | 提前退出响应读取，返回 `SamplingRequestResult { needs_follow_up: true, ... }` | 让下一次请求能处理新邮件 |
+| 一条 commentary、partial answer 或 reasoning 输出完成后，发现邮箱有待处理消息 | 提前退出响应读取，返回 `SamplingRequestResult { needs_follow_up: true, ... }` | 让下一次请求能处理新邮件 |
 
 `end_turn` 是 `Some(true)` 或 `None` 时，不会把已经置上的标记清掉。响应读完后还要等工具跑完，结果才返回 `run_turn`。
 
@@ -1802,7 +1806,7 @@ let needs_follow_up = model_needs_follow_up || has_pending_input;
 
 ### steer 输入的处理时序
 
-下面只画一种情况：模型正在回答，用户补了一句“再加个测试”；这次响应正常结束，模型没要求继续，也没触发压缩。§4 讲过的提交和校验，这里简化成一个 `steer_input`。
+下面只画一种情况：模型正在回答，用户补了一句“再加个测试”；这次响应正常结束，模型没要求继续，也没触发压缩。这张图画的是关掉 `InstantInterrupt` 时的行为。现在这个开关默认是开的，开了以后第 N 次请求不会等到跑完，而是被 steer 直接打断，见下一小节。§4 讲过的提交和校验，这里简化成一个 `steer_input`。
 
 ```mermaid
 sequenceDiagram
@@ -1836,17 +1840,18 @@ sequenceDiagram
 
 如果 steer 来得更晚，错过了 `run_turn` 的结束检查，也没关系：`RegularTask::run` 在 `run_turn` 返回后还会再查一次队列，有输入又没有致命错误，就再调一次 `run_turn`。
 
-### 即时打断（`InstantInterrupt`，开发中）
+### 即时打断（`InstantInterrupt`，默认开启）
 
-上面的时序里，steer 要等当前这次模型请求跑完才被读到。模型如果正在写一大段，用户补的话就得等它写完。`Feature::InstantInterrupt` 就是为了解决这个问题，目前还是 UnderDevelopment、默认关闭（#48141、#48508）。
+上面的时序里，steer 要等当前这次模型请求跑完才被读到。模型如果正在写一大段，用户补的话就得等它写完。`Feature::InstantInterrupt` 就是为了解决这个问题（#48141、#48508）。9 月它还是默认关闭的；10-07 的 #51812 把它改成默认开启，不过阶段标记仍然是 UnderDevelopment。所以现在的默认行为是：用户一 steer，正在进行的请求就会被打断。
 
-打开之后，捕获 `StepContext` 时会多建一个取消令牌 `preempt`（§5）。`run_sampling_request` 一开始就调 `InputQueue::watch_user_input`：后台任务先订阅队列的变化，再检查 `pending_input` 里有没有用户输入，一有就 `preempt.cancel()`。
+开关打开时，捕获 `StepContext` 时会多建一个取消令牌 `preempt`（§5）。`run_sampling_request` 一开始就调 `InputQueue::watch_user_input`：后台任务先订阅队列的变化，再检查 `pending_input` 里有没有用户输入，一有就 `preempt.cancel()`。
 
 请求建立、读流、重试前的等待都挂了 `.or_cancel(&preempt)`，所以令牌一取消，这次请求就提前结束，返回 `needs_follow_up: true`。下一圈照常取出 steer、写进历史，再发新请求。几个细节：
 
 - 如果流已经开始了，而且模型走的是 Responses Lite，会通过 websocket 发一个 `response.interrupt` 让服务端停下，然后把这次响应正常读完，连接和历史都还能接着用。
 - 被打断的那一步，即使压缩后估算的上下文仍然超限，也会先把 steer 取出来处理（`can_drain_pending_input`）。
 - Code Mode 里正在跑的 cell 也会让出。
+- 这里说的是 steer 打断模型请求。用户直接中断整轮（`Op::Interrupt`）是另一回事，由 `CodeModeInterrupt` 管：中断时把正在跑的 Code Mode cell 和它里面嵌套的工具调用一起终止，cell 里存下的会话变量保留。它在 10-07 也改成了 Stable、默认开启（#51835）。
 - 另一个开关 `DeferMailboxPreemption`（#47913）管的是邮箱消息：打开后，模型刚输出 commentary 或 reasoning 时，不会因为有邮件就提前截断响应。
 
 ### `InputQueue`
@@ -1879,17 +1884,19 @@ sequenceDiagram
 | 时机 | 接收状态 | 代码 |
 |---|---|---|
 | 新一轮开始 | 收（默认值） | `#[default] CurrentTurn` |
-| 模型输出了一段给用户看的最终答案（`assistant` 消息、不是 `Commentary` 过程说明、文本非空） | 不收 | `handle_output_item_done` → `defer_mailbox_delivery_to_next_turn`（`input_queue.rs:250`） |
+| 模型输出了一段给用户看的最终答案（`assistant` 消息，phase 是 `FinalAnswer` 或没标，文本非空） | 不收 | `handle_output_item_done` → `defer_mailbox_delivery_to_next_turn`（`input_queue.rs:322`） |
 | 模型接着又发了工具调用，或者用户 steer | 收 | `handle_output_item_done`、`steer_input` → `accept_mailbox_delivery_for_current_turn` |
 
 切到 `NextTurn` 之前会先看一眼队列：已经有 steer、工具输出或者带 `trigger_turn` 的邮件，就还保持 `CurrentTurn`，让这一轮接着处理。
 
 到了 `NextTurn`，邮件既不会被取出来，也不算本轮的待处理输入，所以不会因为一封晚到的邮件又请求一次模型。
 
+assistant 消息的 phase 现在有三种（`MessagePhase`）：`Commentary` 是过程说明；`PartialAnswer`（#51241，10 月新增）是答案的一部分，后面还可能有输出或工具调用；`FinalAnswer` 是这一轮最终的答案。只有 `FinalAnswer` 和没标 phase 的消息会让邮箱切到 `NextTurn`。`PartialAnswer` 和 `Commentary` 一样不会，邮件来了还能打断响应、并进这一轮（#51249）。
+
 没处理的邮件留在 `mailbox_pending_mails` 里，之后有两种方式被处理：
 
 - 用户下次发消息开新一轮时，`start_task` 先把邮箱里的邮件取出来并进这一轮（§5）。
-- 如果邮件带 `trigger_turn = true`，会话一空闲，`maybe_start_turn_for_pending_work`（`tasks/mod.rs:437`）就自动开一轮去处理它，不用等用户。
+- 如果邮件带 `trigger_turn = true`，会话一空闲，`maybe_start_turn_for_pending_work`（`tasks/mod.rs:442`）就自动开一轮去处理它，不用等用户。
 
 ### 中断的传播路径
 
@@ -2049,7 +2056,7 @@ sequenceDiagram
   R->>R: needs_follow_up = model_needs_follow_up 或 has_pending_input
   R->>R: 计算 should_roll_over
   alt 还有后续工作，且请求新窗口或达到阈值
-    R->>C: ContextLimit、MidTurn、BeforeLastUserMessage
+    R->>C: ContextLimit、MidTurn、当前 StepContext 和 WorldState
     alt TokenBudget
       C->>H: 重置上下文窗口
     else 支持远程压缩 V2
@@ -2109,9 +2116,20 @@ sequenceDiagram
 1. 复制一份历史，加上总结的要求，发一个不带工具的摘要请求。
 2. 摘要请求本身也超窗口的话，就从这份历史的开头删掉一些老条目再试；删不动了就报错。
 3. 拿到摘要后，用（截过长度的）用户消息加摘要拼成新历史。
-4. 调 `replace_compacted_history` 替换内存里的历史，写一条 `RolloutItem::Compacted` 等恢复用的记录，再重新算 token 用量。
+4. 用 `build_compaction_replacement_history` 把初始上下文补进新历史（见下文）。
+5. 调 `replace_compacted_history` 替换内存里的历史，写一条 `RolloutItem::Compacted` 等恢复用的记录，再按当前模型重新算 token 用量。
 
-压缩后初始上下文怎么补回来，看 `InitialContextInjection`。执行中压缩用 `BeforeLastUserMessage`：把必要的上下文插到最后一条真实用户消息前面，同时建好基线。执行前、手动、结束时的压缩用 `DoNotInject`：直接清掉完整上下文的锚点，下一轮自然会全量注入。
+压缩后初始上下文怎么补回来？10-05 之前分两种做法：执行中的压缩当场把上下文插回去；执行前、手动、结束时的压缩只清掉完整上下文的锚点，等下一轮再全量注入。后一种做法的问题是，存进 rollout 的替换历史里没有最新的指令和 skill 清单，恢复会话时就会缺。#51117 把这两种合成了一种，`InitialContextInjection` 这个枚举也删了。
+
+现在四个时机的压缩，不管走本地还是远程 V2，都调用 `build_compaction_replacement_history(sess, step_context, world_state, compacted)`：
+
+1. 用传进来的 `StepContext` 和 `WorldState` 渲染一遍完整上下文，同时得到对应的 `WorldStateSnapshot`。
+2. 把渲染结果按位置分两类。大部分是普通上下文，合并后插到最后一条真实用户消息前面；没有用户消息就插到摘要前面。摘要始终是最后一条。少数标成 `Placement::Prefix` 的放到整份历史最前面，目前只有开了 `incremental_tools` 时的工具定义和 base instructions（§7）。
+3. `replace_compacted_history` 现在要求必须传 `TurnContextItem` 和 `WorldStateSnapshot`，不再接受空值。所以压缩完锚点和 diff 基线都是现成的，下一轮直接算 diff。
+
+`TokenBudget` 分支只重置窗口、不生成替换历史，不走这条路。
+
+还有一个细节：执行前的压缩可能是因为换了模型、旧模型的窗口装不下才触发的。这时摘要还是旧模型来做，但替换历史里的上下文和 token 用量都按新模型算。
 
 压缩之后模型读到的是新历史，但磁盘上旧的 rollout 记录不会被改写，而是追加一条压缩记录，告诉恢复逻辑从哪份历史开始重建，见 §13。
 
@@ -2254,7 +2272,7 @@ rollout 文件名一般长这样：`rollout-{timestamp}-{id}.jsonl`，放在 `$C
 
 恢复分两步：先从存储里读出需要的记录，再调 `ThreadManager::resume_thread_with_history` 建会话。解析记录的活在 `reconstruct_history_from_rollout` 里，`Session` 通过 `apply_rollout_reconstruction` 把结果装进去。
 
-读记录这一步现在按线程的历史模式分两条路（`ThreadHistoryMode`）。`LocalThreadStore` 的默认模式已经从 Legacy 改成了 Paginated（`thread-store/src/local/mod.rs:475`，#47900），所以本地新建的线程都走分页这条：
+读记录这一步现在按线程的历史模式分两条路（`ThreadHistoryMode`）。`LocalThreadStore` 的默认模式已经从 Legacy 改成了 Paginated（`thread-store/src/local/mod.rs:482`，#47900），所以本地新建的线程都走分页这条：
 
 - **Paginated**：app-server 的 `thread/resume` 调 `thread_store.load_latest_model_context`（`thread-store/src/local/model_context.rs`）。它从 rollout 文件末尾往前扫，找到最新一条同时带替换历史和窗口号的 `Compacted`，只返回这条和它之后的记录，不用读完整个文件。压缩检查点里还多存了一份 `resume_metadata`（#47323），恢复时要用的设置和基线从这里取。
 - **Legacy**：老线程还是读完整个 rollout，入口是 `ThreadManager::resume_legacy_thread_from_rollout`。这个方法会拒绝分页线程。
@@ -2307,7 +2325,7 @@ ResponseItem：压缩后的新消息 B
 
 - 模型历史：装回 `ContextManager` 的 `ResponseItemEnvelope` 序列。
 - 前轮设置：后面拿来判断设置有没有变。
-- `reference_context_item`：完整上下文的锚点。压缩记录可能已经把它清掉了，恢复后也要保持清掉的状态。
+- `reference_context_item`：完整上下文的锚点。新的压缩记录都带着锚点；10-05 之前写的旧记录可能把它清掉了，恢复后也要保持清掉的状态。
 - `world_state_baseline`：从有效的完整快照加后续 patch 重建，下一步比较 section 用。
 - 窗口和用量状态：让窗口管理接着之前的状态走。
 
