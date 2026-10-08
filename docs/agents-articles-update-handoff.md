@@ -117,6 +117,15 @@ v2 的 `core/src` 约 6.4 万行（旧文章写的是约 3.3 万行）。设计�
 
 ---
 
+### 2.6 进度（2026-10-08）
+
+已按 `origin/v2` 的 `216c311744`（`@opencode/cli` 2.0.24）整篇重写，直接替换了原文件（URL 不变），开头注明了重写原因，旧版在 git 历史里（`a713790` 及之前）。
+- 读代码的方式：`git archive origin/v2 packages specs` 导出到临时目录，没有切换用户本地仓库的分支（本地仍在 `dev`）。
+- 结构：1 包与进程模型 → 2 整体流程 → 3 收件箱 → 4 调度 → 5 runner → 6 请求组装（指令增量、历史、请求字段）→ 7 attempt → 8 工具 → 9 权限 → 10 压缩 → 11 事件、持久化与恢复 → 12 装配 → 13 Code Mode / 子 agent / 迁移 / 回退 / v1 迁移 → 14 三家对照。13 张 mermaid 图都用 jsdom + mermaid.parse 校验过。
+- 发现 `specs/v2/session.md` 写的“最多重试 4 次”和代码（10 次）不一致，文中以代码为准并注明了。
+
+还可以补的：`packages/ai` 的协议路由只在 §6.5 带过；provider policy、WebSocket 传输、workspace / worktree、TUI 都没展开。
+
 ## 3. pi-mono：需改写部分章节
 
 对比范围 `7a2647f32a..6f7551516`。影响最大的两个提交：

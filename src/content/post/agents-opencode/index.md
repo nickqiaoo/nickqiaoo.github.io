@@ -1,2072 +1,1235 @@
 ---
 title: "opencode 源码解析"
 description: ""
+updatedDate: "2026-10-08"
 publishDate: "2026-09-14"
 tags: ["opencode", "agent"]
 series: agents
 seriesOrder: 2
 ---
 
-## 1. 包与源码目录
+> 本文在 2026-10 按 opencode 的 `v2` 分支整篇重写过，对照的是 `origin/v2` 的 `216c311744`（2026-10-08，`@opencode/cli` 2.0.24）。9 月的旧版分析的是 `dev` 分支里一份 6 月从 v2 分出来的早期原型，很多名字（`promoteSteers`、`runTurnAttempt`、`PermissionV2`、`lildax`）在正式的 v2 里已经不存在了。旧版还能在博客仓库的 git 历史里找到。
+>
+> opencode 现在有两条线：`dev` 分支是 v1 的维护线（`packages/opencode`，1.18.x）；`v2` 分支是重写后的新架构，命令名还是 `opencode`（另有一个 `opencode2`）。下文的源码路径都相对 v2 分支的 `packages/`。
+
+## 1. 包与进程模型
 
 ```mermaid
 graph LR
-  CLI["cli（lildax）<br/>新 CLI：启动 server 守护进程 + TUI"] --> SRV
-  SRV["server<br/>HTTP API：路由 + 中间件 + 处理器"] --> CORE
-  CORE["core<br/>v2 内核：会话、执行、工具、权限、Effect 服务图"] --> LLM
-  CORE --> SCHEMA
-  LLM["llm<br/>统一请求/事件模型 + 各家协议"] --> SCHEMA
-  SCHEMA["schema<br/>纯类型：消息、事件、权限、agent"]
-  OLD["opencode（老 CLI，v1）<br/>自己的 server + SessionPrompt 单体"] -.依赖但不走 v2 runner.-> CORE
-  OLD -.-> SRV
+  CLI["cli<br/>opencode 命令：拉起或连接服务、跑 TUI"] --> CLIENT
+  TUI["tui<br/>终端界面"] --> CLIENT
+  CLIENT["client<br/>生成的 HTTP 客户端 + 托管服务发现"] -->|HTTP / SSE| SERVER
+  SERVER["server<br/>实现 protocol 定义的接口"] --> CORE
+  PROTO["protocol<br/>HttpApi 接口定义"] -.-> SERVER
+  PROTO -.-> CLIENT
+  CORE["core<br/>会话、执行、工具、权限、事件、插件"] --> AI
+  CORE --> CM["codemode<br/>JS 子集解释器"]
+  CORE --> PLUGIN["plugin<br/>插件 API"]
+  AI["ai<br/>统一请求/事件 + 各家协议"] --> SCHEMA
+  CORE --> SCHEMA["schema<br/>纯类型：消息、事件、权限"]
 ```
 
-| 包 | 目录 | 行数 | 干什么 |
+| 包 | 目录 | 行数（不含测试） | 干什么 |
 |---|---|---|---|
-| `@opencode-ai/core` | `core/src` | 32961 | v2 内核。会话门面、执行器、runner、工具、权限、事件总线、Effect 服务图 |
-| `@opencode-ai/server` | `server/src` | 小 | 把 core 的服务挂成 HTTP API。`routes.ts` 是装配点 |
-| `@opencode-ai/cli` | `cli/src` | 69 行入口 | 新 CLI，二进制名 `lildax`。`serve` 起 server，默认命令起 TUI 连 server |
-| `@opencode-ai/llm` | `llm/src` | 2684 | `LLMRequest` / `LLMEvent` / `Message` 统一模型，8 种协议，13 家 provider |
-| `@opencode-ai/schema` | `schema/src` | 2561 | 纯类型定义。`SessionMessage`、会话事件、权限规则、agent 信息都在这 |
-| `opencode`（老包） | `opencode/src` | 76082 | v1 实现。它有自己的 HTTP server 和 1631 行的 `SessionPrompt`。 |
+| `@opencode/core` | `core/src` | 约 6.6 万 | 内核。会话门面、输入收件箱、执行调度、runner、工具、权限、事件总线、插件、服务装配 |
+| `@opencode/ai` | `ai/src` | 约 3.1 万 | 模型层。`LLMRequest` / `LLMEvent` 统一格式，几十种协议，还有生图、语音、转写、视频 |
+| `@opencode/protocol` | `protocol/src` | 约 4300 | 用 Effect 的 `HttpApi` 定义所有 HTTP 接口，server 和 client 都从这里生成 |
+| `@opencode/server` | `server/src` | 约 4100 | 只实现 protocol 里定义的 handler，把调用转给 core |
+| `@opencode/client` | `client/src` | 约 1.7 万 | 生成的客户端；还负责发现、拉起本机的托管服务 |
+| `@opencode/cli` | `cli/src` | 约 1.2 万 | `opencode` 命令 |
+| `@opencode/tui` | `tui/src` | 约 6.2 万 | 终端界面，通过 client 和 server 通信 |
+| `@opencode/schema` | `schema/src` | 约 5700 | 纯类型：会话消息、会话事件、收件箱条目、权限规则等 |
+| `@opencode/codemode` | `codemode/src` | 约 1.1 万 | 一个只支持 JavaScript 子集的解释器，给 Code Mode 用（§13） |
+| `@opencode/plugin` | `plugin/src` | 约 3300 | 插件 API |
+
+v2 的一个基本设计是：**客户端从不直接调用 core**。TUI、CLI、桌面端都是 HTTP 客户端，会话真正跑在一个 server 进程里。`cli/src/services/server-connection.ts` 的 `resolve` 决定连哪个 server：
+
+| 方式 | 怎么触发 | 做什么 |
+|---|---|---|
+| 托管服务（默认） | 什么参数都不加 | `client` 的 `Service.ensure` 先读本机的注册文件找已经在跑的服务，做健康检查和版本检查；找不到就拉起 `opencode serve --service`，等它在注册文件里登记好 |
+| 指定服务 | `--server <url>` | 直接连，版本不一致只打警告 |
+| 独立模式 | `--standalone`，或配置里关掉了托管服务 | 在当前进程里起一个只给自己用的 server |
+
+所以默认情况下，开好几个终端跑 `opencode`，用的是同一个后台服务，会话、权限请求、后台任务都在这个服务里。这也是后面“崩溃恢复”（§11）能成立的前提：同一时刻只有一个托管服务会去恢复会话。
 
 ---
 
 ## 2. 整体执行流程
 
-这篇只看 OpenCode v2 在本地跑的那条路径：一条 HTTP 输入怎么落库、怎么叫醒 runner，runner 怎么拼请求、收模型事件、并发跑工具，最后根据收尾结果决定接着跑还是退出。文中的源码路径都相对仓库的 `packages/`。老 `opencode` 包里 v1 的 `SessionPrompt` 不在这条链上，这里不讲。
-
-先看整体的嵌套关系：`drain` 是 coordinator 安排的一次执行，一次 `run` 里可以跑完多条输入，一次 `runTurn` 又可能因为压缩重新进 attempt。上下文超限后压缩重试只有一次机会，第二次再超就直接失败（§9）。
+先看一条输入从进来到处理完的大致路径。后面每一节展开其中一段。
 
 ```mermaid
 flowchart TD
-  P["SessionV2.prompt：admit 输入"] --> W["coordinator.wake"]
-  W -->|空闲时启动，忙时登记后继通知| D["drain：按 location 注入 runner"]
-  D --> R["run：选择 steer / queue / force"]
-  R --> A["runTurnAttempt：promotion、上下文、历史、工具"]
-  A --> C{"请求前需压缩？"}
-  C -->|是| X["压缩并抛转换信号"]
-  X --> A
-  C -->|否| M["消费模型流，同时启动工具 fiber"]
-  M --> S["flush、等待工具、修补状态、Step.Ended"]
-  S -->|正常返回| N{"needsContinuation 或待处理 steer？"}
-  N -->|是| A
-  N -->|否| Q{"还有 queue？"}
-  Q -->|是| A
-  S -->|失败或中断| E
-  Q -->|否| E["drain 退出，coordinator.settle"]
-  E -->|pendingWake| D
-  E -->|无后继| I["完成 done，移除 entry"]
-  M -.->|输出前溢出且可恢复| X
+  P["Session.prompt：预处理输入"] --> A["SessionInbox.admit：写进 session_inbox"]
+  A --> W["SessionExecution.wake"]
+  W -->|空闲：起一个执行 fiber<br/>忙：按门铃| D["runner.drain"]
+  D --> S["advanceToStep：处理控制项、投递输入、准备上下文"]
+  S --> R["runStep：自动压缩检查、拼请求"]
+  R --> T["SessionStep.attempt：读模型流，边读边并发跑工具"]
+  T -->|Retry / Continue / Compacted / RecoverFull| R
+  T -->|Completed| N{"needsContinuation？"}
+  N -->|是：有工具结果要交回模型| S
+  N -->|否| S2["advanceToStep：还有待投递的输入？"]
+  S2 -->|有| R
+  S2 -->|没有| E["drain 返回 Complete"]
+  E --> C{"执行期间有人按过门铃？"}
+  C -->|是| D
+  C -->|否| I["发 Execution.Succeeded，会话空闲"]
 ```
 
-下面从一次 `prompt` 进入已有会话开始讲：§3–§4 是调度，§5–§8 是一次 attempt 里发生的事，§9–§10 是压缩和持久化，§11 再回头看这些服务是怎么装配起来的。每张图后面只介绍这一步用到的对象和方法。
+几个名词先说清楚：
+
+- **输入（inbox item）**：用户的一句话、系统补的一条通知、一次手动压缩、一次会话迁移，都先作为一条记录放进会话的收件箱，再由 runner 取出来。
+- **执行（execution）**：一个会话从忙到闲的一段时间，对应一个 fiber（Effect 里的轻量线程）。一个执行里可能跑好几次 `drain`。
+- **Step**：一次逻辑上的模型请求加上它触发的工具调用。一个 Step 可能因为重试、压缩等原因发好几次物理请求（attempt）。
+
+§3–§5 是调度，§6–§8 是一个 Step 里发生的事，§9–§10 是权限和压缩，§11 讲持久化和恢复，§12 回头看服务是怎么装配起来的，§13 是 Code Mode、子 agent 等扩展能力。
 
 ---
 
-## 3. 输入接收：从 prompt 到后台 drain
-
-这一节从 HTTP handler 开始，到 local execution 调用 runner 为止。先看时序，搞清楚输入、通知、后台执行三者的关系，再看重复提交和并发怎么处理。
+## 3. 输入：从 prompt 到收件箱
 
 ```mermaid
 sequenceDiagram
   participant H as HTTP handler
-  participant S as SessionV2.prompt
-  participant IN as SessionInput
-  participant EV as EventV2 / Projector
-  participant CO as Coordinator
-  participant EX as local drain
-  participant RN as SessionRunner
-  H->>S: prompt(sessionID, id, prompt, delivery, resume)
-  S->>S: 查会话；规范 prompt；默认 id / delivery
-  S->>IN: admit
-  IN->>IN: find(id)，已有则返回
-  opt 新输入
-    IN->>EV: publish(PromptAdmitted)
-    EV->>EV: 事务内插入 session_input
-    EV-->>IN: durable.seq
+  participant S as Session.prompt
+  participant P as SessionPrompt.prepare
+  participant IN as SessionInbox
+  participant B as Bus / 投影
+  participant EX as SessionExecution
+
+  H->>S: prompt(sessionID, { id?, text, files, skills, delivery, resume })
+  S->>IN: reconcile(id)：这条输入已经收过？
+  alt 已经收过（客户端重试）
+    IN-->>S: 返回已有记录
+  else 新输入
+    S->>P: prepare：插件 session.prompt 钩子、读附件、展开技能
+    P-->>S: 一条 user 类型的收件箱条目
+    S->>S: 会话上有暂存的 revert？先提交它
+    S->>IN: admit
+    IN->>B: publish(session.inbox.enqueued)
+    B->>B: 同一事务：分配序号，投影插入 session_inbox 一行
   end
-  IN-->>S: Admitted
-  S->>S: equivalent：会话、内容、delivery 一致？
-  opt resume 不为 false
-    S->>CO: execution.wake(sessionID)
-    alt 已有 entry
-      CO->>CO: pendingWake = true
-    else 空闲
-      CO->>CO: 登记 entry，start(force=false)
-    end
+  opt resume 不是 false
+    S->>EX: wake(sessionID)
   end
-  S-->>H: Admitted（不等待 runner 完成）
-  Note over CO,RN: 下方为后台 fiber，和 HTTP 返回没有完成先后保证
-  CO->>EX: options.drain(sessionID, force)
-  EX->>EX: store.get → locations.get(session.location)
-  EX->>RN: provide 目录服务，run(sessionID, force)
+  S-->>H: 返回收件箱条目（不等模型跑完）
 ```
 
-### 为什么要分成接收和取出两步
-
-`prompt` 的主干代码如下，省略了会话查询、附件解析和错误类型转换，顺序没动：
-
-```ts
-// core/src/session.ts，节选并省略外围定义
-Effect.uninterruptible(
-  Effect.gen(function* () {
-    const admitted = yield* SessionInput.admit(db, events, {
-      id: messageID,
-      sessionID: input.sessionID,
-      prompt,
-      delivery,
-    })
-    if (!SessionInput.equivalent(admitted, expected))
-      return yield* new PromptConflictError({ sessionID: input.sessionID, messageID })
-    if (input.resume !== false) yield* execution.wake(admitted.sessionID)
-    return admitted
-  }),
-)
-```
-
-`admit` 发一个 `PromptAdmitted` 事件，它的投影往 `session_input` 插一行。这行有两个序号：`admitted_seq` 是接收事件的序号；`promoted_seq` 一开始是空的，表示还没被取出执行。`SessionInput.hasPending` 查的就是这个会话、这种 `delivery` 下有没有 `promoted_seq IS NULL` 的记录。
-
-等 runner 发 `Prompted` 时，投影才填上 `promoted_seq`，同时往 `session_message` 写一条 user 消息。这两处更新和事件写库在同一个事务里，所以不会出现“输入标成已取出了，user 消息却没写进去”的情况。
-
-| 阶段 | `session_input` | 对话历史 | 谁推进 |
-|---|---|---|---|
-| `PromptAdmitted` | 新增记录，`promoted_seq` 为空 | 尚未新增 user 消息 | `SessionV2.prompt` |
-| `Prompted` | 填入 `promoted_seq` | 新增 user 消息 | runner 中的 promotion |
-
-拆成两步后，接收输入不用管 runner 忙不忙；`steer` 和 `queue` 也能在不同的时机进入历史。注意“取出”只表示输入进了历史，不代表模型已经处理完，所以不能拿 `promoted_seq` 判断一次任务有没有成功。
-
-`resume: false` 只是这次不调 `wake`，输入照样入库。它不是暂停会话的开关：runner 如果正在跑，后面查库时照样可能把这条输入取走。
-
-### 重复提交怎么处理
-
-`admit` 先按 id 查一次，有记录就直接返回，没有才发接收事件。投影插入用的是 `onConflictDoNothing()`，没插进去就报 `LifecycleConflict`。发布出了 defect 时，`admit` 会再按这个 id 查一次：查到了就返回这条，查不到就把原来的 defect 抛出去。这是为了处理两个请求一开始都没查到、然后同时去插的情况。
-
-不过 id 已存在，不等于这就是一次正常的重试。回到 `prompt` 里，`equivalent` 还会比对 `sessionID`、`delivery` 和编码后的 prompt 内容，id 相同内容不同就返回 `PromptConflictError`，原来的输入不会被覆盖。前提是客户端重试时带的是同一个 id；不带 id 的话，入口每次都会新生成一个 message id。
-
-重复提交、内容也一致时，还是会走到 `wake`。这样第一次请求其实已经收下了输入、只是客户端没收到响应时，重发一次也能再叫醒执行器。
-
-最外面那层 `Effect.uninterruptible` 包住了接收、校验、唤醒三步，防止取消信号正好落在“已经写库、还没 wake”的中间。但它没法把写库和内存调度变成一个事务，进程崩了也不会自动 wake，崩溃恢复见 §10。
-
-### 输入的结构
-
-```ts
-// schema/src/session-input.ts 中 Admitted 的字段摘要
-// 省略品牌类型和 Schema 声明；序号来自持久化事件。
-type Admitted = {
-  id: MessageID
-  sessionID: SessionID
-  prompt: Prompt
-  delivery: "steer" | "queue"
-  admittedSeq: number
-  promotedSeq?: number
-  timeCreated: DateTime
-}
-```
-
-`Prompt` 里是规范化后的 `text`、`files` 和 `agents`。分工上，`SessionV2` 做输入规范化、幂等校验、调执行接口；`SessionInput` 管输入从接收到取出的整个过程；`SessionExecutionLocal` 按 location 找 runner。三者都没有在内存里另存一份 prompt 队列，待处理的输入只在数据库里。
-
-### `wake`：怎么保证同一个会话只有一个 runner
-
-`SessionExecutionLocal` 是进程级服务，里面建了一个以 `sessionID` 为 key 的 coordinator。它交给 coordinator 的 `drain(sessionID, force)` 每次先读会话当前的 location，用 `locations.get(session.location)` 拿到对应目录的服务注入进去，最后调 `runner.run({ sessionID, force })`。
-
-也就是说，选哪个目录的服务是 local execution 的事，同一会话不并发跑是 coordinator 的事。另外 `runTurnAttempt` 还会检查会话的 location 和当前 runner 还对不对得上，对不上就中断。coordinator 在内存里，只能保证当前进程内串行，不是跨进程的分布式锁。
-
-Coordinator 的状态就一张 `Map<Key, Entry>`：
-
-```ts
-// core/src/session/run-coordinator.ts
-type Entry<E> = {
-  readonly done: Deferred.Deferred<void, E>
-  owner?: Fiber.Fiber<void, never>
-  pendingWake: boolean
-  stopping: boolean
-}
-```
-
-`owner` 是正在执行的 fiber，`done` 是给调用方等的完成信号，另外两个字段用来控制后继执行和中断。看一下 `wake` 就知道为什么不用每来一条输入就建一个任务：
-
-```ts
-const wake = (key: Key) =>
-  Effect.sync(() => {
-    const entry = active.get(key)
-    if (entry !== undefined) {
-      entry.pendingWake = true
-      return
-    }
-
-    const next = makeEntry()
-    active.set(key, next)
-    start(key, next, false)
-  })
-```
-
-查 Map 和改 Map 在同一个同步回调里，中间没有挂起点，别的 fiber 插不进来。空闲时先登记 entry 再起 fiber；已经有 entry 就只把 `pendingWake` 置上。连着来多次 wake，最后就是一个布尔值。
-
-合并了也不会丢输入，因为输入都已经在数据库里了。这个标记的意思只是“跑的过程中又有人喊过，结束时再查一遍”，它不带 prompt，也不管取哪条。
-
-### runner 自己会查队列，为什么还要 `pendingWake`
-
-看 runner 快退出时的一种情况：
+### 3.0 涉及的对象
 
 ```mermaid
-sequenceDiagram
-  participant R as 当前 runner
-  participant P as prompt 请求
-  participant C as coordinator
-  R->>R: 最后一次 hasPending 返回 false
-  P->>P: admit 提交新输入
-  P->>C: wake(sessionID)
-  Note over C: 旧 entry 仍在，pendingWake = true
-  R-->>C: drain 返回，进入 settle
-  C->>C: 消费 pendingWake，启动后继 drain
-  C->>R: runner.run(force = false)
-  R->>R: 查询数据库，取出新输入
+classDiagram
+  class SessionHandle {
+    <<Session.make().forSession(id)>>
+    id: SessionID
+    +get() / message(id)
+    +prompt(input) SessionInbox.Info
+    +synthetic(input) / skill(input) / shell(input)
+    +compact() / revert(...)
+    +inbox() / cancelInbox(id) / steerInbox(id) / queueInbox(id)
+    +switchAgent / switchModel / rename / setPermissions
+    +wait() / resume() / interrupt()
+  }
+  class SessionPrompt {
+    <<模块>>
+    +prepare(session, messageID, input) SessionInbox.Item
+  }
+  class SessionInbox {
+    <<全局服务>>
+    +reconcile(id, sessionID, type, delivery)
+    +admit(id, sessionID, item)
+    +admitCompaction(id, sessionID, delivery)
+    +cancel / steer / queue(ref)
+    +list(sessionID)
+  }
+  class SessionInboxModule {
+    <<模块函数，runner 直接调>>
+    +nextPromotable(db, sessionID, scope)
+    +promote(db, bus, sessionID, scope) number
+    +has(db, sessionID, scope)
+    +serialized(sessionID, effect)
+    +projectAdmitted / projectDelivered / projectCancelled
+  }
+  class SessionExecution {
+    +wake(sessionID)
+  }
+  SessionHandle ..> SessionPrompt : 预处理
+  SessionHandle ..> SessionInbox : 入库
+  SessionHandle ..> SessionExecution : 叫醒
+  SessionInbox ..> SessionInboxModule : 投影函数
 ```
 
-如果正在跑的时候直接忽略 wake，这条输入恰好落在 runner 最后一次查询之后，runner 又已经决定退出了，这条输入就没人管了。`pendingWake` 把这次通知留到 `settle` 时处理，补上这个空档。
+| 对象 | 存什么 | 干什么 |
+|---|---|---|
+| `Session.make` 返回的会话句柄（`core/src/session/session.ts`） | 只存会话 id。每次调用都重新读数据库，不缓存会话状态 | 对外的会话操作入口。决定输入的幂等规则、入库顺序、要不要叫醒执行。HTTP handler 最终都调到这里 |
+| `SessionPrompt.prepare` | 无状态 | 把原始输入变成收件箱条目：插件钩子、附件、技能（§3.1） |
+| `SessionInbox.Service` | 持有数据库和 Bus 的引用 | 入库、改投递方式、撤回。所有改动都在“每个会话一把锁”（`serialized`）里串行，并用事件 + 投影完成 |
+| `SessionInbox` 模块函数 | 无状态 | runner 用的读取和投递：看下一条可投递的条目、正式投递、查有没有待处理的输入 |
 
-反过来，输入来得早一点，已经被当前 runner 取走了，`pendingWake` 也可能还是 true。这时后继 drain 只是多查一次库，不会多调一次模型：wake 起的执行是 `force = false`，没有待处理的 steer 或 queue 就直接返回。
+会话句柄不会因为被拿到或丢掉而启动、停止执行；同一个会话的输入随时都能提交，和执行是否在跑无关。
 
-所以这两层检查管的事不一样：runner 的 `hasPending` 决定当前循环要不要继续；coordinator 的 `pendingWake` 保证 runner 退出那一刻来的通知不会被吞掉。
+### 3.1 预处理：`SessionPrompt.prepare`
 
-### 正常结束、失败、中断时，等待者怎么办
+`prepare`（`core/src/session/prompt.ts`）把客户端提交的原始输入变成一条可以入库的收件箱条目，但不入库：
 
-`settle` 不是简单地“删 entry、通知等待者、再起下一次”，它要看当前执行是怎么退出的：
+1. 等插件激活完成，触发 `session.prompt` 钩子。插件可以改文字、附件、技能、metadata 和投递方式。
+2. 附件逐个读出来（并发 8 个），单个不超过 20 MiB。`file://` 地址读文件，带 `?start=&end=` 时只取这几行；目录会被转成文件列表；`data:` 地址直接解码；图片会被规整，必要时缩小。
+3. 用户点名的技能（skill）在这一步就读出正文，存进条目里。
+
+预处理完，`Session.prompt` 还要做一件事：如果会话上有“暂存的回退”（用户选了回退到某个点但还没确认），新输入一进来就提交这次回退。
+
+### 3.2 收件箱表
+
+`admit` 发一个持久化事件 `session.inbox.enqueued`，它的投影往 `session_inbox` 插一行（`core/src/session/sql.ts`）：
+
+| 列 | 含义 |
+|---|---|
+| `id` | 输入的 id，也是它以后变成消息时的消息 id |
+| `session_id` | 所属会话 |
+| `type` | `user`（用户输入）/ `synthetic`（系统补的通知，比如后台命令跑完了）/ `compaction`（手动压缩）/ `move`（会话迁移到别的目录） |
+| `payload` | 条目内容（JSON） |
+| `delivery` | `steer` 或 `queue`，见下 |
+| `enqueued_seq` | 入队事件在会话事件流里的序号，决定先后顺序 |
+
+这张表**只放还没处理的输入**。投递时，`session.inbox.delivered` 的投影在同一个事务里删掉这一行，再往 `session_message` 插一条可见的用户消息。所以“取出”和“出现在对话历史里”是原子的，不会出现一边成功一边失败。压缩、迁移这两种控制项被取出时只删行，不产生对话消息。
+
+### 3.3 两种投递方式
+
+| `delivery` | 什么时候被取出 | 用途 |
+|---|---|---|
+| `steer`（默认） | 下一个“安全的 Step 边界”：当前 Step 的模型回复和工具都结束之后 | 用户在模型干活时插一句话，模型在下一步就能看到 |
+| `queue` | 会话本来要停下的时候。而且每次只取一条，取完让模型处理完再看下一条 | “做完手上的事再做这个” |
+
+具体规则在 `SessionInbox.promote` 里：
 
 ```ts
-// core/src/session/run-coordinator.ts，settle 的关键分支
-if (Exit.isSuccess(exit) && !entry.stopping && entry.pendingWake) {
-  entry.pendingWake = false
-  start(key, entry, false, true)
-  return
+// core/src/session/inbox.ts，promote 的主干
+const steers = yield* pendingSteers(db, sessionID)
+if (steers.length > 0 || scope === "steer") {
+  const control = steers.findIndex((row) => row.type === "compaction" || row.type === "move")
+  if (control === 0) return undefined                  // 排在最前面的是控制项：交给 runner 先处理
+  return yield* publish(db, bus, sessionID, control === -1 ? steers : steers.slice(0, control))
 }
-
-const successor = entry.pendingWake ? makeEntry() : undefined
-if (successor === undefined) active.delete(key)
-else {
-  active.set(key, successor)
-  start(key, successor, false, true)
-}
-Deferred.doneUnsafe(entry.done, exit)
+// 没有 steer，且允许取 queue：只取最早的一条 queue
+const queued = /* 最早一条 delivery = queue 的行 */
+if (!queued) return 0
+if (queued.type === "compaction" || queued.type === "move") return undefined
+const promoted = yield* publish(db, bus, sessionID, [queued])
+// 投递这条 queue 期间又来的 steer，跟着一起投
+const arrivedSteers = yield* pendingSteers(db, sessionID)
+...
 ```
 
-正常结束、又有 pending wake 时，后继 drain 直接复用这个 entry，`done` 先不完成，在等它的调用方会一直等到后继也跑完。如果执行失败了，或者正在 stopping，就用原来的退出结果完成原 entry 的 `done`；这时还有新的 wake，就另建一个 entry 去跑。不这么分开的话，原来那次的失败会被后继的成功盖掉。
+有几个细节：
 
-顺便说一下 `resume` 和 `wake` 的区别。local execution 把 `resume` 映射成 coordinator 的 `run`：空闲时用 `force = true` 起一次执行；已经在跑就一起等同一个 `done`，不设 `pendingWake`；entry 正在 stopping 就等它退出后再 `run`。`wake` 只登记通知，不等执行完。
+- **steer 一次全投**，所有等着的 steer 按顺序一起变成用户消息，但不会越过控制项。比如收件箱里是 `[steer A, 压缩, steer B]`，这次只投 A，压缩做完再投 B。
+- **手动压缩会插队到 steer 前面**（`pendingSteers` 里的那段排序）。用户先说了两句话、又点了压缩，会先压缩再投递这两句话，这样它们原文保留在压缩点之后，而不是被压进摘要里。但压缩不会越过“迁移”，因为迁移会改变工作目录。
+- **入参 `scope`** 决定能不能取 queue：`"steer"` 只取 steer，`"input"` 在没有 steer 时可以取一条 queue。谁传哪个，见 §5。
 
-`run` 用 `uninterruptibleMask` 包住创建和登记 entry 这一段，等 `done` 的部分用 `restore` 放开，可以取消。执行 fiber 挂在 coordinator 的 `FiberSet` 上，所以某个等待者取消了，不会把大家共用的那次执行也取消掉；真要停下来得调 `interrupt`。
+条目入库后还可以改：`session.inbox.update` 能把一条 steer 改成 queue 或反过来（改成 steer 会顺便 `wake`），`session.inbox.cancel` 能撤回还没投递的条目。
 
-`interrupt` 先把 `stopping` 置为 true、清掉已有的 `pendingWake`，再中断 owner 并等它清理完。清理期间又来了 wake，`pendingWake` 会重新置上，`settle` 随后建一个后继 entry。这样中断之前攒下的通知被丢掉，中断过程中新来的会保留。清掉通知不会删库里的输入。
+### 3.4 重复提交
 
-后继的 `start` 前面还有一个 `Effect.yieldNow`：drain 如果同步跑完、又同步 wake 了自己，没有这一步就会在 `settle` 里一直递归下去。`core/test/session-run-coordinator.test.ts` 里有 wake 合并、失败后的后继执行、中断清理期间的新 wake、同步自唤醒这几个用例，看上面几个分支时可以对照着看。
+客户端可以自己带 `id`。`reconcile` 先查收件箱，再查已经投递成消息的记录，查到了而且会话、类型都对得上，就直接返回已有的那条，不重新预处理，**以第一次为准**，重试时带的新内容会被忽略。会话或类型对不上则报冲突。不带 `id` 的话每次都生成新 id，等于新输入。
+
+发布事件和查重之间有竞争：两个请求同时查不到、同时去插。投影插入用 `onConflictDoNothing`，没插进去就以 defect 的形式中止事务，`admit` 捕获后再查一次：查到了就返回那条，查不到才真的报错。
+
+`resume: false` 只表示这次不叫醒执行，输入照样入库。执行如果正在跑，后面照样会把它取走。
+
+整段 `prompt` 包在 `Effect.uninterruptibleMask` 里，只有预处理那一步允许被取消。这样不会出现“已经入库、还没 wake 就被取消”的情况。
 
 ---
 
-## 4. Runner 循环
+## 4. 调度：同一个会话同一时刻只有一个执行
 
-上一节最后调到了 `runner.run({ sessionID, force })`。这个接口不带 prompt，runner 自己去库里查待处理的输入，`promotion` 决定下一次 attempt 取哪一类。下面用 A、B、C 三条输入走一遍，看两层循环分别在哪里退出。
+`SessionExecution`（`core/src/session/execution.ts`）是进程级的服务，按会话 id 管执行。它把调度规则交给一个通用的 `SessionRunCoordinator`（`run-coordinator.ts`），自己负责“真正执行时做什么”。
+
+```mermaid
+classDiagram
+  class SessionExecution {
+    <<全局服务>>
+    +active() Set~SessionID~
+    +isActive(sessionID) boolean
+    +resume(sessionID)
+    +wake(sessionID)
+    +interrupt(sessionID, options) boolean
+    +awaitIdle(sessionID)
+    -drain(sessionID, force, continuation, promotable)
+  }
+  class Coordinator {
+    -executions: Map~SessionID, Execution~
+    -fork: FiberSet 运行时
+    +run(key)
+    +wake(key, scope)
+    +interrupt(key, reason)
+    +awaitIdle(key)
+    -start(key, force, scope)
+    -loop(key, execution, force)
+    -settle(key, execution, exit)
+  }
+  class Execution {
+    done: Deferred
+    owner?: Fiber
+    scope: input 或 steer
+    pendingWake?: input 或 steer
+    stopping: boolean
+    interruptionReason?
+  }
+  class SessionStore {
+    +get(sessionID)
+    +claim(sessionID) / release(sessionID)
+    +listSuspended() / countResume(sessionID)
+  }
+  class SessionRunner {
+    <<目录级服务>>
+    +drain(sessionID, force, continuation, promotable) DrainResult
+  }
+  SessionExecution *-- Coordinator : make 时传入 started / drain / settled
+  Coordinator o-- Execution : 每个忙碌的会话一个
+  SessionExecution ..> SessionStore : 读会话、写声明
+  SessionExecution ..> SessionRunner : 经 Instance.provide 取到
+```
+
+| 方法 | 干什么 | 谁调它 |
+|---|---|---|
+| `wake` | 空闲时起一个执行；忙时按门铃，不等待 | `Session.prompt`、`steerInbox`、后台任务完成通知等 |
+| `resume`（coordinator 的 `run`） | 空闲时起执行并等它结束；忙时一起等；正在停止时等它停完再起新的 | 崩溃恢复（§11.4）、子 agent 任务（`subagent-job.ts`） |
+| `interrupt` | 标记停止、清门铃、中断 fiber，立即返回 | 接口 `session.interrupt`；目录长时间不活跃时由 `location-activity.ts` 以 `inactivity` 原因中断 |
+| `awaitIdle` | 等到这个会话没有执行为止（包括清理期间新起的后继执行），自己从不启动执行 | 接口 `session.wait` |
+
+### 4.1 Coordinator 的状态
+
+```ts
+// core/src/session/run-coordinator.ts
+type Execution<E, Reason> = {
+  readonly done: Deferred.Deferred<void, E>   // 等这次执行结束的人在这上面等
+  owner?: Fiber.Fiber<void>                   // 执行它的 fiber
+  scope: Promotable                           // 这一轮 drain 能取哪些输入："input" 或 "steer"
+  pendingWake?: Promotable                    // 门铃：执行期间又有人 wake 过
+  stopping: boolean                           // 正在被中断
+  interruptionReason?: Reason
+}
+```
+
+整个 coordinator 就是一张 `Map<会话 id, Execution>`。
+
+```ts
+const wake = (key: Key, scope: Promotable = "input") =>
+  Effect.sync(() => {
+    const execution = executions.get(key)
+    if (execution !== undefined) {
+      // 合并多次 wake 时取范围大的："input" 包含 "steer"
+      execution.pendingWake = execution.pendingWake === "input" ? "input" : scope
+      return
+    }
+    start(key, false, scope)
+  })
+```
+
+空闲时直接起一个执行；忙的时候只按一下“门铃”。执行的主循环是：
+
+```ts
+const loop = (key, execution, force) =>
+  Effect.suspend(() => options.drain(key, force, execution.scope)).pipe(
+    Effect.andThen(Effect.suspend(() => {
+      if (execution.stopping || execution.pendingWake === undefined) return Effect.void
+      execution.scope = execution.pendingWake
+      execution.pendingWake = undefined
+      return Effect.yieldNow.pipe(Effect.andThen(loop(key, execution, false)))
+    })),
+  )
+```
+
+drain 一次跑完，看门铃有没有响过；响过就再 drain 一次。为什么 runner 自己会查收件箱，还需要门铃？因为 runner“最后一次查收件箱发现是空的”和“决定退出”之间不是原子的。新输入恰好落在这个空档里，如果 wake 被忽略，这条输入就没人管了。门铃把这次通知留到 drain 结束后处理。反过来，输入已经被当前 drain 取走、门铃也响过，后面多出来的那次 drain 只会查一次库发现没事可做，不会多调一次模型。
+
+### 4.2 执行开始和结束时做什么
+
+`SessionExecution` 给 coordinator 传了三个回调：
+
+| 回调 | 做什么 |
+|---|---|
+| `started` | 一段忙碌期开始时发 `session.execution.started`，**同一个事务里**写一个执行声明（claim，§11） |
+| `drain` | 读会话，用 `instances.provide(session)` 进入会话所在目录的那套服务（§12），调 `runner.drain`。返回 `Moved`（会话迁移到别的目录了）或 `Reloaded`（目录的服务重载了）时，重新读会话再 drain 一次 |
+| `settled` | 一段忙碌期结束时只发一个终止事件：成功 `succeeded`、失败 `failed`、被中断 `interrupted`。前两种和用户主动中断都会同时释放声明；**关机导致的中断不释放**，留给下次启动恢复 |
+
+`run`（对外叫 `resume`）和 `wake` 的区别：`run` 会等执行结束；已经有执行在跑就一起等同一个 `done`。`wake` 只按门铃不等待。
+
+`interrupt` 把执行标成 `stopping`，清掉已经响过的门铃（那些属于被中断的意图），然后中断 fiber，**不等清理完就返回**。清理期间新来的 wake 会正常重新起执行。接口上 `interrupt` 还有一个 `resume` 选项：中断后如果收件箱最前面是 steer 或控制项，就用 `"steer"` 范围再 wake 一次，接着处理用户插的话，但不会去取 queue 里的下一个任务。
+
+---
+
+## 5. Runner：从投递输入到一个个 Step
+
+`runner.drain`（`core/src/session/runner/llm.ts`）是一次 drain 的全部逻辑。外层循环 `advanceToStep` 决定下一个 Step 用什么输入，内层 `runStep` 负责把这个 Step 跑完。
+
+### 5.0 执行组件
+
+```mermaid
+classDiagram
+  class SessionRunner {
+    <<目录级服务，runner/llm.ts>>
+    -titles: FiberMap 生成标题的后台任务
+    +drain(input) DrainResult
+    -advanceToStep() Ready 或 DrainResult
+    -prepareContext(sessionID) Selection
+    -runStep(loaded, step) boolean
+    -settleStaleCompactions(sessionID)
+    -settleStaleToolCalls(sessionID)
+  }
+  class DrainResult {
+    <<tagged enum>>
+    Complete
+    Moved(continuation?)
+    Reloaded(force, continuation?)
+  }
+  class SessionContext {
+    +select(sessionID) Selection
+    +load(selection) Loaded
+    +resolveModel(session)
+    +request: SessionModelRequest
+  }
+  class Loaded {
+    session
+    agent
+    model: Resolved
+    initial: 指令基线文本
+    messages: SessionMessage[]
+    tools: Tool.Snapshot
+  }
+  class SessionModelRequest {
+    +primary(input) Prepared
+    +compaction(input) Prepared
+    +generate(input) Prepared
+    +title(input) Prepared
+  }
+  class Prepared {
+    event
+    request: LLMRequest
+    options: http / webSocket
+    retry(event)
+    executeTool(call) NormalizedResult
+  }
+  class SessionStep {
+    +attempt(input) Outcome
+  }
+  class SessionCompaction {
+    +compact(trigger) skipped / completed / failed
+  }
+  class InstructionState {
+    <<模块>>
+    +prepare(db, bus, instructions, sessionID)
+    +initial(db, sessionID, instructions)
+  }
+  SessionRunner ..> DrainResult : 返回
+  SessionRunner --> SessionContext
+  SessionRunner --> SessionStep
+  SessionRunner --> SessionCompaction
+  SessionRunner ..> InstructionState : prepareContext 时调
+  SessionContext ..> Loaded : load 返回
+  SessionContext --> SessionModelRequest
+  SessionModelRequest ..> Prepared : 返回
+  SessionStep ..> Prepared : 用它发请求、执行工具
+```
+
+| 组件 | 作用 |
+|---|---|
+| `SessionRunner` | 一次 drain 的全部逻辑。自己不存会话状态，状态都在数据库里；只用一个 `FiberMap` 管生成标题的后台任务，避免同一会话重复生成 |
+| `DrainResult` | drain 怎么结束的：`Complete` 没活了；`Moved` 会话搬到别的目录了；`Reloaded` 目录的服务重载了。后两种由 `SessionExecution` 换一套服务接着 drain，并带上当前步数，让步数限制跨过这次切换 |
+| `SessionContext` | 分两段准备上下文：`select` 定会话、agent、指令来源和工具快照；`load` 再加上模型和历史（§6） |
+| `SessionModelRequest` | 为四种请求（主对话、压缩、生成、标题）各自拼请求，各走各的插件钩子（§6.5） |
+| `SessionStep` | 一次物理请求：读流、跑工具、得出 `Outcome`（§7） |
+| `SessionCompaction` | 判断要不要压缩、执行压缩（§10） |
+| `InstructionState` | 指令的增量同步（§6.2） |
+
+### 5.1 一个例子
+
+用户先发 A（steer），模型在调工具时又发了 B（steer）和 C（queue）：
 
 ```mermaid
 sequenceDiagram
   participant U as 用户
-  participant SV as SessionV2.prompt
-  participant DB as session_input 表
-  participant CO as Coordinator
-  participant RN as run 双层 while
-  participant RT as runTurnAttempt
+  participant IN as session_inbox
+  participant EX as Coordinator
+  participant AD as advanceToStep
+  participant RS as runStep
 
-  U->>SV: prompt(A, steer)
-  SV->>DB: A: admitted_seq=10, promoted_seq=NULL
-  SV->>CO: wake → 空闲 → 起 drain
-  CO->>RN: run(force=false)
-  RN->>DB: hasPending(steer)=true → promotion=steer
-  RN->>RT: runTurn(promotion=steer, step=1)
-  RT->>DB: cutoff=latestSequence=10，promoteSteers(<=10) → A 变 user 消息
-  Note over RT: 正在流式收响应
-  U->>SV: prompt(B, steer)
-  SV->>DB: B: admitted_seq=15, promoted_seq=NULL
-  SV->>CO: wake → 正在跑 → pendingWake=true
-  U->>SV: prompt(C, queue)
-  SV->>DB: C: admitted_seq=16, promoted_seq=NULL
-  RT-->>RN: { needsContinuation: true（有工具）, step: 1 }
-  RN->>RN: promotion=steer, step=2
-  RN->>RT: runTurn(steer, 2)
-  RT->>DB: cutoff=20，promoteSteers → B 取出执行，promoted 大于 0 → currentStep=1
-  RT-->>RN: { needsContinuation: false, step: 1 }
-  RN->>DB: hasPending(steer)=false → 内层退出
-  RN->>DB: hasPending(queue)=true → shouldRun=true, promotion=queue
-  RN->>RT: runTurn(queue, 1)
-  RT->>DB: promoteNextQueued → C 取出执行；再 promoteSteers（没有）
-  RT-->>RN: { needsContinuation: false, step: 1 }
-  RN->>DB: hasPending(queue)=false → 外层退出
-  RN-->>CO: 结束
-  CO->>CO: settle：pendingWake 为真 → 起后继 drain(force=false)
-  CO->>RN: run → hasPending 都为 false → 直接 return
+  U->>IN: A（steer）
+  U->>EX: wake → 空闲，起执行
+  EX->>AD: drain(force=false, scope=input)
+  AD->>IN: promote("input") → A 变成用户消息
+  AD->>RS: Step 1
+  Note over RS: 模型回复里有工具调用，正在跑
+  U->>IN: B（steer）、C（queue）
+  U->>EX: wake → 忙，按门铃
+  RS-->>AD: needsContinuation = true
+  AD->>IN: 继续中：只能 promote("steer") → B 变成用户消息
+  AD->>RS: Step 1（有新输入，步数重置）
+  RS-->>AD: needsContinuation = false
+  AD->>IN: 不再继续：promote("input") → 没有 steer，取一条 queue：C
+  AD->>RS: Step 1
+  RS-->>AD: needsContinuation = false
+  AD->>IN: promote("input") → 没东西了
+  AD-->>EX: Complete
+  EX->>EX: 门铃响过 → 再 drain 一次 → 没事可做 → 结束
 ```
 
-### 执行组件关系
-
-`SessionExecution` 是会话执行的接口，本地 layer 把它的几个方法直接绑到 `SessionRunCoordinator` 上。Coordinator 管同一会话的并发和等待；真要执行时回调 local 的 `drain`，由 `drain` 按会话的 Location 拿到 `SessionRunner`。
-
-图里的 `SessionExecutionLocal` 指的是本地 layer 和里面的闭包，`CoordinatorEntry` 指协调器为一次执行存的状态，源码里都没有同名的 class。
-
-```mermaid
-classDiagram
-  direction TB
-  class SessionExecution {
-    <<Service global>>
-    active
-    resume(sessionID)
-    wake(sessionID)
-    interrupt(sessionID)
-  }
-  class SessionExecutionLocal {
-    <<local layer>>
-    store: SessionStore
-    locations: LocationServiceMap
-    coordinator: Coordinator
-    drain(sessionID, force)
-  }
-  class SessionRunCoordinator {
-    active: Map
-    run(key)
-    wake(key)
-    interrupt(key)
-    start(key, entry, force, successor)
-    settle(key, entry, exit)
-  }
-  class CoordinatorEntry {
-    done: Deferred
-    owner: Fiber
-    pendingWake: boolean
-    stopping: boolean
-  }
-  class SessionStore {
-    get(sessionID)
-    context(sessionID)
-  }
-  class LocationServiceMap {
-    get(location)
-  }
-  class SessionRunner {
-    <<Service location>>
-    run(sessionID, force)
-  }
-  SessionExecutionLocal ..> SessionExecution : 提供接口实现
-  SessionExecutionLocal --> SessionRunCoordinator : make 并绑定方法
-  SessionRunCoordinator *-- CoordinatorEntry : 每个活跃会话的状态
-  SessionRunCoordinator ..> SessionExecutionLocal : start 回调 drain
-  SessionExecutionLocal --> SessionStore : 查询 session.location
-  SessionExecutionLocal --> LocationServiceMap : 取得 location layer
-  SessionExecutionLocal ..> SessionRunner : provide 后调用 run
-```
-
-`SessionRunner` 的实现在 `session/runner/llm.ts`。layer 构造时拿到依赖的服务，`runTurnAttempt` 这些内部函数都是闭包。下图用 `RunnerImplementation` 代指这组闭包，源码里没有这个类。`LLMEventPublisher` 是每次 attempt 新建的。
-
-```mermaid
-classDiagram
-  direction TB
-  class SessionRunner {
-    <<Service interface>>
-    run(sessionID, force)
-  }
-  class RunnerImplementation {
-    <<llm.ts layer closures>>
-    events: EventV2
-    llm: LLMClient
-    models: SessionRunnerModel
-    tools: ToolRegistry
-    store: SessionStore
-    location: Location
-    db: Database
-    compaction: SessionCompaction
-    run(input)
-    runTurn(sessionID, promotion, step)
-    runTurnAttempt(sessionID, promotion, step, recoverOverflow)
-    runAfterOverflowCompaction(sessionID, promotion, step)
-    failInterruptedTools(sessionID)
-    loadSystemContext(agent)
-  }
-  class SessionInput {
-    <<functions>>
-    hasPending(db, sessionID, mode)
-    promoteSteers()
-    promoteNextQueued()
-  }
-  class SessionContextEpoch {
-    <<functions>>
-    initialize()
-    prepare()
-    reset()
-  }
-  class SessionRunnerModel {
-    <<Service location>>
-    resolve(session)
-  }
-  class ToolRegistry {
-    materialize()
-    settleWith()
-  }
-  class LLMEventPublisher {
-    publish(event, outputPaths)
-    flush()
-    failAssistant(message)
-    failUnsettledTools(message, hostedOnly)
-    stepSettlement()
-  }
-  class SessionCompaction {
-    compactIfNeeded(input)
-    compactAfterOverflow(input)
-  }
-  class TurnTransitionError {
-    transition
-    step
-  }
-  RunnerImplementation ..> SessionRunner : 提供 run 实现
-  RunnerImplementation ..> SessionInput : 查询和取出待处理输入
-  RunnerImplementation ..> SessionContextEpoch : 准备上下文 epoch
-  RunnerImplementation --> SessionRunnerModel : 解析模型
-  RunnerImplementation --> ToolRegistry : 构造工具并执行调用
-  RunnerImplementation ..> LLMEventPublisher : 每次 attempt 创建
-  RunnerImplementation *-- SessionCompaction : layer 构造时创建
-  RunnerImplementation ..> TurnTransitionError : 压缩后切换执行分支
-```
-
-图里只画了主要依赖。系统上下文、skill、引用引导见 §5，工具内部见 §7，location layer 的创建和释放见 §11。
-
-### `SessionRunner`
-
-`SessionRunner` 从库里已有的历史出发，把待处理的输入跑完。对外接口只有一个方法 `run({ sessionID, force })`，不接收消息参数。
-
-错误类型写在方法签名里（`index.ts`）：`RunError = LLMError | ModelError | MessageDecodeError | ContextSnapshotDecodeError | InitializationBlocked | ToolOutputStore.Error`。
-少处理一种，编译就会报错。
-
-字段（构造 layer 时取，`llm.ts`）：13 个服务加一个 `compaction` 对象。其中 `location` 是这个 runner 绑定的目录，后面用来检查会话是不是还在这个目录下。
-
-内部主要函数：
-
-| 函数 | 干什么 | 谁调它 |
-|---|---|---|
-| `run(input)` | 用双层循环把待处理输入跑完，详见 §4 | `SessionExecutionLocal.drain` |
-| `runTurn(sessionID, promotion, step)` | 调 `runTurnAttempt` 并传入 `compaction.compactAfterOverflow` 作为溢出恢复函数；捕获 `TurnTransitionError`：压缩后重来一次 `runTurn`，溢出压缩后转 `runAfterOverflowCompaction` | `run` |
-| `runAfterOverflowCompaction(...)` | 和 `runTurn` 一样但不传溢出恢复函数。再溢出就 die："Post-compaction provider attempt cannot recover another overflow" | `runTurn` |
-| `runTurnAttempt(sessionID, promotion, step, recoverOverflow?)` | 完成一次 attempt：请求准备见 §5，流消费见 §6，收尾见 §8 | 上面两个 |
-| `failInterruptedTools(sessionID)` | 遍历上下文里所有 assistant 的 tool 项，`pending` 或 `running` 的发 `Tool.Failed`，文案 "Tool execution interrupted" | `run` 开头 |
-| `loadSystemContext(agent)` | 并发加载三个上下文源（注册表、技能引导、引用引导），`SystemContext.combine` | `runTurnAttempt` |
-| `isUserDeclined(cause)` | 失败原因里有 `PermissionV2.DeclinedError` 或 `QuestionV2.RejectedError` 就算用户拒绝 | `runTurnAttempt` |
-
-### `run`
+### 5.2 drain 开始前
 
 ```ts
-const hasSteer = yield* SessionInput.hasPending(db, sessionID, "steer")
-const hasQueue = hasSteer ? false : yield* SessionInput.hasPending(db, sessionID, "queue")  // 有 steer 就不看 queue
-if (!input.force && !hasSteer && !hasQueue) return                                // wake 来的且没活 → 走人
-yield* failInterruptedTools(input.sessionID)                                      // §10
-let promotion = hasSteer ? "steer" : hasQueue ? "queue" : undefined
-let shouldRun = input.force || hasSteer || hasQueue
-while (shouldRun) {                                                               // 外层：queue
-  let needsContinuation = true
-  let step = 1
-  while (needsContinuation) {                                                     // 内层：工具续接 + steer
-    const result = yield* runTurn(sessionID, promotion, step)
-    needsContinuation = result.needsContinuation
-    step = result.step + 1                                                        // 注意 result.step 可能被重置成 1
-    promotion = "steer"                                                           // 第二轮起只取出执行 steer
-    if (!needsContinuation) needsContinuation = yield* hasPending(db, sessionID, "steer")   // 没工具了？看看有没有插话
-  }
-  shouldRun = yield* hasPending(db, sessionID, "queue")                           // 内层退出 → 看 queue
-  promotion = shouldRun ? "queue" : undefined
+if (!force && !continuing) {
+  const pending = yield* SessionInbox.nextPromotable(db, sessionID, "input")
+  if (!pending) return DrainResult.Complete()                       // 没活就直接走
+  const control = pending.type === "compaction" || pending.type === "move"
+  if (promotable === "steer" && pending.delivery === "queue" && !control) return DrainResult.Complete()
+}
+yield* plugins.awaitActivation
+yield* settleStaleCompactions(sessionID)   // 上个进程死时没收尾的压缩，标成失败
+yield* settleStaleToolCalls(sessionID)     // 上个进程死时还在跑的工具调用，标成失败
+```
+
+后两步是崩溃恢复的一部分（§11）：数据库里还显示 running 的压缩和工具调用，其实已经没人在跑了，要先收尾，否则模型下一次请求会看到一个永远没有结果的工具调用。
+
+### 5.3 `advanceToStep`：下一个 Step 用什么输入
+
+它是一个循环，每圈做这些事：
+
+1. 目录的服务已经关闭（比如配置重载了）？返回 `Reloaded`，让外面换一套服务再来。
+2. 在收件箱锁内看下一条可投递的条目（`nextPromotable`）。这里的范围是：刚进入 drain 或者上一个 Step 不需要继续时用 `"input"`，否则用 `"steer"`。也就是说，**模型还在干活时只接受插话，不接新任务**。
+   - 是**压缩**：发 `inbox.delivered` 和 `compaction.started`，做一次手动压缩（§10），然后回到循环开头。
+   - 是**迁移**：关掉模型的 WebSocket 连接，发 `inbox.delivered` 和 `session.moved`，返回 `Moved`。
+3. 不需要继续、又没有可投递的输入（或者只有 queue 而当前范围是 steer），返回 `Complete`。
+4. 准备上下文（`prepareContext`，§6），然后正式 `promote`。这一步会把输入变成对话消息。有新输入被投递时，步数重置为 1；如果会话还没有标题，后台起一个生成标题的任务，不阻塞模型请求。
+5. `context.load` 加载模型和历史，返回 `Ready`。
+
+整个 `advanceToStep` 跑在 `uninterruptibleMask` 里，只有真正等待的部分（准备上下文、压缩）允许被打断。这样不会出现“投递事件发了一半就被中断”。
+
+主循环很短：
+
+```ts
+while (true) {
+  const next = yield* advanceToStep()
+  if (next._tag !== "Ready") return next              // Complete / Moved / Reloaded
+  continuing = yield* runStep(next.context, step)     // 返回 needsContinuation
+  step++
+  force = false
+  entering = false
 }
 ```
 
-### 与 pi-mono 对照
+### 5.4 步数上限
 
-| pi-mono `runLoop` | opencode `run` | 差别 |
+每个 agent 可以配置 `steps`（最多连续多少个 Step）。到上限时，`runStep` 不会直接停下，而是在消息末尾加一段 `MAX_STEPS_PROMPT`（“已经到最大步数，不许再调工具，总结一下做了什么、还剩什么”），同时把 `toolChoice` 设成 `"none"`。工具定义仍然带上，这样请求前缀不变，提示缓存还能命中。万一模型还是调了工具，执行时会直接返回错误“工具在最大步数之后被禁用”。
+
+用户插话会重置步数：“新输入进来，模型又有了完整的步数额度”。一批 steer 只重置一次。
+
+### 5.5 `runStep`：一个 Step 可能发好几次请求
+
+```ts
+while (true) {
+  const loaded = initial ?? (yield* prepareContext(sessionID).pipe(Effect.flatMap(context.load)))
+  initial = undefined
+  const compacted = yield* compaction.compact({ reason: "auto", context: loaded })   // 先看要不要自动压缩
+  if (compacted.status === "failed") return yield* new StepFailedError(...)
+  if (compacted.status === "completed") { assistantMessageID = SessionMessage.ID.create(); continue }
+
+  const transcript = SessionModelRequest.baseTranscript({ ... })     // §6.4
+  const prepared = yield* context.request.primary({ ... })           // §6.5
+  const outcome = yield* steps.attempt({ ..., prepared, retry, recoverOverflow, recoverContinuation })  // §7
+  const completed = yield* Outcome.$match(outcome, { ... })
+  if (completed !== undefined) return completed
+}
+```
+
+`attempt` 的结果有五种，`runStep` 分别这样处理：
+
+| 结果 | 含义 | `runStep` 怎么办 |
 |---|---|---|
-| `while (true)` | `while (shouldRun)` | pi 靠内部 break；opencode 靠查库 |
-| `while (hasMoreToolCalls \|\| pending.length)` | `while (needsContinuation)` | 同构 |
-| `pendingMessages = config.getSteeringMessages()` | `hasPending(db, "steer")` + 下轮 `promoteSteers` | 内存回调 → SQL 查询 |
-| `followUp = config.getFollowUpMessages()` | `hasPending(db, "queue")` + `promoteNextQueued` | 同上 |
-| steer 队列 `one-at-a-time` 或 `all` | steer 全部取出执行（cutoff 之前的），queue 一次一条 | opencode 没有模式开关 |
-| `prepareNextTurn` 在轮次开头 | 取出执行 → 比对系统上下文 → 读历史，都在 `runTurnAttempt` 开头 | 同一位置 |
+| `Completed` | 这次请求正常结束（工具也都跑完了） | 返回 `needsContinuation`，结束这个 Step |
+| `Retry` | 还没有任何输出就失败了，可以重试 | 发 `session.retry.scheduled`，等一段时间，**用同一个 assistant 消息 id** 再来一次 |
+| `Continue` | 已经输出了一部分，流断了 | 同样等待，然后补一条系统通知“上次回复被打断了，从断的地方接着说，别重复”，换一个新的 assistant 消息 id 再来 |
+| `Compacted` | 服务端说上下文太长，已经压缩完 | 换新 assistant 消息 id 再来。这种恢复一个 Step 只做一次 |
+| `RecoverFull` | 服务端拒绝了“接着上次的状态继续”（比如 WebSocket 续传的状态过期了） | 立即用完整上下文重发一次，不等待。也只做一次 |
 
-两边的循环结构基本一致，区别在于数据来源：pi 读内存，opencode 查数据库。这样换来了崩溃恢复和多进程运行的可能，但每轮至少要多跑五次 SQL。
-
-每次 attempt 返回后 `promotion` 都会改成 `steer`，所以工具续接的过程中可以插话进来，但不会顺手把下一条 queue 也取走，queue 要等内层循环结束了外层才去查。取出新输入后 `currentStep` 会重置为 1，所以循环里的 `step + 1` 得用 attempt 返回的 step 来算。
-
-`runTurnAttempt` 先读 `latestSequence` 当 cutoff，`promoteSteers` 只取 `admitted_seq <= cutoff` 的输入；`promoteNextQueued` 不看 cutoff，直接按接收序号取最早的一条 queue。两者取输入的规则不一样，并不是按同一个快照取的。
-
-循环里每一轮调的是 `runTurn(sessionID, promotion, step)`。下一节看其中一次 attempt 里发生了什么，压缩导致的重入放到 §9。
+每次循环都重新 `prepareContext` + `load`，因为等待期间指令可能变了、历史可能多了东西。但重试**不会再投递新输入**，用户在这期间的插话要等这个 Step 结束。
 
 ---
 
-## 5. runTurnAttempt：把输入、上下文和工具组装成请求
+## 6. 一次请求是怎么拼出来的
 
-进到这一步时，runner 已经定好了 promotion 和 step。这一步做完，要么拿到请求、工具执行入口和这次的 publisher，要么压缩了一次，通过信号退出去再重进。
+这一节回答：发给模型的那个请求里，每个字段从哪来。
 
-```mermaid
-sequenceDiagram
-  participant RN as runTurn
-  participant RT as runTurnAttempt
-  participant IN as SessionInput
-  participant EV as EventV2 / Projector
-  participant CE as SessionContextEpoch
-  participant MO as SessionRunnerModel
-  participant HI as SessionHistory
-  participant TR as ToolRegistry
-  participant CP as SessionCompaction
-  RN->>RT: attempt(sessionID, promotion, step, recoverOverflow)
-  RT->>RT: getSession；校验 location；agents.select
-  Note over RT: location 不匹配则 interrupt
-  RT->>CE: initialize：尚无基线则创建
-  opt promotion 已指定
-    RT->>EV: latestSequence → cutoff
-    opt promotion = queue
-      RT->>IN: promoteNextQueued：最早一条 queue
-      IN->>EV: Prompted → 标 promoted_seq + 写 user 消息
-    end
-    RT->>IN: promoteSteers(cutoff)
-    IN->>EV: 逐条 Prompted，事务内投影
-    RT->>RT: promoted 大于 0 → currentStep = 1
-  end
-  RT->>CE: 未新建基线时 prepare
-  CE->>EV: 变化时 ContextUpdated + advance 快照
-  RT->>MO: resolve(session)
-  MO-->>RT: Model（route、鉴权、限额）
-  RT->>HI: entriesForRunner(baselineSeq)
-  HI-->>RT: 带 seq 的 SessionMessage
-  opt 未达 steps 上限
-    RT->>TR: materialize(agent.permissions)
-    TR-->>RT: definitions + settle
-  end
-  RT->>RT: toLLMMessages → LLM.request
-  RT->>CP: compactIfNeeded(entries, model, request)
-  alt 已压缩
-    RT-->>RN: ContinueAfterCompaction(currentStep)
-  else 无需压缩
-    RT->>RT: startSnapshot；创建 publisher 和 Semaphore(1)
-    Note over RT: 请求与工具 materialization 就绪，进入模型流（§6）
-  end
+### 6.1 `SessionContext.select`：先定下 agent、指令来源和工具
+
+```ts
+// core/src/session/context.ts，select 的主干
+const session = yield* store.get(sessionID)
+if (session.location.directory !== location.directory || ...) return yield* Effect.interrupt   // 会话已经搬走了
+yield* mcpTools.flush
+const agent = yield* agents.select(session.agent)
+const permissions = Permission.merge(agent.info.permissions, session.permissions ?? [])
+const loaded = yield* Effect.all({
+  tools: registry.snapshot(permissions),          // 工具快照，§8
+  builtins: builtins.load(),                      // 内置指令：日期、环境等
+  discovery: discovery.load(),                    // 项目里发现的 AGENTS.md 之类
+  skills: skillInstructions.load(permissions),    // 可用技能的说明
+  references: referenceInstructions.load(),
+  mcp: mcpInstructions.load(permissions),         // MCP 服务给的说明
+  entries: entries.load(sessionID),               // 通过 API 给这个会话设置的指令条目
+}, { concurrency: "unbounded" })
+return {
+  session, agent, tools: loaded.tools,
+  instructions: Instructions.combine([
+    CodeModeInstructions.make(loaded.tools.codeModeCatalog),
+    loaded.mcp, loaded.references, loaded.skills, loaded.discovery, loaded.builtins, loaded.entries,
+  ]),
+}
 ```
 
-图里有三处顺序不能乱。先 `initialize` 再 promotion：上下文初始化失败的话，输入还留在库里没取出，下次能重试。先 promotion 再读历史：这样本轮请求能看到刚取出的 user 消息。压缩判定放最后：token 预算要把 system、历史消息、工具定义加在一起算，请求拼好才能估。
+指令来源的顺序是有讲究的：按“在不同会话之间有多通用”从高到低排，越通用的越靠前。这样拼出来的指令开头部分在很多会话里都一样，提示缓存更容易命中。日期、环境这些每天每个目录都不一样的，放在最后。
 
-另外注意 `materialize` 一次产出两样东西：给模型看的工具定义（definitions）和真正执行用的 `settle`，是同一份快照。到步数上限时会跳过这步。§6 收到本地 tool-call 时，就用这份 `settle` 执行。
+注意权限在这里已经起作用了：被整个禁用的工具（规则是 `资源 = "*"`、`效果 = deny`）直接不进工具快照，模型根本看不到。
 
-### Context Epoch：存什么，怎么跨 attempt 更新
+### 6.2 `InstructionState`：指令只发变化的部分
 
-每次请求模型，除了 agent 自己的指令，还要带上工作目录、当前日期、`AGENTS.md`、可用技能这些系统上下文。这些东西在会话过程中可能会变。opencode 用 Context Epoch 来管：一开始生成一份完整的系统上下文文本，之后有变化就追加一条消息告诉模型，等压缩后再重新生成一份完整的。
+系统指令（AGENTS.md、技能列表、MCP 说明、环境信息……）在会话中途可能会变。v2 的做法是：**会话开始时的指令作为基线放在 system 里，之后的变化作为一条条“系统消息”按时间顺序追加进对话**。
 
-epoch 可以理解成“共用同一份系统上下文基线的一段时间”。一次 attempt 就是一次模型请求，多个 attempt 可以共用一个 epoch，只有换了新基线才算进入下一个 epoch。管这份状态的服务叫 `SessionContextEpoch`。
+每次进入 Step 前，`prepareContext` 都会调 `InstructionState.prepare`（`core/src/session/instruction-state.ts`）：
 
-#### 一个 epoch 实际存什么
+1. 并发读一遍所有指令来源，每个来源得到一个 JSON 值（或者“暂时读不到”“已经没了”）。
+2. 每个值算 SHA-256，和库里记的当前值比较，得到一个 delta：`{ 来源 key → 新哈希 或 "removed" }`。
+3. 有变化就发 `session.instructions.updated { delta, text }`。值本身存进 `instruction_blob` 表（按哈希去重，同样的内容只存一份）；`text` 是渲染好的变化说明，比如“AGENTS.md 更新了，新内容是……”，**渲染一次就冻结在事件里**，因为以后再渲染需要当时目录里的那些来源，不一定还在。
+4. 投影更新 `instruction_state` 表，投影出一条 `system` 类型的会话消息。
 
-`session_context_epoch` 表里每个会话一行：
-
-| 字段 | 保存的数据 | 用途 |
-|---|---|---|
-| `session_id` | 所属会话的 ID | 找到这个会话的当前 epoch |
-| `baseline` | 各系统上下文源渲染后拼成的完整文本 | 发给模型，作为这一阶段稳定的系统上下文前缀 |
-| `snapshot` | 按上下文源的 key 保存的结构化快照，例如环境字段、日期、指令内容和技能清单对应的数据 | 留给程序逐源比对变化，不直接发给模型 |
-| `baseline_seq` | 当前基线的序号边界；压缩后替换基线时设为 `compaction.seq` | 读取历史时，只保留此边界之后的 system 更新消息，避免重复携带已被新基线覆盖的更新 |
-
-`baseline` 在一个 epoch 里是固定不变的文本，`snapshot` 是最近一次确认过的上下文状态。之后有变化时，快照跟着更新，基线不动。描述变化的那段文字存成消息历史里的一条 `system` 消息，不会追加到这张表的 `baseline` 里。
-
-这张表只管系统上下文；用户消息、模型回复、工具结果都在消息历史里。agent 自己的 `system` 指令也不在这里，它单独放在 baseline 前面。
-
-#### 用日期变化走一遍
-
-下面只看日期这一个源，表里的文字是示意，不是实际的序列化格式，真实的基线和快照里还有别的源。
-
-| 时点 | `baseline` 中的日期文本 | `snapshot` 中记录的日期 | 消息历史中的变化 |
-|---|---|---|---|
-| 首次请求，9 月 19 日 | 今天是 9 月 19 日 | 9 月 19 日 | 无需追加更新 |
-| 下一次 attempt，日期没变 | 保持不变 | 9 月 19 日 | 无需追加更新 |
-| 跨天后的 attempt | 仍然是“今天是 9 月 19 日” | 更新为 9 月 20 日 | 追加一条 system 消息：“当前日期已变为 9 月 20 日” |
-| 再下一次 attempt，日期没变 | 保持不变 | 9 月 20 日 | 与更新后的快照比较，不会重复追加日期更新 |
-| 压缩后成功重建基线 | 新基线写“今天是 9 月 20 日” | 9 月 20 日 | 更新 `baseline_seq`，已被新基线覆盖的旧 system 更新不再带入请求 |
-
-跨天之后、基线还没重建的这段时间，模型会同时看到旧基线和后面那条日期更新；程序这边拿已经更新到 9 月 20 日的快照判断下次有没有变化。也就是说，不变的只有基线文本，模型知道的上下文、用来比对的快照都会更新。
-
-为什么要这么绕？为了让请求前缀尽量不变，provider 才有机会复用 prompt cache（最后能不能命中还是看 provider）。压缩后替换基线，就是把当前系统上下文重新渲染成完整文本，开始下一个 epoch。
-
-#### 每次 attempt 怎么准备这份状态
-
-对应本节开头那张图里的 `initialize / prepare`：第一次初始化时生成基线和快照；之后每次 attempt 看有没有新的压缩，有就换基线，没有就比对变化。
-
-```mermaid
-sequenceDiagram
-  participant RT as runTurnAttempt
-  participant EP as SessionContextEpoch
-  participant SC as SystemContext / sources
-  participant DB as session_context_epoch
-  participant EV as EventV2
-  RT->>EP: initialize(db, loadSystemContext(agent), sessionID)
-  EP->>DB: 查当前 epoch
-  alt 尚无 epoch
-    EP->>SC: initialize：观察源并生成 baseline + snapshot
-    Note over EP,SC: 必需上下文源不可用时 InitializationBlocked
-    EP->>DB: insert(epoch)
-    EP-->>RT: baseline + baselineSeq
-  else epoch 已存在
-    EP-->>RT: undefined
-    RT->>EP: prepare
-    EP->>EP: latestCompaction 与 baselineSeq 比较
-    alt 出现新压缩
-      EP->>SC: replace：重建完整 baseline
-      EP->>DB: 可替换时更新 baseline、snapshot、baselineSeq
-      Note over EP: ReplacementBlocked 时保留旧基线
-    else 没有新压缩
-      EP->>SC: reconcile：比对结构化 snapshot
-      opt 上下文发生变化
-        EP->>EV: ContextUpdated(update 文本)
-        EV->>DB: 同一事务 commit 钩子中 advance(snapshot)
-        Note over EV: 投影另写一条 system 消息，baseline 文本不变
-      end
-    end
-    EP-->>RT: 本次请求使用的 baseline + baselineSeq
-  end
-```
-
-`runTurnAttempt` 每次 attempt 处理系统上下文的逻辑：
-
-| 情况 | 代码 | 结果 |
-|---|---|---|
-| 首次初始化 | `initialize`（`context-epoch.ts`） | 观察全部源，任一 `unavailable` 抛 `InitializationBlocked`（排空失败，输入留在库里可重试）。否则渲染 `baseline`，插表 |
-| 后续 attempt，没新压缩 | `prepare` → `reconcile`（`system-context/index.ts`） | 逐源比对快照。没变 → 用旧基线。变了 → 拼 `update` 文案发 `ContextUpdated`（投影成 `system` 消息），并在同一事务 `advance` 快照。某个源不可用 → 保留旧值 |
-| 后续 attempt，有新压缩 | `prepare` → `replace` | 重新渲染完整基线，`baseline_seq = compaction.seq`。有源不可用 → `ReplacementBlocked`，用旧基线 |
-
-#### 系统上下文的数据从哪里来
-
-`SystemContext` 把多个上下文源拼在一起。每个源用 `load` 读结构化数据，用 `baseline` 渲染完整文本，用 `update` / `removed` 渲染变化说明。这样同一份数据既能渲染成给模型看的文本，也能存进快照给程序比对。
-
-```mermaid
-classDiagram
-  class SystemContextSource {
-    key: Key
-    codec: Schema
-    load: Effect~A or Unavailable~
-    baseline(current) string
-    update(previous, current) string
-    removed(previous) string
-  }
-  class SystemContext {
-    <<opaque 一组 PackedSource>>
-    make(source) SystemContext
-    combine(contexts) SystemContext
-    initialize(ctx) Generation
-    reconcile(ctx, snapshot) Unchanged or Updated or ReplacementReady or Blocked
-    replace(ctx, snapshot) ReplacementReady or Blocked
-  }
-  class Generation {
-    baseline: string
-    snapshot: Record~Key, SourceSnapshot~
-  }
-  class SystemContextRegistry {
-    <<Service location>>
-    entries: Ref~Entry[]~
-    register(entry)
-    load() SystemContext
-  }
-  class SystemContextBuiltIns {
-    core/environment
-    core/date
-  }
-  class SkillGuidance {
-    load(agent) SystemContext
-  }
-  class ReferenceGuidance {
-    load() SystemContext
-  }
-  SystemContext ..> SystemContextSource
-  SystemContext ..> Generation
-  SystemContextRegistry ..> SystemContext : combine
-  SystemContextBuiltIns ..> SystemContextRegistry : register
-```
-
-| 谁 | 文件 | 提供什么 |
-|---|---|---|
-| `SystemContextBuiltIns` | `core/src/system-context/builtins.ts` | 两个源：`core/environment`（`<env>` 块：工作目录、项目根、是否 git、平台）和 `core/date`（今天日期）。`baseline` 文案 "Here is some useful information about the environment you are running in:"，`update` 文案 "The environment you are running in is now:" |
-| `InstructionContext` | `core/src/instruction-context.ts` | 全局和向上查找的 `AGENTS.md`（builtins 依赖它） |
-| `SkillGuidance` | `core/src/skill/guidance.ts` | 当前 agent 有权限的技能清单，`<available_skills>` 块。按 agent 算，所以在 runner 里和注册表的源合并（`llm.ts`） |
-| `ReferenceGuidance` | `core/src/reference/guidance.ts` | 引用引导 |
-
-### `SessionContextEpoch`
-
-`SessionContextEpoch` 负责读写 `session_context_epoch` 表，上图里用到的几个函数：
-
-| 函数 | 干什么 |
+| `instruction_state` 列 | 含义 |
 |---|---|
-| `initialize(db, context, sessionID)` | 表里没有就观察一遍上下文源、拍快照、插一行，返回 `{ baseline, baselineSeq }`；有就返回 undefined |
-| `prepare(db, events, context, sessionID)` | 表里已有：比对。有新压缩就 `replace`（整个换新基线）；否则 `reconcile`，变了就发 `ContextUpdated` 事件，并在事件的 `commit` 钩子里 `advance` 快照 |
-| `reset(db, sessionID)` | 删行。会话移动目录时用 |
+| `initial_values` | 这个“纪元”开始时的值（来源 key → 哈希），渲染成请求开头的 system 基线 |
+| `current_values` | 最新的值，下次比较用 |
+| `epoch_start` / `through_seq` | 纪元从哪个事件序号开始、更新到哪 |
 
-### 用到的会话配置
+第一次（新会话）的 delta 必须完整，不带 `text`，它就是基线。这时某个来源读不到，整个初始化会被挡住（`InitializationBlocked`），输入留在收件箱里不投递；之后的读不到则保留旧值，不算变化。
 
-`getSession` 拿到 `Session.Info`，`agents.select` 拿到当前 agent 的配置，它们各自影响请求的不同部分：
+压缩完成时（`compaction.ended`）纪元前移：当前值变成新的初始值。压缩之后，请求开头的基线就是最新的指令，之前那些“变化消息”已经被压缩掉了，不需要再出现。
 
-| 对象与字段 | 这里用来干什么 | 后面影响什么 |
-|---|---|---|
-| `Session.Info.location` | 校验当前目录和 workspace | 会话已迁移时中断旧 runner |
-| `Session.Info.agent` / `model` | 选择 agent、解析 provider / model / variant | 未指定时分别走默认选择 |
-| `Agent.Info.system` | 放在上下文 baseline 前，构成 system parts | agent 自身指令与环境基线分开 |
-| `Agent.Info.steps` | 与 `currentStep` 比较 | 最后一步禁用工具，并追加收尾提示 |
-| `Agent.Info.permissions` | 传给 `tools.materialize` | 过滤定义；真正执行仍需工具内部授权 |
+### 6.3 `SessionHistory`：读哪些历史
 
-两者分别定义在 `schema/src/session.ts` 和 `schema/src/agent.ts`。历史消息转成模型协议的消息，再加上这两份配置，就拼成了一次请求。
+`context.load` 调 `SessionHistory.entriesForRunner`，在一个事务里读出两样东西：指令基线（`InstructionState.initial` 渲染出的文本），和最近一次完成的压缩之后的所有消息（含压缩消息本身）。
 
-### 历史从哪里读：SessionHistory 与 SessionStore
+“最近一次压缩”要看压缩的种类：本地生成的摘要对任何模型都有效；provider 原生压缩生成的加密窗口只能在同一个服务端上回放（§10）。所以按当前模型的“来源”（provenance）挑，换了模型就跳过不兼容的原生压缩，往前找本地摘要，或者干脆用原始记录。
 
-| 函数 | 干什么 |
+会话消息再由 `toLLMMessages`（`runner/to-llm-message.ts`）转成模型消息：
+
+| 会话消息 | 变成什么 |
 |---|---|
-| `latestCompaction` | 查最新一条压缩消息的序号 |
-| `messageRows` | 上下文的 SQL 定义：有压缩时取 `seq >= compaction.seq`，或者是 `system` 且 `seq > baselineSeq`；没压缩时取全部，但 `system` 消息只取 `seq > baselineSeq` 的 |
-| `entriesForRunner` | 返回带序号的消息列表，压缩模块靠序号切分要总结和保留的部分 |
+| `user` | user 消息：技能正文 + 文字 + 附件 |
+| `synthetic` / `skill` | user 消息（系统补的通知、技能激活） |
+| `system` | system 消息（指令变化，§6.2） |
+| `shell` | user 消息：“用户执行了这条命令，输出是……”。后台命令的结果不在这里进上下文，而是跑完时通过收件箱的 synthetic 条目进 |
+| `assistant` | assistant 消息，含工具调用和结果 |
+| `compaction`（已完成） | 本地摘要：一条 user 消息，内容是 `<conversation-checkpoint>` 包着的摘要和最近原文；原生压缩：解码出服务端给的窗口 |
+| `model-switched` | 必要时变成一个思考强度变化的标记 |
+| `location-switched` | user 消息：“工作目录改成了……” |
+| `agent-switched` / `idle` | 不进上下文 |
 
-system 消息要看 `baselineSeq`，是因为基线序号之前的 system 消息已经被合并进系统上下文的 `baseline` 文本了，再发一遍就重复。
+### 6.4 `baseTranscript`：system 部分
 
-`SessionStore` 是只读的，给 runner 和门面提供会话信息和历史消息，全部直接查表。
-
-| 方法 | 干什么 |
-|---|---|
-| `get(sessionID)` | 查 `session` 表一行，`fromRow` 转 `Info` |
-| `context(sessionID)` | `SessionHistory.load`：最近一次压缩之后的全部消息，加上基线序号之后的 system 消息 |
-| `runnerContext(sessionID, baselineSeq)` | 和 `context` 一样，只是调用方显式传基线序号，供 runner 用 |
-| `message(messageID)` | 按 id 取单条消息 |
-
-### SessionMessage 怎么转成模型输入
-
-`SessionMessage` 是事件投影出来的消息，存在 `session_message` 表里，下表第二列就是生成它的事件。类型定义在 `schema/src/session-message.ts`，core 里通过 `core/src/session/message.ts` 转发。
-
-```mermaid
-classDiagram
-  class Message {
-    <<union>>
-    id: ID
-    type: Type
-    metadata: Record
-    time.created: DateTime
-  }
-  class User {
-    text: string
-    files: FileAttachment[]
-    agents: AgentAttachment[]
-  }
-  class Assistant {
-    agent: string
-    model: Model.Ref
-    content: AssistantContent[]
-    snapshot.start: string
-    snapshot.end: string
-    snapshot.files: RelativePath[]
-    finish: string
-    cost: number
-    tokens: Tokens
-    error: UnknownError
-    time.completed: DateTime
-  }
-  class Compaction {
-    reason: auto or manual
-    summary: string
-    recent: string
-  }
-  class System {
-    text: string
-  }
-  class Synthetic {
-    sessionID: SessionID
-    text: string
-  }
-  class Shell {
-    callID: string
-    command: string
-    output: string
-    time.completed: DateTime
-  }
-  class AgentSwitched {
-    agent: string
-  }
-  class ModelSwitched {
-    model: Model.Ref
-  }
-  class AssistantText {
-    type: text
-    id: string
-    text: string
-  }
-  class AssistantReasoning {
-    type: reasoning
-    id: string
-    text: string
-    providerMetadata: ProviderMetadata
-  }
-  class AssistantTool {
-    type: tool
-    id: string
-    name: string
-    provider.executed: boolean
-    provider.metadata: ProviderMetadata
-    provider.resultMetadata: ProviderMetadata
-    state: ToolState
-    time.created ran completed pruned
-  }
-  class ToolState {
-    <<union>>
-    status: pending or running or completed or error
-  }
-  Message <|-- User
-  Message <|-- Assistant
-  Message <|-- Compaction
-  Message <|-- System
-  Message <|-- Synthetic
-  Message <|-- Shell
-  Message <|-- AgentSwitched
-  Message <|-- ModelSwitched
-  Assistant *-- AssistantText
-  Assistant *-- AssistantReasoning
-  Assistant *-- AssistantTool
-  AssistantTool *-- ToolState
+```ts
+system: [
+  input.agent.system ? input.agent.system : SessionSystemPrompt.make(toolNames),  // agent 自带的提示词，或者默认提示词
+  input.initial,                                                                   // 指令基线
+].filter((part) => part.length > 0).map(SystemPart.make),
+messages: toLLMMessages(input.messages, input.model.ref, providerMetadataKey),
 ```
 
-| 类型 | 谁生成它 | 发给模型时变成什么（`to-llm-message.ts`） |
-|---|---|---|
-| `user` | `Prompted` 事件投影（`message-updater.ts`） | 一条 `role: user`，文本 + 附件转 media |
-| `assistant` | `Step.Started` 事件新建，后续事件逐步填 `content` | 一条 `role: assistant`（text / reasoning / tool-call），每个本地执行的工具结果单独一条 `role: tool` |
-| `compaction` | `Compaction.Ended` 事件 | 一条 `role: user`，内容是 `<conversation-checkpoint>` 包着 summary 和 recent |
-| `system` | `ContextUpdated` 事件，系统上下文变化时追加 | `Message.system(text)` |
-| `synthetic` | `Synthetic` 事件，目前只有 v1 兼容路径会发 | 一条 `role: user` |
-| `shell` | `Shell.Started/Ended`，v2 门面的 `shell` 方法还没实现（`session.ts`） | 一条 `role: user`，"Shell command: … 输出" |
-| `agent-switched` / `model-switched` | `AgentSwitched` / `ModelSwitched` 事件 | 不发，返回空数组 |
+所以 system 只有两块：agent 的提示词和指令基线。后续的指令变化都在 `messages` 里。
 
-`ToolState` 的四种状态对应一个工具调用的生命周期：
+### 6.5 `SessionModelRequest.prepare`：最终的请求
 
-| 状态 | 字段 | 进入这个状态的事件 |
-|---|---|---|
-| `pending` | `input: string`（还在流式接收的原始 JSON 文本） | `Tool.Input.Started`（`message-updater.ts`） |
-| `running` | `input: Record`、`structured`、`content` | `Tool.Called`，input 已经是解析好的对象 |
-| `completed` | `input`、`content`、`structured`、`outputPaths`、`attachments`、`result` | `Tool.Success` |
-| `error` | `input`、`content`、`structured`、`error`、`result` | `Tool.Failed` |
+`primary` 调 `prepare("primary", ...)`（`core/src/session/model-request.ts`）。它依次：
 
-`provider.executed` 为真，表示这个工具是模型供应商自己执行的（比如内置 web search），本地不跑。发给模型时，供应商执行的工具把 call 和 result 都放进 assistant 消息的 content 里；本地执行的只放 call，result 单独成一条 `role: tool` 消息（`to-llm-message.ts`）。
+1. 触发插件的 `session.context` 钩子。插件能改 system、messages、生成参数，还能改工具定义：改描述、改参数、删工具、改名。钩子改过之后，按对象身份把定义对回原来的工具，凭空多出来的定义被丢掉。
+2. 算默认的输出上限：模型目录里的上限（没有就 32000，最多 256000），再看上下文窗口还剩多少：`窗口 − 实测输入 − 估算新增 × 1.15`，最少留 1024。
+3. 拼 `LLMRequest`，再触发 `session.model.request` 钩子，插件能改 baseURL 和请求头。
+4. 如果有插件订阅了 `session.http.request` / `http.response`，包一层 HTTP 拦截；模型走 WebSocket 时，绑定会话级的 WebSocket 连接（`SessionModelTransport`），握手和每一帧也都能被钩子改。
 
-### 解析模型：SessionRunnerModel
+最后的请求字段：
 
-`SessionRunnerModel` 把会话的 `model: { providerID, id, variant }` 变成 llm 包的 `Model`（带路由、鉴权、限额）。
-
-| 方法 | 干什么 |
+| 字段 | 来源 |
 |---|---|
-| `resolve(session)` | 会话指定了模型就从目录里找；没指定用 `catalog.model.default()`；默认的不支持就找第一个支持的。找不到分别抛 `ModelUnavailableError` / `ModelNotSelectedError` |
-| `fromCatalogModel(model, credential)` | 只支持三种 API：`@ai-sdk/openai`（走 Responses 协议）、`@ai-sdk/anthropic`、`@ai-sdk/openai-compatible`（必须有 url）。其他抛 `UnsupportedApiError` |
-| `withVariant(model, variantID)` | 变体的 headers / body 用 immer 合并进模型 |
-| `withDefaults(model, route)` | 把目录里的 `limit.context` / `limit.output` 塞进 route 的 `limits`，压缩判定读的就是这里 |
+| `model` | 会话选的模型；`model.request` 钩子改了 baseURL 时换路由 |
+| `system` | §6.4 的两块，经过 `session.context` 钩子 |
+| `messages` | §6.3 的历史，经过钩子；模型不支持的媒体换成一句错误说明；图片总量超过 25 MiB 时从前往后删图，删到 15 MiB 以下，并写明“这张图被删了，别凭记忆描述它” |
+| `tools` | 工具快照的定义（§8），经过钩子 |
+| `toolChoice` | 平时不设；到步数上限时为 `"none"` |
+| `generation` / `providerOptions` | 钩子给的 options 里，`maxTokens`、`temperature` 这类通用字段放 `generation`，其他放 `providerOptions` |
+| `http.headers` | `x-opencode-session-id`、`x-session-affinity`（会话亲和，让同一会话落到同一个后端）、项目 id、客户端名等 |
+| `promptCacheKey` | 从会话亲和 id 来，同一会话的请求共用 |
 
-### 请求与模型协议类型
-
-OpenCode 封装了一套 LLMClient（`@opencode-ai/llm`）。每轮把 `SessionMessage` 转成这里的 `Message`，拼成 `LLMRequest` 发出去；模型返回 `LLMEvent` 流，再由发布器转成会话事件。
-
-```mermaid
-classDiagram
-  class LLMRequest {
-    id: string
-    model: Model
-    system: SystemPart[]
-    messages: Message[]
-    tools: ToolDefinition[]
-    toolChoice: ToolChoice
-    generation: GenerationOptions
-    providerOptions: ProviderOptions
-    http: HttpOptions
-    responseFormat: ResponseFormat
-    cache: CachePolicy
-    metadata: Record
-  }
-  class Message {
-    id: string
-    role: system or user or assistant or tool
-    content: ContentPart[]
-    metadata: Record
-    native: Record
-  }
-  class ContentPart {
-    <<union>>
-    TextPart
-    MediaPart
-    ToolCallPart
-    ToolResultPart
-    ReasoningPart
-  }
-  class ToolDefinition {
-    name: string
-    description: string
-    inputSchema: JsonSchema
-    outputSchema: JsonSchema
-    cache: CacheHint
-  }
-  class ToolChoice {
-    type: auto or none or required or tool
-    name: string
-  }
-  class LLMEvent {
-    <<union of 16>>
-    step-start
-    text-start delta end
-    reasoning-start delta end
-    tool-input-start delta end
-    tool-call
-    tool-result
-    tool-error
-    step-finish
-    finish
-    provider-error
-  }
-  class Model {
-    id: string
-    provider: ProviderID
-    route: Route
-  }
-  class LLMClient {
-    stream(request) Stream~LLMEvent, LLMError~
-    generate(request) Effect~LLMResponse, LLMError~
-  }
-  LLMRequest *-- Message
-  LLMRequest *-- ToolDefinition
-  LLMRequest *-- ToolChoice
-  LLMRequest *-- Model
-  Message *-- ContentPart
-  LLMClient ..> LLMRequest
-  LLMClient ..> LLMEvent
-```
-
-| 类 | 文件 | 说明 |
-|---|---|---|
-| `LLMRequest` | `llm/src/schema/messages.ts` | runner 每轮用 `LLM.request({...})`（`llm/src/llm.ts`）构造，字段来源见下表。 |
-| `Message` | | 四种角色。`native` 是 provider 原生字段的透传。 |
-| `ToolDefinition` | | `Tool.make` 的 `definition(name)` 把 Effect Schema 转成 JSON Schema 填进来（`core/src/tool/tool.ts`）。 |
-| `LLMEvent` | `llm/src/schema/events.ts` | 16 种。runner 的发布器把它们一一映射成会话事件（§6）。`ProviderErrorEvent` 带 `classification`，值为 `context-overflow` 时触发溢出压缩。 |
-| `Model` | `route/client.ts` | 不只是 id，还带 `route`（协议、端点、鉴权、默认限额）。`model.route.defaults.limits.context` 就是上下文窗口大小，压缩判定用它。 |
-| `LLMClient` | `llm/src/route/client.ts` | 没有重试。`grep -n 'retry' llm/src/route/*.ts` 是空的。`specs/v2/session.md` 明说"Provider timeout, retry, and watchdog policy is intentionally deferred"。 |
-| `isContextOverflowFailure` | `llm/src/provider-error.ts` | 判断一个错误是不是上下文溢出。匹配用的文案正则有 28 条。 |
-
-### 请求字段从哪里来
-
-| 字段 | 值 | 来源 |
-|---|---|---|
-| `model` | `models.resolve(session)` 的结果 | `SessionRunnerModel.resolve`，变体的 headers/body 已合并 |
-| `http.headers` | `x-session-affinity: <sessionID>`、`X-Session-Id: <sessionID>`、有父会话再加 `x-parent-session-id` | 写死 |
-| `providerOptions.openai.promptCacheKey` | 会话 id 去掉 `ses_` 前缀（正则匹配 `ses_[0-9a-f]{64}` 时），否则原 id | 让 OpenAI 的 prompt cache 按会话命中 |
-| `system` | `[agent.info.system, epoch.baseline]` 过滤空串，各成一个 `SystemPart` | agent 专属提示词在前，系统上下文基线在后。基线更新流程见本节后半部分 |
-| `messages` | `toLLMMessages(context, model)`，最后一步再追加一条 `Message.assistant(MAX_STEPS_PROMPT)` | 由 `toLLMMessages` 转换；`MAX_STEPS_PROMPT` 在 `runner/max-steps.ts` |
-| `tools` | `toolMaterialization.definitions`，最后一步是 `[]` | |
-| `toolChoice` | 最后一步 `"none"`，否则 undefined | |
-| `generation` | 不传。温度、maxTokens 全靠 route 默认 | — |
-
-每轮会变的字段：`messages`（历史变长、steer 被取出执行）、`system`（压缩后基线被替换时）、`tools`（agent 权限变了或到最后一步）。
-不变的字段：headers、cacheKey、`generation`。
-v2 还没有的：v1 里的每次 prompt 覆盖系统文本、插件修改请求、结构化输出策略，在 v2 里都还是 `missing`（`specs/v2/session.md` 那张表）。
-
-### 步数上限
-
-到达 `steps` 上限时会同时做三件事：`tools: []`、`toolChoice: "none"`、消息末尾追加一条 assistant 消息（`max-steps.ts`）：
-"CRITICAL - MAXIMUM STEPS REACHED … Tools are disabled until next user input. Respond with text only."
-模型如果还是发了 tool-call，会直接 `failUnsettledTools("Tools are disabled after the maximum agent steps")`，不执行。
-有新用户输入就 `currentStep = 1`，所以这个上限指的是每次用户输入之后最多跑 N 轮。
+返回的 `Prepared` 里除了 `request` 还有一个 `executeTool`，它只认这次请求里宣告过的工具（§8）。
 
 ---
 
-## 6. 消费模型流：发布状态与启动工具
+## 7. `SessionStep.attempt`：读流、并发跑工具
 
-这一节拿着 §5 准备好的 request、materialization 和 publisher 去请求模型。工具内部怎么执行放到 §7，这张图先看工具执行和模型流是怎么交错进行的，以及哪些事要留到 §8 收尾时做。
+`attempt`（`core/src/session/runner/step.ts`）负责一次物理请求：发请求、读流、启动工具、等它们结束、决定结果。
 
 ```mermaid
 sequenceDiagram
-  participant RT as runTurnAttempt
-  participant LM as LLMClient.stream
-  participant PB as LLMEventPublisher
-  participant EV as EventV2 / Projector
-  participant FS as FiberSet / materialization.settle
-  RT->>LM: stream(request)
-  loop Stream.runForEach 消费事件
-    LM-->>RT: LLMEvent
-    alt 已记录 overflowFailure 或 provider 错误
-      RT->>RT: 忽略后续事件
-    else assistant 尚未开始且为上下文溢出
-      RT->>RT: 保存 overflowFailure，暂不 publish
-    else 可发布
-      RT->>PB: withPublication(publish(event))
-      PB->>EV: Step.Started / Text.* / Tool.Input.* / Tool.Called
-      opt 本地 tool-call（非 providerExecuted）
-        alt materialization 不存在
-          RT->>PB: failUnsettledTools：已到步数上限
-        else 可以执行
-          RT->>RT: needsContinuation = true
-          RT->>PB: assistantMessageID(call.id)
-          RT->>FS: FiberSet.run：启动 settle
-          Note over LM,FS: settle 与后续模型流消费可以交错
-          FS->>PB: 工具完成，经同一个 withPublication 发布 toolResult
-          PB->>EV: Tool.Success / Tool.Failed
-        end
+  participant AT as attempt
+  participant LLM as LLMClient.stream
+  participant PB as publisher
+  participant T as 工具 fiber × n
+  participant B as Bus
+
+  AT->>AT: snapshots.capture()：记下工作区快照
+  AT->>LLM: stream(request)
+  loop 每个模型事件
+    LLM-->>AT: LLMEvent
+    alt 输出开始前就报“上下文太长”
+      AT->>AT: 记下来，先不发布
+    else
+      AT->>PB: publish(event)
+      PB->>B: step.started / text.* / reasoning.* / tool.input.* ...
+      opt 是一个完整的本地工具调用
+        PB->>B: tool.called（持久化之后才开始执行）
+        AT->>T: forkScoped：执行 → 截断输出 → tool.success / tool.failed
       end
     end
   end
-  RT->>PB: ensuring：withPublication(flush)
-  Note over RT,FS: stream Exit 已取得，工具可能仍在执行；收尾见 §8
+  AT->>PB: flush：把攒着的增量发出去
+  AT->>T: Fiber.awaitAll：等所有工具结束
+  AT->>AT: 判断：压缩恢复？重试？续传？失败？
+  AT->>B: step.ended（用量、费用、改动的文件）或 step.failed
 ```
-
-图里工具返回的箭头是工具跑完后的回调，`Stream.runForEach` 并不会在每个 tool-call 后停下来等工具，`FiberSet.run` 把 fiber 挂上去就接着消费模型事件了。工具这边和模型流那边发会话事件时抢的是同一个 `Semaphore(1)`，所以工具可以并发跑，但 publisher 的状态更新是一条一条来的。
-
-收到 `step-finish` 也不会马上发 `Step.Ended`。publisher 只是先把 finish 原因、token 用量这些记下来，等工具都跑完了 attempt 才去收尾。模型流失败时 `ensuring(flush)` 照样会执行，把没关的文本、工具输入片段都关掉。
-
-### `LLMEventPublisher`
-
-`createLLMEventPublisher` 把 `llm.stream` 返回的 16 种 `LLMEvent` 转成会话事件，再 `events.publish`。每轮创建一个，只在这一轮内使用。
-文件注释："Persist one provider turn without executing tools or starting a continuation turn."
-
-字段：
-
-| 字段 | 含义 |
-|---|---|
-| `tools: Map<callID, {assistantMessageID, name, inputEnded, called, settled, providerExecuted, providerMetadata}>` | 这一轮见过的每个工具调用的状态机 |
-| `assistantMessageID` | 这一轮的 assistant 消息 id。第一个需要它的事件到来时才创建（`startAssistant`），创建时发 `Step.Started` |
-| `assistantActive` / `assistantFailed` / `providerFailed` | 三个布尔。runner 收尾时靠它们决定发什么 |
-| `stepSettlement` | `step-finish` 事件带来的 `finish` 原因和 token 用量 |
-| `text` / `reasoning` / `toolInput` | 三个 `fragments` 累加器：`start(id)` 开一个桶，`append` 攒，`end` 把桶里的拼成完整字符串发 `*.Ended` 事件 |
-
-主要方法：
-
-| 方法 | 干什么 |
-|---|---|
-| `publish(event, outputPaths)` | 大 switch。`text-delta` 发 `Text.Delta`（不持久化）并攒桶；`text-end` 发 `Text.Ended`（持久化）。`tool-call`：桶没关先关，发 `Tool.Called`。`tool-result`：成功发 `Tool.Success`，错误发 `Tool.Failed`。`step-finish`：flush 全部桶，记 `stepSettlement`。`provider-error`：`providerFailed = true`，`failAssistant` |
-| `flush()` | 把三个桶里没关的都关掉（发 Ended 事件）。runner 用 `Effect.ensuring` 保证流结束一定 flush（`llm.ts`） |
-| `failAssistant(message)` | 发 `Step.Failed`。只发一次 |
-| `failUnsettledTools(message, hostedOnly)` | 所有没 `settled` 的工具发 `Tool.Failed`。`hostedOnly` 为真只处理 provider 执行的 |
-| `assistantMessageID(callID)` | 给 runner 查这个工具调用属于哪条 assistant |
-
-一致性检查很严格：同一个 id 重复 start、name 变了、result 比 call 先到，都会 `Effect.die`。也就是说它不假设 provider 返回的流一定是对的。
-
-### 模型事件映射成哪些会话事件
-
-v2 的数据都是从会话事件来的，表格最后一列是每种事件会更新哪张表。事件定义在 `schema/src/session-event.ts`，每个事件用 `Event.define({ type, durable?, schema })` 造（`schema/src/event.ts`）。带 `durable: { aggregate: "sessionID", version }` 的会写库，不带的只广播。
-
-| 事件族 | 类型名前缀 | 持久化？ | 谁发 | 投影成什么 |
-|---|---|---|---|---|
-| `PromptAdmitted` | `session.next.prompt.admitted` | 是 | `SessionInput.admit`（`input.ts`） | 插一行 `session_input`（`projector.ts`） |
-| `Prompted` | `session.next.prompted` | 是 | `SessionInput.publish`（`input.ts`），取出执行时 | 给 `session_input` 行填 `promoted_seq` 并 插一条 `user` 消息（`projector.ts`），同一个事务 |
-| `Step.Started / Ended / Failed` | `session.next.step.*` | 是（Ended/Failed 是 v2 版本） | 发布器 `startAssistant`（`publish-llm-event.ts`）/ runner / `failAssistant` | 新建 / 收尾 / 标错一条 `assistant` 消息 |
-| `Text.Started / Ended` | `session.next.text.*` | 是 | 发布器 | 往 assistant 的 `content` 加一段 text |
-| `Text.Delta` | `session.next.text.delta` | 否 | 发布器 | 在线订阅者拿到增量，`message-updater` 也会累加（内存投影用） |
-| `Reasoning.*` | `session.next.reasoning.*` | Started/Ended 是，Delta 否 | 发布器 | 和上面 text 一样，只是写 reasoning 段 |
-| `Tool.Input.Started / Ended` | `session.next.tool.input.*` | 是 | 发布器 | 新建一个 `pending` 状态的 tool 项；Ended 填原始 input 文本 |
-| `Tool.Input.Delta` | | 否 | 发布器 | 不投影（`message-updater.ts`） |
-| `Tool.Called` | `session.next.tool.called` | 是 | 发布器 | tool 项转 `running`，input 变成对象 |
-| `Tool.Progress / Success / Failed` | `session.next.tool.*` | 是 | 工具执行完 / 失败 / 中断 | tool 项转 `completed` / `error` |
-| `ContextUpdated` | `session.next.context.updated` | 是 | `SessionContextEpoch.prepare`（`context-epoch.ts`） | 插一条 `system` 消息 |
-| `Compaction.Started / Ended` | `session.next.compaction.*` | 是 | `SessionCompaction.compactAfterOverflow`（`compaction.ts`） | Ended 插一条 `compaction` 消息 |
-| `Compaction.Delta` | | 否 | 目前没人发 | — |
-| `AgentSwitched / ModelSwitched` | | 是 | 门面 `switchAgent` / `switchModel`（`session.ts`） | 改 `session` 表的 agent/model 列，并插一条标记消息 |
-| `RevertEvent.Staged / Cleared / Committed` | | 是 | `SessionRevert`（`revert.ts`） | 改 `session.revert` 列；Committed 删掉边界之后的消息和输入行（`projector.ts`） |
-| `Retried` | `session.next.retried` | 是 | 目前没人发（投影那行被注释掉了，`projector.ts`） | — |
-| `Moved` | | 是 | 会话跨目录移动 | 改 `session` 表的 directory/workspace |
-
-持久化事件的完整清单在 `session-event.ts` 的 `DurableDefinitions` 里。
-
----
-
-## 7. 执行工具：权限等待、文件修改与结果回写
-
-这一节展开上一张图里的 `materialization.settle`，以 `edit` 为例。权限审批和实际执行要放在同一条调用链里看：等用户审批是在工具 fiber 里等的，用户回复之后工具才接着执行、生成 settlement。
-
-```mermaid
-sequenceDiagram
-  participant RT as runTurnAttempt
-  participant PB as LLMEventPublisher
-  participant EV as EventV2
-  participant FS as FiberSet toolFibers
-  participant MT as Materialization.settle
-  participant TR as ToolRegistry.settleWith
-  participant TL as Tool.settle
-  participant EX as edit.execute
-  participant LM as LocationMutation
-  participant PM as PermissionV2
-  participant UI as 客户端
-  participant OS as ToolOutputStore
-
-  RT->>PB: publish(tool-call event)
-  PB->>EV: publish(Tool.Called { callID, tool, input, provider })
-  RT->>RT: needsContinuation = true
-  RT->>PB: assistantMessageID(callID)
-  RT->>FS: FiberSet.run(uninterruptibleMask(settle → publish toolResult))
-  FS->>MT: settle({ sessionID, agent, assistantMessageID, call })
-  MT->>TR: settleWith(input, registration.identity)
-  TR->>TL: settle(tool, call, context)
-  TL->>TL: 解码 input（失败 → ToolFailure）
-  TL->>EX: execute(input, context)
-  EX->>LM: resolve({ path, kind: file })
-  LM-->>EX: Target { canonical, resource, externalDirectory? }
-  opt 外部目录
-    EX->>PM: assert({ action: external_directory, resources, save })
-  end
-  EX->>PM: assert({ action: edit, resources: [resource], save: [*], source })
-  PM->>PM: evaluateInput：agent 规则 + 已保存规则 → allow / deny / ask
-  alt ask
-    PM->>EV: publish(permission.v2.asked)
-    EV-->>UI: SSE 收到请求
-    UI->>PM: reply({ requestID, reply: once/always/reject })
-    PM-->>EX: Deferred 兑现
-    break reply = reject
-      EX-->>TL: die(DeclinedError)，由 runner 识别用户拒绝
-    end
-  else deny
-    break 规则拒绝
-      PM-->>EX: BlockedError
-      EX-->>TL: ToolFailure（不执行文件修改）
-    end
-  end
-  EX->>EX: 读文件、精确匹配、writeIfUnchanged
-  EX-->>TL: Output { files, replacements }
-  TL->>TL: 编码 output，toModelOutput → content
-  TL-->>TR: ToolOutput { structured, content }
-  TR->>OS: bound({ sessionID, toolCallID, output })
-  OS-->>TR: 超限则落盘 + 预览
-  TR-->>MT: Settlement { result, output, outputPaths }
-  MT-->>FS: settlement
-  FS->>PB: publish(LLMEvent.toolResult, outputPaths)
-  PB->>EV: publish(Tool.Success 或 Tool.Failed)
-  Note over RT: 流结束后 awaitToolFibers 等所有 fiber
-```
-
-### 执行规则
-
-1. 先记录再执行（`llm.ts`）：`publish(event)` 发出 `Tool.Called` 并写库之后，才调 `settle`。进程在这之间挂掉，重启后 `failInterruptedTools` 能看到一个 `running` 的工具并标失败。
-2. 执行可以取消，发布结果不能：`uninterruptibleMask` 里用 `restore` 包住 settle，所以执行过程可以被中断；拿到结果后的 `publish(toolResult)` 在 mask 里，取消信号插不进“拿到 settlement”和“发布结果”之间。但进程崩溃、写库失败它管不了，工具的副作用和结果记录并不是一个原子操作。
-3. 并行执行，串行发布：每个 tool-call 立刻进 `FiberSet`，互不等待；但 `withPublication` 信号量让事件一条一条发。文档："Eager local-tool execution is intentionally unbounded in the current local slice."
-
-### 工具结果回传
-
-下一轮 `entriesForRunner` 读到这条 assistant 消息时，`content` 里的 tool 项已经是 `completed`。`to-llm-message.ts` 把每个本地执行的 tool 项转成一条 `role: tool` 消息，内容是 `ToolOutput.toResultValue({ structured, content })`。`outputPaths` 里的落盘路径已经写进 content 的预览文本里了。
-
-### 工具无结果时的文案
-
-| 文案 | 在哪发 | 什么情况 |
-|---|---|---|
-| `Tool execution interrupted` | `llm.ts` | 上次崩溃留下的；用户拒绝权限；流或工具被中断；provider 报错 |
-| `Provider did not return a tool result` | | provider 执行的工具没给结果 |
-| `Tools are disabled after the maximum agent steps` | | 最后一步模型还在调工具 |
-| `Tool execution failed: …` | | 工具 fiber 以非中断原因失败（一般是 `ToolOutputStore.Error`） |
-| `Stale tool call: …` / `Unknown tool: …` | `registry.ts` | 工具在 materialize 之后被替换或注销 |
-
-### 类图
 
 ```mermaid
 classDiagram
-  class ToolDefinition_opaque {
-    <<Tool.make 返回值 冻结空对象>>
+  class SessionStep {
+    +attempt(input) Outcome
   }
-  class ToolRuntime {
-    permission: string
-    definition(name) ToolDefinition
-    settle(call, context) Effect~ToolOutput, ToolFailure~
+  class AttemptInput {
+    <<step.ts 里的 Input>>
+    sessionID
+    assistantMessageID
+    agent / model
+    prepared: Prepared
+    retry(cause, error, retryable) Decision
+    recoverContinuation: boolean
+    recoverOverflow: Effect~boolean~
+    isLocationClosed()
   }
-  class ToolConfig {
-    description: string
+  class Publisher {
+    <<createLLMEventPublisher 的返回值>>
+    -tools: Map 调用 id → 状态
+    -chunks: 攒着的增量
+    +publish(event)
+    +progress(callID, update)
+    +toolExecution(id, name, result)
+    +failTool(id, error)
+    +failUnsettledTools(error)
+    +failAssistant(error)
+    +flush() / streamed()
+    +startAssistant()
+    +record() StepRecord
+  }
+  class StepRecord {
+    outputStarted: boolean
+    providerFailed: boolean
+    failure?
+    finish?: finish / tokens / providerState
+    needsContinuation: boolean
+  }
+  class Outcome {
+    <<tagged enum>>
+    Completed(needsContinuation)
+    Retry(error, decision)
+    Continue(error, decision)
+    Compacted
+    RecoverFull
+  }
+  SessionStep ..> AttemptInput
+  SessionStep *-- Publisher : 每次 attempt 新建
+  Publisher ..> StepRecord : record()
+  SessionStep ..> Outcome : 返回
+```
+
+`createLLMEventPublisher`（`runner/publish-llm-event.ts`）造出的发布器是这一步的记账本：它把模型事件翻译成会话事件发出去，同时记下“输出开始了没有”“服务端报错了没有”“每个工具调用到哪一步了”。`attempt` 最后所有的判断，都是看 `record()` 给出的这份快照做的。
+
+模型事件和会话事件的对应关系：
+
+| 模型事件（`LLMEvent`） | 会话事件 | 持久化 |
+|---|---|---|
+| 第一个事件 | `step.started` | 是 |
+| `text-start` / `text-delta` / `text-end` | `text.started` / `text.delta` / `text.ended` | 增量不持久化，开始和结束持久化 |
+| `reasoning-*` | `reasoning.started` / `delta` / `ended` | 同上 |
+| `tool-input-start` / `delta` / `end` | `tool.input.started` / `delta` / `ended` | 同上 |
+| `tool-call` | `tool.called` | 是 |
+| `tool-result` / `tool-error`（服务端执行的工具） | `tool.success` / `tool.failed` | 是 |
+| 本地工具执行完 | `tool.success` / `tool.failed`（由工具 fiber 发） | 是 |
+| `step-finish` / `finish` | 记下来，收尾时发 `step.ended` | 是 |
+| `provider-error` | 记下来，收尾时发 `step.failed` | 是 |
+
+### 7.1 边读边跑工具
+
+模型流里每出现一个完整的工具调用，就为它 `forkScoped` 一个 fiber 去执行，不等流读完。几个工具调用可以并发跑。规则是：
+
+- **先持久化，再执行**。`tool.called` 事件写进库以后才开始执行工具，这样进程死了也知道“这个调用开始过”。
+- 每个工具 fiber 自己负责发结果事件：成功就 `toolOutput.truncate`（§8.4）后发 `tool.success`；工具返回 `Tool.Error` 就发 `tool.failed`，模型能看到错误信息。
+- 用户拒绝权限或者关掉提问对话框，不算工具失败，而是作为“拒绝”留在 fiber 的错误通道里，由 `attempt` 统一处理（§9）。
+- 流要读到底，不是看到 finish 事件就停，这样下一次请求能接着用这次响应留下的状态。
+
+文本和推理的增量（`text.delta`、`reasoning.delta`）是**临时事件**，只推给在线的客户端，不写库，而且会攒一小段时间批量发。每段文字结束时的 `text.ended` 才是持久化的，带完整内容。
+
+### 7.2 读完之后怎么收尾
+
+收尾整段是不可中断的（工作本身可以被取消，但最后的工具结果和 Step 事件一定要写完）：
+
+1. 发 `step.streamed`；流被中断了就中断所有工具 fiber。
+2. 等所有工具 fiber 结束，把它们的结局分成三类：用户拒绝、被中断、意外崩溃。
+3. **溢出恢复**：输出还没开始、服务端说上下文太长、`recoverOverflow` 也同意（一个 Step 只给一次机会，由 runner 控制），就压缩并返回 `Compacted`。
+4. **完整重发**：传输层说“要用完整上下文重发”，而且还没输出，返回 `RecoverFull`。
+5. **重试**：失败、还没有任何输出、重试策略同意 → 返回 `Retry`。已经有输出了、流中途断了、策略同意，且没有用户拒绝 → 先把这次的 Step 收尾，再返回 `Continue`。
+6. 其他情况：有拒绝的工具发失败（“用户拒绝了这次调用”），还没结果的工具统一标失败，Step 标中断或失败。
+7. 有结束原因就算用量和费用，再抓一次工作区快照，和开始时的快照比，得到这一步改了哪些文件，一起写进 `step.ended`。
+
+最后返回 `Completed({ needsContinuation })`。`needsContinuation` 的定义很直接：这一步里有没有**本地执行的**工具调用（被调用或者已经有结果）。有，就需要把结果交回模型，runner 会再跑一个 Step；provider 自己执行的工具（比如服务端的网页搜索）不算。
+
+### 7.3 重试策略
+
+`runner/retry.ts`：
+
+| 项 | 值 |
+|---|---|
+| 哪些错误会重试 | 限流、服务端内部错误、请求没发出去或不确定发没发出去的传输错误、被判为“流不完整”的输出 |
+| 间隔 | 从 2 秒开始指数增长，每次最多 10 秒，加随机抖动 |
+| 次数 | 最多 10 次（全失败的话大约等 84 秒） |
+| `Retry-After` | 服务端给了更长的等待时间就听它的，但最多 15 分钟 |
+| 超时 | 超时的请求本身已经等了很久，最多只重试 3 次 |
+| 插件 | `session.retry` 钩子能看到每次决定，可以否决或改延迟 |
+
+（设计文档 `specs/v2/session.md` 里写的是“最多重试 4 次”，代码已经改成 10 次，以代码为准。）
+
+---
+
+## 8. 工具
+
+### 8.1 工具的形状
+
+```mermaid
+classDiagram
+  class ToolInfo {
+    name
+    description
     input: Schema
-    output: Schema
-    structured: Schema
-    toStructuredOutput(input, output)
-    execute(input, context) Effect~Output, ToolFailure~
-    toModelOutput(input, output) Content[]
+    output?: Schema
+    options?: namespace / codemode / permission
+    execute(input, context) Result
   }
   class ToolContext {
-    sessionID: SessionID
-    agent: Agent.ID
-    assistantMessageID: Message.ID
-    toolCallID: string
+    sessionID
+    agent
+    messageID：发起调用的 assistant 消息
+    id：调用 id
+    progress(update)
   }
-  class ToolRegistry {
-    <<Service location>>
-    local: Map~name, registration[]~
-    applications: ApplicationTools
-    resources: ToolOutputStore
-    materialize(permissions) Materialization
-    register(tools)
-    settleWith(input, advertised) Settlement
+  class Result {
+    output?：给 Code Mode 的机器值
+    content：给模型看的内容
+    metadata?：给 UI 的小块 JSON
   }
-  class Materialization {
+  class ToolService {
+    <<Location 级>>
+    transform(editor => ...)
+    reload()
+    list()
+    snapshot(permissions) Snapshot
+  }
+  class Snapshot {
     definitions: ToolDefinition[]
-    settle(input) Effect~Settlement~
+    codeModeCatalog?
+    execute(sessionID, agent, messageID, call, progress, definitions)
   }
-  class Settlement {
-    result: ToolResultValue
-    output: ToolOutput
-    outputPaths: string[]
-  }
-  class ApplicationTools {
-    <<Service global>>
-    entries() Map~name, Entry~
-    register(tools)
-  }
-  class ToolOutputStore {
-    <<Service location>>
-    MAX_LINES 2000
-    MAX_BYTES 50KB
-    RETENTION 7d
-    bound(input) BoundResult
-    cleanup()
-  }
-  class PermissionV2 {
-    <<Service location>>
-    pending: Map~ID, Pending~
-    ask(input) AskResult
-    assert(input)
-    reply(input)
-    get(id) Request
-    forSession(sessionID) Request[]
-    list() Request[]
-    evaluate(action, resource, rulesets) Rule
-  }
-  class QuestionV2 {
-    <<Service location>>
-    pending: Map~ID, Pending~
-    ask(input) Answer[]
-    reply(input)
-    reject(requestID)
-  }
-  class LocationMutation {
-    <<Service location>>
-    resolve(input) Target
-  }
-  class Target {
-    canonical: string
-    resource: string
-    externalDirectory: action directory resource save
-  }
-  class BashTool
-  class EditTool
-  class ReadTool
-  class WriteTool
-  class QuestionTool
-  ToolDefinition_opaque ..> ToolRuntime : WeakMap 关联
-  ToolRuntime ..> ToolConfig : 闭包持有
-  ToolRuntime ..> ToolContext
-  ToolRegistry --> ApplicationTools : 兜底查
-  ToolRegistry --> ToolOutputStore : bound
-  ToolRegistry ..> Materialization : 返回
-  Materialization ..> Settlement
-  BashTool ..> PermissionV2 : assert
-  BashTool ..> LocationMutation : resolve
-  EditTool ..> PermissionV2
-  EditTool ..> LocationMutation
-  ReadTool ..> PermissionV2
-  WriteTool ..> PermissionV2
-  QuestionTool ..> QuestionV2 : ask
-  QuestionTool ..> PermissionV2
-  LocationMutation ..> Target
+  ToolService ..> Snapshot : snapshot
+  ToolInfo ..> ToolContext : execute 收到
+  ToolInfo ..> Result : execute 返回
 ```
 
-### `Tool.make`
+一个工具就是一个对象：名字、描述、输入输出 schema、`execute`。`execute` 返回三样东西：`output` 是给 Code Mode 脚本用的结构化值，不写库；`content` 是给模型看的内容，写库；`metadata` 是给界面用的小块 JSON。
 
-`Tool.make(config)` 用来定义一个工具：`config` 里有描述、输入输出 Schema，以及真正干活的 `config.execute`。调 `Tool.make` 只是创建工具，不会执行。
+### 8.2 注册
 
-返回的工具是一个 `Object.freeze({})` 空对象，对应的 `Runtime` 存在模块级的 `WeakMap` 里。外面要用只能通过 `Tool.definition`、`Tool.settle` 这些函数，碰不到内部实现。
+工具都通过 `Tool.Service.transform` 注册，内置工具、插件、MCP 都一样。注册是有作用域的：同名工具后注册的生效；关掉某次注册的作用域，就只删掉它自己，之前被它盖住的那个又露出来。
 
-| `Runtime` 成员 | 干什么 |
+内置工具在 `core/src/tool/plugin/` 下，每个都是一个内部插件：
+
+| 工具 | 说明 |
 |---|---|
-| `definition(name)` | 把输入、输出 Schema 转成 JSON Schema，生成并按名字缓存 `ToolDefinition`，告诉模型这个工具怎么调 |
-| `settle(call, context)` | 解码输入、调 `config.execute`、编码输出，最后生成 `ToolOutput`，流程见下面 |
-| `permission` | 过滤工具时用的权限动作名。`Tool.withPermission(tool, "edit")` 可以改掉默认名字，比如 `edit` / `write` / `apply_patch` 都用 `edit`，一条规则就能管住这几个工具 |
+| `read` / `write` / `edit` / `patch` | 读写文件。后三个共用权限动作 `edit`。`patch` 一次提交多个文件的增删改 |
+| `glob` / `grep` | 找文件、搜内容 |
+| `shell` | 执行命令，输出写到文件，返回截断后的尾部 |
+| `question` | 向用户提问（§9.3） |
+| `subagent` | 派子 agent（§13） |
+| `skill` | 加载技能 |
+| `webfetch` / `websearch` | 抓网页、搜索 |
+| `opencode` | `session_rename`、`session_move`、`models` 几个操作会话和查模型的小工具 |
 
-这里的 `settle` 管的是单个工具的执行过程：
+### 8.3 快照：每次请求固定一份
+
+`snapshot(permissions)` 在 `select` 时调用（§6.1），为这次请求固定一份工具：
+
+1. 去掉被权限整个禁用的工具。
+2. 分成两组：`codemode: false` 的工具**直接**声明给模型；其余的（默认值）都收进 Code Mode。
+3. Code Mode 里有工具时，额外声明一个名叫 `execute` 的工具：模型写一段脚本，在脚本里调这些工具（§13）。
+
+上面表里的内置工具都标了 `codemode: false`，所以模型直接看到它们。插件和 MCP 加进来的工具默认进 Code Mode，不占工具声明。少数本身就把工具包成了 Code Mode 的 MCP 服务是例外，会被自动设成 `codemode: false`，避免两层 Code Mode 套在一起（`plugin/mcp-codemode-defaults.ts`）。
+
+快照的 `execute` 只执行这次请求宣告过的工具。之后注册表变了，只影响后面的请求。被钩子删掉的工具、名字对不上的工具、最后一步的工具调用，都各自返回一个错误结果，不影响同一批里的其他调用。
+
+一次本地调用的完整过程：
 
 ```text
-call.input
-  → 按 config.input 解码、校验
-  → config.execute(input, context)          真正执行工具业务
-  → 按 config.output 编码、校验返回值
-  → 配置了 structured 和 toStructuredOutput 时，生成独立的 structured 输出
-  → 用 toModelOutput 生成模型可读的 content
-  → 返回 ToolOutput { structured, content }
+tool.execute.before 钩子（可以修复参数）
+  → 用输入 schema 校验参数（不合法就不执行）
+  → 工具的 execute
+  → 用输出 schema 编码 output
+  → tool.execute.after 钩子（可以改结果）
+  → 规整 content，压缩图片
+  → runner 里的 ToolOutput.truncate
+  → tool.success / tool.failed 事件
 ```
 
-输入不合法直接返回 `ToolFailure`，不会进 `config.execute`；输出不符合 Schema 也返回 `ToolFailure`。没配 structured 转换时，`structured` 就用编码后的 output。没配 `toModelOutput` 时，字符串 output 默认转成 text content，其他类型就没有 content。
+### 8.4 输出截断
 
-`Tool.settle(tool, call, context)` 只是从 `WeakMap` 里找到这个工具的 `Runtime`，再调上面的 `Runtime.settle`。
+`ToolOutput.truncate`（`core/src/tool-output.ts`）只量文本部分：超过 2000 行或 50 KiB，就把完整内容存进托管目录下的 `tool-output/` 文件里，保留 7 天；给模型的内容换成“头部 + 省略标记 + 尾部”，并在 metadata 里记下文件路径。完整内容存不下来时，这次调用算失败，不会发一个丢了数据的“成功”。
 
-### `ToolRegistry`
-
-`ToolRegistry` 管当前目录能用的工具。它把进程级的 `ApplicationTools` 和目录级的本地注册项合到一起，每次 attempt 返回一个 `Materialization { definitions, settle }`：`definitions` 发给模型，`settle` 留给 runner 执行模型发回来的 tool-call。
-
-注意这里有两个 settle：`Materialization.settle` 是外层入口，里面再调 `Tool.make` 存下的 `Runtime.settle`。它们在同一条调用链上，`config.execute` 只执行一次。
-
-```text
-runner 收到 tool-call
-  → Materialization.settle(input)
-    → ToolRegistry 的 settleWith(input, registration.identity)
-      → 按 call.name 找到当前注册项，检查 identity 是否仍与本次提供给模型的一致
-      → Tool.settle(tool, call, context)
-        → Runtime.settle(call, context)
-          → 输入解码 → config.execute → 输出编码 → ToolOutput
-      → ToolOutputStore.bound(...) 处理输出大小
-      → 返回 Settlement { result, output?, outputPaths? }
-```
-
-`Runtime.settle` 管输入、执行和输出类型；`ToolRegistry` 这层的 settle 管找哪个工具、注册项有没有过期、结果怎么交回 runner。
-
-| 方法 | 干什么 | 谁调它 |
-|---|---|---|
-| `register(tools)` | 校验名字（`/^[A-Za-z][A-Za-z0-9_-]{0,63}$/`），按名字压栈。Scope 关闭时通过 `addFinalizer` 移除本次注册项，恢复之前的同名工具 | 工具的 layer（`bash.ts`, `edit.ts` 等） |
-| `materialize(permissions)` | 以 `ApplicationTools` 为基础，用本地注册项覆盖同名工具；过滤 `whollyDisabled` 的工具（规则 `resource: "*"` 且 `effect: "deny"`），返回持有本次注册表快照的 `{ definitions, settle }` | `runTurnAttempt` |
-| `settleWith(input, advertised)` | 重新查找注册项（本地优先），用 `identity` 检查它是否仍是之前提供给模型的那个工具；通过后调用 `Tool.settle`，再整理结果 | `Materialization.settle` |
-
-模型调的名字不在这次的 `Materialization` 里，返回 `Unknown tool`；当初给模型的那个注册项已经没了或被换掉了，返回 `Stale tool call`，不会去执行新的同名工具。`Tool.settle` 返回的 `ToolFailure` 会转成 `Settlement.result` 里的 error；成功的输出交给 `ToolOutputStore.bound`，再生成 `result` 和可选的 `outputPaths`。
-
-这里的权限过滤只决定给模型看哪些工具。具体到某个路径、某条命令能不能执行，还是工具自己在 `config.execute` 里调 `PermissionV2` 判断。
-
-### `ToolOutputStore`
-
-`ToolOutputStore` 在工具输出太长时把完整内容写到文件，只给模型头尾预览和文件路径。
-
-`bound(input)`：把 content 里的 text 拼起来（没 content 就 JSON 化 `structured`）；行数 ≤ 2000 且字节 ≤ 50KB 原样返回；否则写到 `<data>/tool-output/tool_<id>`，返回 `boundedPreview`（头 + "... output truncated; full content saved to … ..." + 尾）。限额可以在配置的 `tool_output.max_lines / max_bytes` 改。`cleanup` 删 7 天前的文件，server 启动时挂了个 `cleanupNode`。
-
-### `PermissionV2`
-
-`PermissionV2` 是工具产生副作用之前的一道检查。它不执行工具，只给出三种结果之一：
-
-```text
-allow：直接继续执行
-deny：直接阻止，不询问用户
-ask：暂停当前工具，等用户选择 once / always / reject
-```
-
-权限在两个地方用到：
-
-1. `ToolRegistry.materialize` 把工具列表发给模型前，先把被规则整个禁掉的工具藏起来。比如某个 action 对 `resource: "*"` 是 deny，模型就看不到这个工具。
-2. 模型真的调了工具，工具在产生副作用前调 `permission.assert(...)`，针对这次要操作的具体对象再判断一次。第一步只是让模型少看到几个工具，不能代替这一步。
-
-`Tool.withPermission(tool, "edit")` 只是告诉注册表“过滤这个工具时按哪个 action 算”，不会自动授权；`assert` 还是得工具自己在产生副作用前调。
-
-#### 一次权限请求里有什么
-
-假设模型要运行 `git status`，工具会构造类似这样的请求：
-
-```ts
-yield* permission.assert({
-  sessionID,
-  agent,
-  action: "bash",
-  resources: ["git status"],
-  save: ["git status"],
-  source: { type: "tool", messageID, callID },
-})
-```
-
-| 字段 | 含义 |
-|---|---|
-| `action` | 要做哪类操作。通常是工具名，也可以是 `edit`、`external_directory` 这类共用权限名 |
-| `resources` | 这次实际要操作什么。它只是用于匹配规则的字符串；这里是命令，读写工具里通常是文件路径 |
-| `save` | 用户选择 `always` 时要记住哪些字符串。它可以和 `resources` 不同，也可以不提供 |
-| `sessionID` / `agent` | 用哪个会话和 agent 的规则来判断 |
-| `source` | 是哪条 assistant 消息里的哪个 tool call 发起了请求，供客户端定位和显示 |
-
-一条规则就是 `{ action, resource, effect }`。`action` 和 `resource` 都支持通配符；多条规则同时匹配时，排在最后的那条生效。比如：
-
-```ts
-[
-  { action: "*",    resource: "*",             effect: "allow" },
-  { action: "read", resource: "*.env",         effect: "ask" },
-  { action: "read", resource: "*.env.example", effect: "allow" },
-]
-```
-
-意思是一般操作都允许，读 `.env` 要问用户，读 `.env.example` 还是允许。一条规则都没匹配上时，默认是 `ask`，不是直接放行。
-
-#### `assert` 怎么让工具停下来等用户
-
-```mermaid
-sequenceDiagram
-  participant RN as SessionRunner
-  participant TL as Tool.execute
-  participant PM as PermissionV2
-  participant EV as EventV2
-  participant UI as 客户端
-
-  RN->>TL: 执行模型发出的 tool call
-  TL->>PM: assert(action, resources, save, sessionID)
-  PM->>PM: 读取 agent 规则和项目已保存规则
-  alt allow
-    PM-->>TL: return，工具继续产生副作用
-  else deny
-    PM-->>TL: BlockedError，工具不执行
-  else ask
-    PM->>PM: 建一个 pending 请求和一次性等待闸门
-    PM->>EV: permission.v2.asked
-    EV-->>UI: SSE 显示授权卡片
-    UI->>PM: HTTP permission.reply(once / always / reject)
-    alt once 或 always
-      PM->>PM: 打开等待闸门
-      PM-->>TL: assert 返回，工具继续
-    else reject
-      PM->>PM: 让等待以拒绝失败
-      PM-->>RN: 当前排空被中断
-    end
-  end
-```
-
-图里的“一次性等待闸门”在代码里就是一个 `Deferred`：`assert` 停在 `Deferred.await` 上，`reply` 把这个 Deferred 置成成功或失败，原来那个工具 fiber 才接着跑或者退出。等待中的请求放在 `pending` Map 里，客户端通过 `list` / `forSession` / `get` 读。目录服务被释放时，还在等的 Deferred 全部按拒绝处理，工具不会一直挂着。
-
-三个回复的区别：
-
-| 回复 | 后果 |
-|---|---|
-| `once` | 只打开当前请求的等待闸门，不写数据库；下次相同操作仍重新判断 |
-| `always` | 请求带有 `save` 时，把其中的字符串作为 allow 规则写进当前 project 的 `PermissionSaved` 表，再放行当前请求；同会话里其他现在也能命中这些规则的 pending 请求会一起放行。没有 `save` 时只放行当前请求 |
-| `reject` | 拒绝当前请求，并把同一会话里其他 pending 请求一起拒绝；没有反馈文案时，runner 把它识别成用户拒绝并停止本次排空 |
-
-#### 规则怎么合并
-
-并不是把所有规则拼在一起就完事，判断顺序是这样的：
-
-1. 根据 `sessionID` 找到会话，再确定当前 agent，取它配置的 permission rules；找不到 agent 时使用全 deny。
-2. 先只看 agent 规则。如果这次任一 resource 被 agent 明确 deny，立即 deny。项目里记住的 `always` 不能覆盖 agent 的硬禁止。
-3. 没有硬禁止，再把项目已保存的 allow 规则放到 agent 规则后面。因为后面的匹配规则优先，它可以把原来的 ask 变成 allow。
-4. 一个请求可以有多个 resources：任一个 deny，整体 deny；否则任一个 ask，整体 ask；全部 allow 才整体 allow。
-
-主要方法：
-
-| 方法 | 谁调它 | 干什么 |
-|---|---|---|
-| `assert(input)` | 工具执行代码 | 完成判断；allow 立即返回，deny 报错，ask 发事件并等待用户回复 |
-| `ask(input)` | `session.permission.create` HTTP 接口 | 只判断并在需要时创建 pending，请求本身不等待；返回 `{ id, effect }` |
-| `reply(input)` | 客户端的授权按钮 | 回复 pending 请求，让等待中的 `assert` 继续或失败 |
-| `list()` / `forSession()` / `get()` | HTTP 接口和客户端同步 | 查询当前还在等待用户处理的请求 |
-
-内置 build agent 的规则是 `*` allow 打底，但外部目录默认 ask，读取敏感环境文件也会 ask；`plan`、`explore` 等 agent 再追加更严格的规则。
-
-### `QuestionV2`
-
-和 `PermissionV2` 结构一样：`pending` Map + Deferred。`ask` 发 `Asked` 事件后等答复；`reply` 返回答复；`reject` 以 `RejectedError` 失败。`question` 工具（`tool/question.ts`）先 `permission.assert({ action: "question" })` 再 `question.ask`。
-
-### `LocationMutation.resolve`
-
-`LocationMutation.resolve` 把工具传进来的路径解析成规范路径、权限资源名，以及是否属于外部目录。
-
-规则：相对路径必须落在 Location 内（否则 `relative_escape`）；绝对路径落在 Location 内、但 realpath 逃出去了，是 `location_escape`；绝对路径在 Location 外算外部路径，资源名用规范绝对路径，再附一个 `externalDirectory` 授权描述（action `external_directory`，resource `<目录>/*`）。内部路径的资源名是相对路径。
+工具自己也可以先截（比如 shell 把完整输出写进自己的文件，只返回尾部），那是工具自己的事，两层限制互不相干。
 
 ---
 
-## 8. 收尾：等待工具，提交 step，再决定续接
-
-```mermaid
-sequenceDiagram
-  participant RN as runTurn
-  participant RT as runTurnAttempt 收尾
-  participant CP as SessionCompaction
-  participant FS as toolFibers
-  participant PB as LLMEventPublisher
-  participant EV as EventV2
-  Note over RT,FS: 承接 §6：providerStream 已退出，工具可能仍运行
-  opt 尚未开始 assistant 且发生上下文溢出
-    RT->>CP: recoverOverflow（若提供）
-    break 压缩成功
-      RT-->>RN: ContinueAfterOverflowCompaction(currentStep)
-    end
-  end
-  RT->>PB: 发布未恢复的溢出；LLMError 补失败状态
-  opt stream 被中断
-    RT->>FS: clear
-  end
-  RT->>FS: restore(awaitToolFibers) → settled Exit
-  break 用户拒绝工具
-    RT->>FS: clear
-    RT->>PB: failUnsettledTools
-    RT-->>RN: Effect.interrupt
-  end
-  RT->>PB: 按 stream / settled 修补工具和 assistant 的失败状态
-  opt 有 stepSettlement 且无 provider 错误
-    RT->>RT: endSnapshot，计算 files
-    RT->>EV: withPublication：Step.Ended
-  end
-  RT->>PB: 兜底失败化未 settle 的工具
-  alt stream 失败或工具等待被中断
-    RT-->>RN: failCause（原 cause）
-  else 可返回
-    RT-->>RN: needsContinuation + currentStep
-    Note over RN: 回到 §4 的循环：续接、取 queue，或退出 drain
-  end
-```
-
-收尾整个包在 `Effect.uninterruptibleMask` 里，只有 providerStream、溢出恢复、等工具这几处用 `restore` 放开，可以被中断。各段的退出结果先存成 `Exit`，后面才分得清是模型流失败、等工具失败，还是用户明确拒绝。为什么不在模型流一停就直接返回？因为这时工具可能还在跑，publisher 里也还有没收尾的东西，直接返回就没人管它们了。
-
-发不发 `Step.Ended`，看的是有没有 `stepSettlement`、有没有 provider 错误，而不是工具是不是都成功了。工具失败和 step 结束是分开记的；最后要不要把 cause 往上抛，由后面的分支决定。
-
-收尾时按这个顺序判断：
-
-| 步 | 条件 | 动作 |
-|---|---|---|
-| ① | 传了 `recoverOverflow`、还没开始输出、错误是溢出、压缩成功 | `die(continueAfterOverflowCompaction)` |
-| ② | 有记下的溢出错误但没能恢复 | 现在把它 publish 出去（变成 `Step.Failed`） |
-| ③ | 流以 `LLMError` 失败且发布器还没记 provider 错误 | `failUnsettledTools("Provider did not return a tool result", hostedOnly=true)` + `failAssistant(reason)` |
-| ④ | 流被中断 | 清掉工具 fiber（不等它们） |
-| ⑤ | — | `awaitToolFibers`：等全部工具 settle |
-| ⑥ | 工具失败原因是用户拒绝 | 清 fiber，`failUnsettledTools("Tool execution interrupted")`，`Effect.interrupt` 结束整个排空 |
-| ⑦ | 流或工具被中断 | `failUnsettledTools`，assistant 还活着就 `failAssistant("Provider turn interrupted")` |
-| ⑧ | 工具以非中断原因失败 | `failUnsettledTools("Tool execution failed: …")` |
-| ⑨ | 有 `stepSettlement` 且没 provider 错误 | 拍结束快照，算改动文件列表，发 `Step.Ended { finish, cost: 0, tokens, snapshot, files }` |
-| ⑩ | 兜底 | 有 provider 错误再 fail 一次未 settle 的；流正常结束但 provider 执行的工具没给结果也 fail |
-| ⑪ | 流失败 / 工具中断 | 把失败原因原样往上抛 |
-| ⑫ | 正常 | 返回 `{ needsContinuation: 没 provider 错误 && needsContinuation, step }` |
-
----
-
-## 9. 压缩：怎样退出并重新进入 attempt
-
-压缩有两个入口：§5 里请求发出前的主动压缩，和 §8 里模型还没开始输出就报溢出之后的压缩。两条路都会带着当前 step 退出去再重进 attempt，重进时要重新读历史，不能用压缩前拼好的那个 request。
-
-opencode v2 目前没有 provider 重试。`LLMClient` 里没有 retry，runner 头注释里 "Bound provider retries" 那项没勾，`SessionEvent.Retried` 定义了但没人发。一次 `LLMError` 就是这轮失败：`Step.Failed` 落库，排空结束。
-所以循环外面的处理只有压缩这一种。
-
-```mermaid
-sequenceDiagram
-  participant RN as run
-  participant T as runTurn
-  participant A as runTurnAttempt
-  participant C as SessionCompaction
-  participant LLM as LLMClient
-  participant EV as EventV2
-  participant R as runAfterOverflowCompaction
-
-  RN->>T: runTurn(sessionID, promotion, step)
-  T->>A: runTurnAttempt(..., recoverOverflow=compactAfterOverflow)
-  A->>A: 拼好 request
-  A->>C: compactIfNeeded({ sessionID, entries, model, request })
-  C->>C: auto 关？context 未知？估算 tokens 小于等于 context - max(output, buffer)？→ false
-  alt 需要压缩
-    C->>C: select(entries, keep.tokens) → head / recent
-    C->>C: buildPrompt(previousSummary?, [prior.recent, head])
-    C->>EV: publish(Compaction.Started { reason: auto })
-    C->>LLM: stream(request{ model, messages: [user(summaryPrompt)], tools: [], maxTokens })
-    LLM-->>C: text-delta 攒起来
-    C->>EV: publish(Compaction.Ended { text: summary, recent })
-    EV->>EV: 投影：插一条 compaction 消息
-    C-->>A: true
-    A->>A: die(ContinueAfterCompaction(step))
-    T->>T: catchDefect 认出 → yieldNow → runTurn(sessionID, undefined, step)
-    Note over T: 重新走一遍：entriesForRunner 从 compaction.seq 起读，prepare 发现新压缩 → replace 基线
-  else 不需要
-    A->>LLM: stream(request)
-    LLM-->>A: provider-error classification=context-overflow（还没开始输出）
-    A->>A: overflowFailure = event，不 publish
-    A->>C: recoverOverflow = compactAfterOverflow(...)
-    C-->>A: true
-    A->>A: die(ContinueAfterOverflowCompaction(step))
-    T->>R: runAfterOverflowCompaction(sessionID, undefined, step)
-    R->>A: runTurnAttempt(..., recoverOverflow=undefined)
-    A->>LLM: stream(request)
-    alt 再次溢出
-      A->>A: publish(overflowFailure) → Step.Failed
-    end
-  end
-```
-
-### 压缩判定
-
-```
-estimate({ system, messages, tools }) > context - max(generation.maxTokens ?? limits.output, buffer)
-```
-
-`estimate` 是 `Token.estimate(JSON.stringify(...))`，粗估。`context` 来自 `model.route.defaults.limits.context`（目录里的 `limit.context`）。`buffer` 默认 20000。`auto: false` 可以关掉。
-
-### 压缩实现
-
-1. `select`：非 compaction 消息序列化成行（user / assistant / tool call / tool result 截 2000 字 / system / synthetic / shell），从尾往头攒 8000 token 当 `recent`，其余是 `head`。
-2. 有旧 `compaction` 消息就把它的 `recent` 拼在 `head` 前面，`summary` 当 `previousSummary`。这样摘要是滚动更新的。
-3. 摘要提示词本身超过 `context - summaryOutput` 就放弃。
-4. 用同一个模型发请求，`tools: []`，`maxTokens = min(output, 4096)`。注意用的是当前 agent，不是那个叫 `compaction` 的隐藏 agent（那是 v1 用的）。
-5. 成功发 `Compaction.Ended`，投影插一条 `compaction` 消息，`seq` 是这条事件的序号。
-
-### 压缩后的历史
-
-`SessionHistory.messageRows`（`history.ts`）：有 compaction 时取 `seq >= compaction.seq`，所以历史变成 `[compaction 消息, 之后的所有消息]`。`to-llm-message.ts` 把 compaction 消息渲染成一条 user 消息：`<conversation-checkpoint><summary>…</summary><recent-context>…</recent-context></conversation-checkpoint>`。同时 `SessionContextEpoch.prepare`（`context-epoch.ts`）发现 `compaction.seq > baseline_seq`，走 `replace` 重新渲染一份完整基线，`baseline_seq` 设成 compaction 的 seq。所以压缩后的第一轮请求里，系统提示词是重新生成的完整基线，历史只有一条 checkpoint 加上之后的消息。
-
-### 溢出恢复
-
-`runTurn` 会传 `compactAfterOverflow` 进去，`runAfterOverflowCompaction` 不传。所以第二次溢出时 `recoverOverflow` 是 undefined，恢复条件不成立，溢出错误就被 publish 出去，变成 `Step.Failed`。如果溢出发生在已经开始输出之后（`hasAssistantStarted()` 为真），不恢复，直接当普通错误。文档："recovery never loops or replays partial side effects."
-
-### 转换信号：TurnTransitionError
-
-名字叫 Error，其实是控制流程用的信号。请求前压缩成功，或者流退出后溢出恢复成功时，`runTurnAttempt` 用 `Effect.die(new TurnTransitionError(...))` 把信号抛给外层；`runTurn` 用 `catchDefect` 接住，决定是再调一次自己，还是转到 `runAfterOverflowCompaction`。这条路不走正常的 `{ needsContinuation, step }` 返回值。两种转换：`ContinueAfterCompaction`（主动压缩完成）和 `ContinueAfterOverflowCompaction`（溢出后压缩完成），都带当前 `step`。
-
-### 压缩对象与预算
-
-图里的预算判断、摘要请求、发压缩事件都在 `SessionCompaction` 里。`make({ events, llm, config })` 返回两个函数。
-
-| 函数 / 常量 | 内容 |
-|---|---|
-| `DEFAULT_BUFFER = 20_000` | 上下文窗口要留的余量（token） |
-| `DEFAULT_KEEP_TOKENS = 8_000` | 压缩后保留最近原文的 token 预算 |
-| `TOOL_OUTPUT_MAX_CHARS = 2_000` | 序列化进摘要提示词时每个工具输出截到多长 |
-| `SUMMARY_OUTPUT_TOKENS = 4_096` | 摘要请求的 `maxTokens` 上限 |
-| `SUMMARY_TEMPLATE` | 摘要必须遵守的 Markdown 模板：Objective / Important Details / Work State(Completed, Active, Blocked) / Next Move / Relevant Files |
-| `settings(config)` | 从配置文档里取 `compaction.auto` / `buffer` / `keep.tokens`，多份配置后者覆盖前者 |
-| `select(entries, tokens)` | 把非 compaction 消息序列化成文本行，从尾往头攒到 `tokens` 预算为止，切成 `head`（要总结的）和 `recent`（保留原文的） |
-| `buildPrompt({ previousSummary, context })` | 有旧摘要就带上 `<prior-summary>` 和合并规则 |
-| `compactIfNeeded(input)` | `auto` 关了返回 false；估算 `system + messages + tools` 的 token，超过 `context - max(output, buffer)` 就调 `compactAfterOverflow` |
-| `compactAfterOverflow(input)` | 主体逻辑。发 `Compaction.Started` → 用同一个模型发一次无工具请求→ 拼文本 → 发 `Compaction.Ended`。任何一步失败返回 false |
-
----
-
-## 10. 事件提交：持久化、客户端同步与恢复
-
-前面所有的 publish 最后都走到这里。先看一个持久化事件是怎么在事务里写进去的，再看投影和表结构，最后看崩溃恢复：能恢复到什么程度，取决于崩溃前哪些东西已经提交了。
-
-### 事件写库
-
-```mermaid
-sequenceDiagram
-  participant P as 发布方（发布器 / SessionInput / 门面）
-  participant EV as EventV2.publish
-  participant TX as SQLite 事务 immediate
-  participant PJ as 投影函数们
-  participant MU as SessionMessageUpdater
-  participant SUB as 订阅者（SSE / durable 流）
-
-  P->>EV: publish(定义, data, { commit? })
-  EV->>EV: 补 id、location
-  EV->>TX: begin
-  TX->>TX: SELECT seq FROM event_sequence WHERE aggregate_id
-  TX->>TX: seq = latest + 1，检查 event.id 不重复
-  TX->>PJ: 逐个调 projectors[type]
-  PJ->>MU: update(db 适配器, event)
-  MU->>TX: UPDATE/INSERT session_message
-  TX->>TX: options.commit(seq)（系统上下文 advance 快照时用）
-  TX->>TX: UPSERT event_sequence，INSERT event
-  TX-->>EV: commit
-  EV->>SUB: PubSub.publish(durable wake) 叫醒该会话的 durable 流
-  EV->>SUB: notify：listeners、typed PubSub、all PubSub
-  EV-->>P: 带 durable.seq 的事件
-```
-
-`event` 表是数据的来源，`session_message` 相当于缓存。两者在同一个事务里写入，所以不会出现事件写进去了、消息却没更新的情况。投影函数抛异常整个事务回滚，发布方拿到的是 defect。
-
-### 事务内的投影：SessionProjector
-
-`SessionProjector` 负责把事件投影成表里的数据。它在 `EventV2` 上用 `events.project(定义, 函数)` 注册了 29 个投影函数，投影和事件写库在同一个事务里执行（`event.ts`）。
-
-主要方法：
-
-| 方法 | 干什么 |
-|---|---|
-| `run(db, event)` | 造一个 `SessionMessageUpdater.Adapter`，六个回调全是查表/改表，然后交给 `SessionMessageUpdater.update` |
-| `insertMessage(db, event, message)` | `seq = event.durable.seq`，`data` 是消息去掉 `id` / `type` 后的 JSON |
-| `getCurrentAssistant` 适配器 | 取 `seq` 最大的 assistant，且 `time.completed` 为空的才算"当前"。注释：新一轮开始时旧的未完成 assistant 被视为过期，不再续写 |
-
-### 同一份消息更新逻辑：SessionMessageUpdater
-
-`SessionMessageUpdater` 是一个纯函数 `update(adapter, event)`，对 33 种会话事件各写了一个 case，决定每个事件怎么改消息。它不知道底下是 SQLite 还是内存数组：`memory(state)` 给了一个数组版适配器，前端也用它。
-
-§6 列出了事件族与主要投影结果，这里补充两条消息更新规则：
-
-- `step.started`：先把上一条未完成的 assistant 标成 `completed`，再新建一条空 content 的 assistant，`snapshot.start` 从事件里带过来。
-- `tool.failed`：只有 `pending` 或 `running` 才转 `error`。已经 `completed` 的不动。
-
-### 事件服务的接口
-
-`EventV2` 既是事件总线，也负责存储事件。
-
-| 方法 | 干什么 |
-|---|---|
-| `publish(definition, data, options)` | 补 `id`（`evt_`）、`location`（从当前 Effect 环境里取 `Location.Service`，没有就不带），进 `publishEvent` |
-| `publishEvent` | 定义带 `durable` 就先 `commitDurableEvent`，再 `notify`；不带直接 `notify` |
-| `commitDurableEvent` | 一个 SQLite 事务（`behavior: "immediate"`）：读 `event_sequence` 拿 `latest` → `seq = latest + 1` → 检查 id 没重复 → 跑这个类型注册的全部投影函数→ 跑 `options.commit(seq)` 钩子→ upsert `event_sequence` → 插 `event`。事务外：叫醒这个聚合的 durable 订阅者 |
-| `notify(event, isolate)` | 依次调 `listeners`（durable 事件时隔离异常）、按类型的 PubSub、全局 PubSub |
-| `project(definition, projector)` | 注册投影函数。`SessionProjector` 的 layer 就是一串 `project` 调用 |
-| `durable({ aggregateID, after })` | 返回一个流：先 `readAfter` 把库里 `seq > after` 的全读出来，再 `Stream.concat` 一个实时流，每次被唤醒就再读一次。叫醒信号是 `PubSub.sliding(1)`，连续提交合并 |
-| `replay` / `replayAll` / `claim` / `remove` | 跨节点同步用的。序号不连续、owner 不匹配都会 die |
-
-因为投影在事务里执行，事件写入和状态表更新要么都成功，要么都失败。`Prompted` 的投影（写 user 消息 + 标 promoted）也是靠这个保证原子的。
-
-### 持久化表结构
-
-上面这些数据最终落在六张表里。`event` 表存全部持久化事件；`session_message` 和 `session_input` 由事件投影维护；`session_context_epoch` 由 `SessionContextEpoch` 写（§5）；`session` 表目前还是由 v1 的会话事件投影。
+## 9. 权限与用户交互
 
 ```mermaid
 classDiagram
-  class session {
-    id PK
-    project_id FK
-    workspace_id
-    parent_id
-    directory
-    path
-    title
-    agent
-    model json
-    cost tokens_x5
-    revert json
-    permission json
-    time_created updated compacting archived
+  class Permission {
+    <<目录级服务>>
+    -pending: Map~ID, Pending~
+    -closed: boolean
+    +ask(input) id 和 effect
+    +assert(input)
+    +reply(requestID, reply, message?)
+    +get(id) / forSession(sessionID) / list()
+    +close()
   }
-  class session_message {
-    id PK
-    session_id FK
-    type
-    seq  UNIQUE with session_id
-    time_created
-    data json
+  class Pending {
+    request: Request
+    agent?
+    deferred: Deferred
   }
-  class session_input {
-    id PK
-    session_id FK
-    prompt json
-    delivery
-    admitted_seq UNIQUE with session_id
-    promoted_seq UNIQUE with session_id
-    time_created
+  class Request {
+    id
+    sessionID
+    action
+    resources: string[]
+    save?: string[]
+    metadata?
+    source: 哪个工具调用
+    message?
   }
-  class session_context_epoch {
-    session_id PK
-    baseline text
-    snapshot json
-    baseline_seq
+  class Rule {
+    action
+    resource
+    effect: allow / deny / ask
   }
-  class event {
-    id PK
-    aggregate_id FK
-    seq UNIQUE with aggregate_id
-    type
-    data json
+  class PermissionSaved {
+    +list(projectID)
+    +add(projectID, action, resources)
   }
-  class event_sequence {
-    aggregate_id PK
-    seq
-    owner_id
-  }
-  session "1" --> "*" session_message
-  session "1" --> "*" session_input
-  session "1" --> "0..1" session_context_epoch
-  event_sequence "1" --> "*" event
+  Permission o-- Pending : 等待回复的请求
+  Pending --> Request
+  Permission ..> Rule : 求值
+  Permission --> PermissionSaved : 总是允许的规则
 ```
 
-| 表 | 定义 | 谁写 | 说明 |
-|---|---|---|---|
-| `session` | `core/src/session/sql.ts` | `SessionV1.Event.Created/Updated` 的投影（`projector.ts`） | 创建会话仍然走 v1 事件，v2 只是投影它。 |
-| `session_message` | | `insertMessage`（`projector.ts`）和 `updateMessage` | `seq` 就是产生它的那条事件的会话序号。历史顺序按 `seq` 排，不按时间。 |
-| `session_input` | | `SessionInput.projectAdmitted` / `projectPrompted` | 索引 `(session_id, promoted_seq, delivery, admitted_seq)` 就是为 `hasPending` 和 `promoteSteers` 建的。 |
-| `session_context_epoch` | | `SessionContextEpoch.insert / replace / advance` | 一个会话一行。`baseline` 是发给模型的系统提示词原文，`snapshot` 是结构化快照用来比对。 |
-| `event` / `event_sequence` | `core/src/event/sql.ts` | `EventV2.commitDurableEvent`（`event.ts`） | `event_sequence` 存每个聚合（会话）的最新序号；写事件时在同一个事务里读序号、跑投影、写两张表。 |
+### 9.1 规则怎么算
 
-SQLite 连接在 `core/src/database/database.ts`：WAL 模式、`synchronous = NORMAL`、`busy_timeout = 5000`。库文件位置由 `path()` 决定，`OPENCODE_DB` 环境变量可以指到 `:memory:`。
+一条权限规则是 `{ action, resource, effect }`，`effect` 是 `allow` / `deny` / `ask` 三种，`action` 和 `resource` 都支持通配符。`Permission.Service`（`core/src/permission.ts`）判断一次请求：
 
-### 客户端同步
+```ts
+const rules = merge(agent.permissions, session.permissions)        // agent 的规则 + 会话的规则
+if (任一资源命中 deny) return "deny"
+const all = [...rules, ...已保存的 always 规则]                       // 用户点过“总是允许”的
+const effect = 任一资源是 ask ? "ask" : "allow"                       // 每个资源取最后一条匹配的规则；都没匹配算 ask
+const event = yield* hooks.trigger("permission", "evaluate", { ..., effect })   // 插件可以改结论
+return event.effect
+```
 
-`session.events` 处理器（`server/src/handlers/session.ts`）返回 `session.events({ sessionID, after })` 的 SSE。底层是 `EventV2.durable`（`event.ts`）：先一次性读出 `seq > after` 的全部事件，再接一个流，每次被叫醒就再查一次。叫醒信号是容量 1 的 sliding PubSub，连续多次提交会合并成一次查询。只有持久化事件走这条流，`Text.Delta` 这类要另外订阅 `EventV2.subscribe`。文档原话："The first `sessions.events(...)` contract is durable-only during both replay and live tailing."
+注意 deny 先于保存的规则判断：用户以前点过“总是允许”，也盖不过配置里的 deny。组织通过 Console 下发的托管策略（`managed-policy.ts`）拥有最终决定权，仓库里的配置不能关掉它。
 
-### 崩溃恢复
+### 9.2 工具怎么问
 
-进程挂了，内存里什么都没了，库里还有：`session_input`（哪些输入还没取出执行）、`session_message`（历史，包括 `running` 状态的工具）、`event`（全部事件）。重启后：
+权限检查不是注册表替工具做的，而是**工具自己在执行时调** `permission.assert`，因为只有工具知道要检查什么资源。比如 `grep` 会先解析出根目录，再用 `action: "grep"`、`resources: [pattern]` 去问。
 
-1. 客户端调 `session.resume`（或再发一条 prompt）→ `coordinator.run`（force）或 `wake`。
-2. `run` 先检查 force 和待处理输入；确定需要执行后，`failInterruptedTools`（`llm.ts`）给上下文中所有 `pending` / `running` 的工具项发 `Tool.Failed("Tool execution interrupted")`。
-3. 进入循环，按 promotion 取出输入并重新准备请求；空队列的显式 resume 也可以从既有历史继续。
+`assert` 的三种结果：
 
-文档里写明了还没做的部分："Post-crash continuation recovery is intentionally deferred. A wake does not infer that ambiguous provider work is safe to retry after an input has already been promoted." 也就是说：输入已取出执行、请求已发出、进程挂了，重启后 `wake` 不会自动重发请求；要靠显式 `resume`。
+| 结论 | 怎么办 |
+|---|---|
+| `deny` | 抛 `BlockedError`，工具把它转成普通的工具失败，模型能看到“被拒绝了” |
+| `allow` | 直接返回 |
+| `ask` | 发 `permission.asked` 事件，客户端弹框；工具 fiber 在这里等用户回复 |
 
-### 中断
+用户的回复有三种（`permission.reply`）：
 
-`session.interrupt` → `coordinator.interrupt`（`run-coordinator.ts`）→ `Fiber.interrupt(owner)`。runner 的 `uninterruptibleMask` 保证中断只落在 `restore` 包住的地方：等 provider 流、等工具 fiber、等权限答复。收尾时（`llm.ts`）把没结果的工具标 `Tool execution interrupted`，assistant 标 `Provider turn interrupted`。已经入库的输入不会被删，下次 wake 会接着处理还没取出的输入；已经进了历史的那条要不要续跑，得看是显式 resume 还是普通 wake（见上面的崩溃恢复）。
+- `once`：只放行这一次。
+- `always`：放行，并把请求里带的 `save` 模式存成规则（按项目保存）；然后重新评估这个会话里其他还在等的请求，现在已经满足的一并放行。
+- `reject`：拒绝。**同一会话里其他正在等的请求也全部拒绝**，因为并行的几个工具调用多半是一件事，一个被拒，其他没必要再问。拒绝时可以附一句话（“别改这个文件，改那个”），这时是 `CorrectedError`，工具把它当普通失败交给模型，模型可以按这句话调整，继续干活。
+
+不带话的拒绝走了一条特殊的路：`assert` 把 `DeclinedError` 变成 defect 抛出去，穿过工具里的各种错误转换，到 `SessionModelRequest.executeTool` 才还原成类型化的错误。这样工具没办法把“用户说不”吞掉变成一条普通输出。`attempt` 拿到拒绝后，把被拒的调用标为失败，然后**中断整个 Step**，等用户下一句话，而不是让模型自己接着试。
+
+### 9.3 提问：Form
+
+`question` 工具背后是 `Form.Service`（`core/src/form.ts`）：工具创建一个表单（几个问题、选项），发事件让客户端显示，等用户回答或取消。用户关掉对话框和拒绝权限一样，作为 defect 穿出去，中断这一步。接口上也能直接创建和回复表单（`session.form.*` 路由）。
 
 ---
 
-## 11. 回看启动：这些服务怎样装配
+## 10. 压缩
 
-前面用到的 SessionExecution、runner、目录上下文，都是通过 Effect 服务拿到的。这一节从 CLI 启动开始看：为什么 execution 是进程级的、runner 是目录级的，以及 `SessionExecution` 接口是在哪换成 local 实现的。
+### 10.1 什么时候压缩
+
+| 触发 | 在哪 | 条件 |
+|---|---|---|
+| `auto` | 每个 Step 开头（`runStep` 循环里） | 开着自动压缩，且估算的上下文 ≥ 阈值。刚压缩完、或者原生压缩的窗口还没测过实际大小时不触发 |
+| `overflow` | `attempt` 里 | 服务端在输出开始前就说“太长”。一个 Step 只给一次机会；第二次溢出、已经有输出后溢出、关了自动压缩时溢出，都算失败 |
+| `manual` | `advanceToStep` 处理收件箱的压缩控制项 | 用户主动 `/compact`。关了自动压缩也照样能做 |
+
+阈值（`calculateCeiling`）：取模型的输入上限，没有就用上下文窗口。配置了 `buffer` 就是 `窗口 − buffer`；否则留 10% 和 16000 中较大的那个（窗口小于 32000 时只留 10%）。窗口未知时自动压缩不触发，只有服务端拒绝才会触发溢出压缩。
+
+默认设置：`auto: true`，`keep: 15000`（摘要旁边原样保留最近约 15000 token 的对话）。
+
+溢出压缩时，既然服务端已经拒绝了，说明估算偏低，第一次就把目标定在估算值的 70%；如果压缩请求本身也太长，再依次降到 50%、35%。
+
+### 10.2 两种压缩方式
+
+| | 本地摘要（默认） | 原生压缩 |
+|---|---|---|
+| 条件 | 模型没声明原生压缩 | 模型配置 `compaction.type = "native"` |
+| 谁来做 | `compaction` agent（可以配一个便宜的模型） | 服务端自己 |
+| 结果 | 一段按模板写的摘要（`text`）+ 最近 `keep` token 原文（`recent`） | 一个加密的压缩窗口，存在 `providerContext` 里 |
+| 以后怎么用 | 一条 user 消息：`<conversation-checkpoint><summary>…</summary><recent-context>…</recent-context></conversation-checkpoint>` | 原样回放给同一个服务端；换了服务端就不能用，退回原始记录 |
+
+本地摘要再次压缩时，会把上一次的摘要也作为输入，生成覆盖全部内容的新摘要：
+
+```text
+第一次：[E1 … E8][E9 E10]               →  [S1 + "E9 E10"]
+再一次：[S1 + "E9 E10"][E11 … E18][E19] →  [S2 + "E19"]    S2 覆盖 S1、E9 E10 和 E11–E18
+```
+
+模型的回复不符合模板时，会追加一句提醒再试一次；还是不行就算压缩失败。
+
+压缩不会删除任何原始记录。读历史时从最近一次完成的压缩开始读（§6.3），之前的消息还在库里，界面照样能翻看。
+
+---
+
+## 11. 事件、持久化与恢复
+
+```mermaid
+classDiagram
+  class Bus {
+    <<全局服务>>
+    -projectors: Map~事件类型, 投影器[]~
+    -pubsub: live / durable / typed
+    +publish(definition, data, options) Payload
+    +publishAll(events)
+    +project(definition, projector)
+    +subscribe()
+    +log(aggregateID, after, follow) Stream
+    +replay(event, options)
+  }
+  class EventDefinition {
+    type
+    schema
+    durable?: aggregate 字段名 / version
+  }
+  class PublishOptions {
+    id?
+    metadata?
+    commit?(seq)
+  }
+  class SessionProjector {
+    <<session/projector.ts>>
+    为每种会话事件注册投影器
+  }
+  Bus ..> EventDefinition
+  Bus ..> PublishOptions
+  SessionProjector ..> Bus : project(...)
+```
+
+### 11.1 一次 publish 做了什么
+
+v2 的所有状态变化都是事件。`Bus.publish`（`core/src/bus.ts`）发一个持久化事件时，在**一个 SQLite 事务**里做完这些事：
 
 ```mermaid
 sequenceDiagram
-  participant CLI as lildax cli
-  participant D as Daemon
-  participant S as server routes.ts
-  participant B as AppNodeBuilder
-  participant LN as LayerNode
-  participant LM as LocationServiceMap
-  participant HTTP as HttpApiBuilder
+  participant C as 调用方
+  participant B as Bus.publish
+  participant DB as SQLite 事务
+  participant P as 投影器
+  participant S as 订阅者
 
-  CLI->>D: 默认命令 daemon.transport()
-  D->>D: 读 server.json 健康检查
-  alt 没有健康的 server
-    D->>CLI: spawn(execPath, [serve, --register])
-    CLI->>S: serve 处理器 createRoutes(password)
-  end
-  S->>B: build(applicationServices, [[SessionExecution.node, SessionExecutionLocal.node]])
-  B->>LN: hasUnbound(root, LocationServiceMap.node)
-  LN-->>B: true
-  B->>LM: buildLocationServiceMap(replacements)
-  B->>LN: compile(root, replacements + LocationServiceMap 替换)
-  LN-->>S: serviceLayer（Database, EventV2, SessionV2, SessionExecutionLocal ...）
-  S->>HTTP: HttpApiBuilder.layer(Api) provide handlers, 中间件, auth, serviceLayer
-  HTTP-->>CLI: 监听端口（4096 起找空闲）
-  Note over LM: 目录服务此时还没建
-  CLI->>HTTP: 第一个带 sessionID 的请求
-  HTTP->>LM: sessionLocationLayer 查 session 表拿目录 → locations.get(ref)
-  LM->>LN: hoist(locationServices, global, [Location 绑定 ref])
-  LM->>LN: compile(目录级) fresh，provide compile(进程级)
-  Note over LM: 构建该 Ref 的 location 服务，含 BuiltInTools、SessionRunnerLLM
-  LM-->>HTTP: 提供该 Ref 的服务 Context（闲置 TTL 为 60 分钟）
+  C->>B: publish(definition, data, { commit? })
+  B->>B: 按聚合 id（通常是会话 id）加锁
+  B->>DB: 开事务
+  DB->>DB: 读 event_sequence，分配下一个序号
+  DB->>P: 依次跑这个事件类型的所有投影器
+  P->>DB: 改 session_v2 / session_message / session_inbox / instruction_state ...
+  DB->>DB: 执行 commit 回调（比如写执行声明）
+  DB->>DB: 更新 event_sequence，插入 event 行
+  DB-->>B: 提交
+  B->>S: 推给在线订阅者（live / durable / typed 三种 PubSub）
 ```
 
-| 步 | 代码 | 说明 |
-|---|---|---|
-| 1 | `cli/src/index.ts` | 命令表。默认命令 `default.ts`：取 daemon 传输参数，动态 import TUI 连上去 |
-| 2 | `cli/src/services/daemon.ts` | 没有健康 server 时 `spawn` 自己跑 `serve --register` |
-| 3 | `cli/src/commands/handlers/serve.ts` | `HttpRouter.serve(createRoutes(password))`，端口从 4096 往上试 |
-| 4 | `server/src/routes.ts` | 装配。`SessionExecution` 未绑定节点在这里被换成本地实现 |
-| 5 | `core/src/effect/app-node-builder.ts` | 自动补 `LocationServiceMap` |
-| 6 | `core/src/location-services.ts` | 目录服务懒建 |
-| 7 | `server/src/middleware/session-location.ts` | 每个会话请求进来先查目录再 provide |
+投影器出错时用 defect 中止整个事务，所以“事件写进去了但投影没做”这种状态不存在。前面说的“投递输入同时插入消息”“开始执行同时写声明”都是靠这一点保证的。
 
-server 启动时只建 global 服务；某个 Location 第一次被用到时，才去建它的 location 服务，工具注册和 runner 都是这时候建的。
+事件分两种：
 
-### 先用两个目录举个例子
+| 种类 | 例子 | 写库 | 能回放 |
+|---|---|---|---|
+| 持久化（`Event.durable`） | `session.inbox.*`、`step.*`、`text.ended`、`tool.called/success/failed`、`compaction.*`、`execution.*` | 是 | 是 |
+| 临时（`Event.ephemeral`） | `text.delta`、`reasoning.delta`、`tool.input.delta`、`compaction.delta` | 否 | 否 |
 
-假设 server 同时在处理 `/repo-a` 和 `/repo-b`。两者共用一个 `Database`，但各有各的 `ToolRegistry`，A 注册的工具不能跑到 B 的注册表里去。
+会话相关的事件一共 51 种（`schema/src/session-event.ts`）。
 
-如果用普通 JavaScript 手写，大概是这样（只是示意对象关系，不是 OpenCode 的代码）：
+### 11.2 表
 
-```js
-const database = createDatabase()
+| 表 | 内容 |
+|---|---|
+| `event` / `event_sequence` | 事件日志；每个聚合的最新序号 |
+| `session_v2` | 会话：目录、标题、agent、模型、权限、用量合计、空闲时间、执行声明（`time_suspended`）、恢复次数（`resume_attempts`）等 |
+| `session_message` | 投影出来的对话消息，`(session_id, seq)` 唯一 |
+| `session_inbox` | 待投递的输入（§3.2） |
+| `instruction_state` / `instruction_blob` / `instruction_entry` | 指令状态、指令内容（按哈希）、通过 API 设置的指令条目 |
 
-const servicesA = {
-  database,
-  tools: createToolRegistry(),
-}
-const servicesB = {
-  database,
-  tools: createToolRegistry(),
-}
+### 11.3 客户端怎么同步
 
-function handleRequest(services) {
-  // 使用传进来的那一份 ToolRegistry
-  services.tools.materialize()
-}
+客户端有两种拿数据的方式：
 
-handleRequest(servicesA) // 使用 A 的 ToolRegistry
-handleRequest(servicesB) // 使用 B 的 ToolRegistry
-```
+- **查询当前状态**：`session.get`、`session.message`、`session.inbox.list`、`session.context` 这些接口，直接读投影表。
+- **订阅事件**：`session.log({ sessionID, after?, follow? })` 读持久化事件日志。`follow: true` 时先订阅、再回放、回放完发一个同步标记，然后转为实时推送，所以不会漏也不会重。临时事件不在这条流里。
 
-OpenCode 做的也是这件事：先选好一组对象，再让处理请求的代码去用。区别是 Effect 帮它把这组对象一层层传下去，不用每个函数都加一个 `services` 参数。这就是这里说的依赖注入（DI）。
+另外还有一个实例级的实时事件流（`/api/event`，SSE），覆盖所有目录。server 对每个事件只编码一次，再分发给每个连接自己的队列（每个最多 4096 条）；某个连接读得太慢、队列满了，就单独断开它，不影响别人（`specs/v2/event-stream-architecture.md`）。
 
-### `Service`：代码怎么拿到这些对象
+### 11.4 崩溃恢复
 
-上面的 `services.tools`，在 Effect 中写成：
+恢复靠的是 §4.2 说的**执行声明**：
+
+1. 一段忙碌期开始时，`execution.started` 事件的 commit 回调写下声明（`session_v2.time_suspended`）。
+2. 成功、失败、用户中断时，终止事件的 commit 回调同时清掉声明。
+3. 关机导致的中断故意**不清**；进程被杀、崩溃根本来不及清。所以“声明还在、却没有终止事件”就说明这个会话的执行是被意外打断的。
+
+托管服务启动时调 `SessionRestart.resumeSuspendedSessions`（`session/execution/restart.ts`）：
+
+1. 先处理后台任务：被打断的后台 shell 命令补一条通知（“服务重启，命令被取消”）；被打断的后台子 agent 重新跑起来。
+2. 对每个有声明的会话：恢复次数加一（先写库再恢复，所以恢复过程中又崩了也会被计数）。超过 10 次就发一个失败事件放弃；否则补一条系统通知“服务刚重启，从断的地方继续，别重复已经做完的事”，然后 `resume`。
+3. 恢复出来的 drain 开头（§5.2）会把还显示在跑的工具调用和压缩标成失败，模型能看到“这个工具被中断了”。
+
+这套机制保证**至少一次**，不保证恰好一次。工具可能已经执行了一半（比如写了一半文件），恢复时不会重放这个工具调用，而是告诉模型它被中断了，由模型自己判断。
+
+---
+
+## 12. 服务怎样装配
+
+### 12.1 两级服务
+
+core 里的服务分两级：
+
+| 级别 | 声明方式 | 例子 | 生命周期 |
+|---|---|---|---|
+| 全局 | `makeGlobalNode` | `Database`、`Bus`、`SessionStore`、`SessionInbox`、`SessionExecution`、`Job` | 整个进程一份 |
+| 目录（Location） | `makeLocationNode` | `SessionRunner`、`SessionContext`、`Tool`、`Permission`、`Plugin`、`Agent`、`Model`、`FileSystem`、`Config` | 每个“目录 + 工作区”一份 |
+
+`makeGlobalNode` / `makeLocationNode`（`util/src/effect/app-node.ts`）是对 `LayerNode` 的包装：每个服务声明自己的 layer 和依赖的其他节点，启动时由图编译器按依赖关系组装。目录级节点可以依赖全局节点，反过来不行。
+
+为什么要分目录？因为同一个服务进程里，不同会话可能在不同的项目目录下，各自有自己的配置、插件、工具、权限规则、模型列表。这些都按目录各建一套。
+
+### 12.2 从会话找到它那套服务
 
 ```ts
-const tools = yield* ToolRegistry.Service
-```
-
-`ToolRegistry.Service` 是取对象用的 key。外层提供 A 的对象，这里拿到 A；外层提供 B 的对象，这里拿到 B。Effect 把存这组对象的地方叫 `Context`。
-
-外层用 `Effect.provide` 指定用哪一组：
-
-```ts
-const program = Effect.gen(function* () {
-  const tools = yield* ToolRegistry.Service
-  return yield* tools.materialize()
-})
-
-// 运行 program 时，提供 A 的服务
-program.pipe(Effect.provide(locations.get(refA)))
-
-// 同一段 program，换成 B 的服务再运行
-program.pipe(Effect.provide(locations.get(refB)))
-```
-
-`locations` 是 `LocationServiceMap` 的实例，按 Location 找对应的那组服务。真实请求里，外层先从 `session` 表查出 `session.location`，再选那一组；`ToolRegistry` 自己完全不用管当前请求是哪个目录的。
-
-### `Layer` 和 `LayerNode`：这些对象怎么创建
-
-前面的示意代码直接调了 `createToolRegistry()`。OpenCode 里创建逻辑写在 `Layer` 里：先拿到 `ApplicationTools`、`ToolOutputStore` 这些依赖，再创建注册表和 `register`、`materialize` 方法。
-
-Layer 具体怎么用？下面拿一个只有 `list()` 方法的 `DemoTools` 走一遍完整过程（演示用的，不是 OpenCode 的 `ToolRegistry`）。
-
-```ts
-import { Context, Effect, Layer } from "effect"
-
-// 定义取对象用的 key，以及对象应该有哪些方法
-class DemoTools extends Context.Service<
-  DemoTools,
-  { readonly list: () => ReadonlyArray<string> }
->()("DemoTools") {}
-
-// ① 定义 Layer：说明怎样创建 DemoTools 对象
-const toolsLayer = Layer.effect(
-  DemoTools,
-  Effect.sync(() => {
-    const names = ["read", "bash"]
-    return { list: () => names }
+// core/src/location-services.ts
+Instance.node.replace(
+  Layer.succeed(Instance.Service, {
+    provide: (session) => Effect.provide(map.get(session.location)),
   }),
 )
-
-// ② 编写使用对象的代码：这里只要求有 DemoTools，不负责创建它
-const program = Effect.gen(function* () {
-  const tools = yield* DemoTools
-  return tools.list()
-})
-
-// ③ 把 Layer 提供给 program，再运行
-const result = await Effect.runPromise(
-  program.pipe(Effect.provide(toolsLayer)),
-)
-// result: ["read", "bash"]
 ```
 
-跑到第 ③ 步时，Effect 才去执行 `toolsLayer` 里的创建逻辑，得到 `{ list: ... }` 对象，放到 `DemoTools` 这个 key 下，再运行 `program`，所以 `yield* DemoTools` 能拿到刚创建的对象。
+`map` 是一个 `LayerMap`（按 key 懒建、缓存的 layer 集合），key 是会话的 `location`（目录 + 工作区）。第一次用到某个目录时才建那套服务，之后一直缓存。`SessionExecution.drain` 里的 `instances.provide(session)`（§4.2）就是从这里取的。
 
-这三步要分清楚：`Layer.effect` 是定义怎么创建；`Effect.provide(toolsLayer)` 是把这份创建逻辑接到 program 上；`Effect.runPromise` 才是真正开始跑，这时才创建对象、运行 program。前两步只是在拼代码，`names` 还没初始化。
+配置变了要重载时，`LocationServiceMap.reload` 让所有目录的缓存失效并立即重建。正在跑的 runner 会看到 `LocationLifecycle.isClosed()` 为真，返回 `Reloaded`，由 `SessionExecution` 用新的那套服务接着跑（§5.3 第 1 步）。
 
-真实的 `ToolRegistry` 也是这么用，只是创建逻辑长一些，而且得先有 `ApplicationTools` 和 `ToolOutputStore`。依赖的 Layer 可以先接到它的 Layer 上，大概这么写：
+### 12.3 插件
 
-```ts
-const readyLayer = registryLayer.pipe(
-  Layer.provide(dependencyLayers),
-)
+v2 的内核几乎全是插件拼起来的。`core/src/plugin/internal.ts` 列了内部插件，分 `pre` 和 `post` 两批：`pre` 里有工具参数修复、MCP、git/hg、agent、命令、技能、models.dev 模型目录、各家服务商、全部内置工具等；`post` 里是把配置文件应用上去的一组插件（指令、agent、压缩、格式化、工具输出、权限策略……）。
 
-// readyLayer 已接好依赖，再提供给使用 ToolRegistry 的业务代码
-const runnable = program.pipe(Effect.provide(readyLayer))
-```
+插件能做两类事：
 
-`dependencyLayers` 是准备好的依赖 Layer，`program` 是用到 `ToolRegistry.Service` 的业务代码。`Layer.provide` 是给创建过程喂依赖，`Effect.provide` 是给业务代码提供服务。
+- **transform**：往有状态的注册表里加东西或改东西。`ctx.tool.transform`、`ctx.agent.transform`、`ctx.provider.transform`、`ctx.model.transform`、`ctx.mcp.transform` 等。每次读注册表时，按注册顺序把所有 transform 在一个新值上重放一遍，所以插件卸载后它的修改自然消失。
+- **hook**：在执行过程中插一脚。
 
-上面这种手动 provide 依赖的写法，是 Effect 的 Layer 本来的用法，不是 OpenCode 额外加的要求。Effect 管服务读取、依赖的类型检查、实例构建和资源释放，但原生的 Layer 不像那种自动装配的 DI 容器，会按类型自己去找实现接上。就算类型上已经写明 `ToolRegistry` 需要 `ApplicationTools.Service`，应用还是得指定由哪个 Layer 来提供，再用 `provide` 这类操作接起来。好在这些连接一般都集中在装配入口，不用每个业务函数都写一遍。
-
-为了少写这些手动组合，OpenCode 自己加了一个 `LayerNode`：每个模块在 `deps` 里声明自己直接依赖谁，`LayerNode.compile` 统一生成对应的 `Layer.provide`。依赖还是要显式声明，省掉的只是到处手写 Layer 组合的代码。比如 `ToolRegistry.node`：
-
-```ts
-export const node = makeLocationNode({
-  service: Service, // 本模块的 ToolRegistry.Service
-  layer,           // 创建这个服务的 Layer
-  deps: [ApplicationTools.node, ToolOutputStore.node],
-})
-```
-
-这段声明就说了三件事：
-
-- `service`：创建好的对象通过哪个 key 提供给业务代码。
-- `layer`：用哪份创建逻辑。
-- `deps`：创建前需要准备哪些依赖。
-
-外面套的 `makeLocationNode` 表示这个服务要按 Location 各建一份；换成 `makeGlobalNode` 就是整个 server 共享一份。
-
-所以 `LayerNode` 只是一条装配记录，存着 Layer、依赖关系和 global / location 标记，它本身不是服务实例。`LayerNode.compile` 顺着 `deps` 把各个 Layer 接好，剩下的交给 Effect 去创建对象。
-
-和前面的普通 JavaScript 对照一下：
-
-| 普通 JavaScript 中的工作 | 这里由谁负责 |
+| 域 | 钩子 |
 |---|---|
-| 编写 `createToolRegistry()` | `Layer` 保存创建逻辑 |
-| 先准备依赖，再调用创建函数 | `LayerNode` 记录依赖，`compile` 连接各个 Layer |
-| 把 `servicesA` 传给处理函数 | `Effect.provide` 提供这一组对象 |
-| 从 `services.tools` 取对象 | `yield* ToolRegistry.Service` |
+| `session` | `prompt`、`context`、`compaction`、`generate`、`title`、`model.request`、`http.request`、`http.response`、`experimental.ws.handshake/send/receive`、`retry` |
+| `tool` | `execute.before`、`execute.after` |
+| `permission` | `evaluate` |
+| `shell` | `create.before` |
+| `aisdk` | 模型、包、选项、SDK 相关的几个 |
 
-### global / location：什么时候创建，什么时候释放
+其中 OpenCode 自己的 Console 连接插件和权限策略插件是受保护的，仓库配置不能把它们移除（`internal.ts` 里的 `guarded`）。
 
-`Database`、`EventV2` 等 global 服务在这套 server 中共享；`Config`、`ToolRegistry`、`Watcher`、`SessionRunner` 等 location 服务按 Location 分开。
+---
 
-`LocationServiceMap` 管着每个 Location 的那组对象，可以先把它想成这样一张表：
+## 13. 其他能力
 
-```text
-LocationServiceMap
-  refA → Config A、ToolRegistry A、Watcher A、SessionRunner A ...
-  refB → Config B、ToolRegistry B、Watcher B、SessionRunner B ...
+### 13.1 Code Mode
 
-两组服务共用 Database、EventV2 等 global 依赖。
-```
+`@opencode/codemode` 是一个只支持 JavaScript 子集的解释器：只有它实现了的语法和内置对象能用，没有定时器、`process`、文件系统、模块，程序只能通过宿主给的工具和外界打交道，宿主还能限制执行时间、调用次数和输出大小。它不是沙箱里的真 JS，而是“只认识这些语法”的解释器。
 
-key 是 `Location.Ref`，里面有 `directory` 和可选的 `workspaceID`。同一个 Ref 下的多个 session 共用一组服务，不会每个 session 都建一个 `ToolRegistry`。
+core 把它包成一个叫 `execute` 的工具（`core/src/codemode/tool.ts`）。模型写一段脚本，在里面调 Code Mode 收纳的那些工具（§8.3），可以写循环、并发调用、对结果做处理，只把最后的结果交回给模型。工具目录（有哪些工具、怎么调）作为一个指令来源放进 system（§6.1 里的 `CodeModeInstructions`）。
 
-生命周期是这样的：
+这样做的好处和 pi-mono 的 codemode 一样：插件、MCP 带来的大量工具不用一个个声明给模型，中间结果也不进上下文。
 
-1. **server 启动：**先建 global 服务，包括 `LocationServiceMap`。这时还不用建 A、B 的 location 服务。
-2. **A 第一次被用到：**建 A 的服务并存下来。只为 A 新建 location 那部分，global 依赖还是共享的。
-3. **A 再次被用到：**直接取已有的；B 第一次被用到时，另建一份 B 的。
-4. **A 暂时没人用：**先留着，后面的请求还能复用。连续闲置 60 分钟才释放；还有人在用就不会回收。
-5. **释放后又用到 A：**重新建一份。
+### 13.2 子 agent 与后台任务
 
-代码在 `core/src/location-services.ts` 的 `buildLocationServiceMap`：`LayerMap` 按 Ref 缓存、闲置回收；`hoist` 把 global 依赖拎出来共享，`Layer.fresh` 让每个 Location 建自己的一份 location 对象。
+`subagent` 工具在当前会话下建一个子会话，用指定的 agent（可选指定模型）跑一个任务：
 
-服务释放时还得把它占着的资源关掉。比如 `Watcher` 建文件监听时登记了一个清理函数，释放时执行 `unsubscribe()`。这些清理函数由 Effect 的 `Scope` 统一管，整张 `LayerMap` 所在的 Scope 关闭时，里面的资源也会一起释放。
+- **前台**（默认）：等子会话跑完，返回它最后一条回复，以及子会话 id。之后可以带着这个 id 继续和同一个子 agent 对话。
+- **后台**（`background: true`）：立即返回“已经在后台跑了”，由 `Job.Service` 管着。子会话结束时，通过收件箱给父会话投一条 synthetic 通知，父会话的模型自然就看到了结果。工具描述里专门叮嘱模型：别轮询、别重复做同样的事。
 
-### 回到一次 session 的执行
+用户在界面上跑的 shell 命令也走类似的路：立即在后台开始，结束后作为 synthetic 输入入库（`resume: false`，不会叫醒空闲的会话）。
 
-有了上面这些，再看实际调用就简单了：
+### 13.3 会话迁移
 
-```text
-SessionExecutionLocal 收到 sessionID
-  → SessionStore 查出 session.location
-  → LocationServiceMap 取得或创建这一组服务
-  → 使用其中的 SessionRunner 执行这个 session
-```
+`session.move` 把会话搬到另一个目录（比如一个新开的 git worktree）。它不是立即生效的，而是作为一个 `move` 控制项进收件箱（§3），等 runner 走到 Step 边界时处理：关掉模型连接，发 `session.moved`，返回 `Moved`；`SessionExecution` 重新读会话，用新目录的那套服务接着 drain。模型会看到一条“工作目录已经改成……”的消息。指令状态保留，所以新目录的 AGENTS.md 等会作为一次指令变化出现。
 
-源码里最后两步写成：
+### 13.4 回退和分叉
 
-```ts
-SessionRunner.Service.use((runner) => runner.run({ sessionID, force })).pipe(
-  Effect.provide(locations.get(session.location)),
-)
-```
+- **回退**分两步。先 `revert.stage`：用工作区快照把文件恢复到那条消息时的样子（也可以只回退对话、不动文件），并记下回退前的快照，这时还能 `revert.clear` 撤销，把文件恢复回去。下一次提交新输入时才 `commit`：删掉那条消息之后的对话记录，清空指令状态，下一步重新建立基线。
+- **分叉**（`session.fork`）从某条消息处复制出一个新会话，复制到那里为止的消息，指令基线直接用父会话最新的值。
 
-这段倒着读比较好懂：先看下面一行，`provide` 按 `session.location` 提供那一组服务；再看上面一行，`Service.use` 从中拿到 `SessionRunner`，调它的 `run`。
+### 13.5 从 v1 迁移
 
-`SessionExecutionLocal` 本身是 global 服务，手里并没有固定哪个目录的 runner，每次执行时按 session 现选，所以一个执行器能处理多个 Location。
+server 启动时会在后台跑 `core/src/database/v1-migration.bun.ts`（1100 多行），把 v1 的会话数据导进新表，客户端可以通过 migration 接口看进度。v1 和 v2 的工具名、参数有的不一样，导入后的会话里如果还能看到这些旧工具调用，会额外告诉模型“这些工具现在叫什么、参数怎么变了”，免得它照着旧的格式再调一次。
 
-### server 装配
+---
 
-`applicationServices` 是进程级组：Database、EventV2、httpClient、ToolOutputStore.cleanupNode、SessionV2、PermissionSaved、PtyTicket、Credential、PtyEnvironment、LocationServiceMap。
+## 14. 和 pi-mono、codex 对照
 
-`makeRoutes`：`AppNodeBuilder.build(applicationServices, [[SessionExecution.node, SessionExecutionLocal.node]])`，v2 的执行器就是在这一行接进来的。`AppNodeBuilder.build`（`app-node-builder.ts`）发现图里有未绑定的 `LocationServiceMap.node` 就自动用 `buildLocationServiceMap` 补上。
+| | opencode v2 | pi-mono | codex |
+|---|---|---|---|
+| 进程模型 | 客户端 / 服务端分离，默认共享一个托管服务 | 单进程，`AgentSession` 直接跑 | TUI 默认连共享的本地 app-server daemon |
+| 输入排队 | 持久化的收件箱表，steer / queue，控制项也排在里面 | 内存里的两个队列 | 内存里的 pending input + 邮箱 |
+| 上下文来源 | 每个 Step 从投影表重读 | 每次请求从会话 JSONL 重新投影 | 内存里的 `ContextManager`，rollout 记录变化 |
+| 指令变化 | 按来源算哈希 delta，变化作为 system 消息追加 | system 消息里的段落补丁 | `WorldState` 各 section 比较后追加更新 |
+| 工具执行 | 读流时就并发起 fiber，先持久化 `tool.called` 再执行 | 读完流后统一执行，可并行 | 读流时启动，有并行门 |
+| 大量工具 | Code Mode（`execute` 工具） | codemode 扩展 + tool_search | Code Mode + 工具搜索 |
+| 崩溃恢复 | 执行声明 + 启动时自动续跑，最多 10 次 | 主线没有；实验性的 pi-durable 在做 | 从 rollout 恢复历史，不自动续跑 |
 
-两个中间件决定请求在哪个目录下执行：`sessionLocationLayer`（`server/src/middleware/session-location.ts`）从路径里的 `sessionID` 查 `session` 表拿目录；`locationLayer`（`server/src/location.ts`）从 query `location[directory]` 或 header `x-opencode-directory` 拿，默认 `process.cwd()`。
-
-### 本地执行实现怎么绑到接口上
-
-`SessionExecutionLocal` 负责根据会话 id 找到会话所在目录的 runner。文件头注释：*"Current-process routing for implicit-local Locations. Future remote placement belongs here."*
-
-协调器不是收到 `wake` 时才临时建的。`SessionExecutionLocal` 的 layer 初始化时，先拿到全局的 `SessionStore` 和 `LocationServiceMap`，接着就调 `SessionRunCoordinator.make({ drain })` 建好一个进程内的协调器。传进去的 `drain(sessionID, force)` 是 local 自己定义的闭包：
-
-1. 用 `SessionStore.get(sessionID)` 查出会话，拿到它的 `location`。
-2. 用 `locations.get(session.location)` 取出该目录的 Effect layer。
-3. 把这层目录服务 `provide` 给 `SessionRunner.Service.use(...)`，再调用 `runner.run({ sessionID, force })`。
-4. 非中断错误先记日志，再原样返回给协调器处理。
-
-拿到协调器后，local 用它拼出真正注册到 `SessionExecution.Service` 下的对象：
-
-```ts
-SessionExecution.Service.of({
-  active: coordinator.active,
-  interrupt: coordinator.interrupt,
-  resume: coordinator.run,
-  wake: coordinator.wake,
-})
-```
-
-所以运行时并没有一层 `SessionExecutionLocal.wake()` 在中间转发，`SessionV2` 拿到的 `execution.wake` 就是协调器的 `wake`。反过来，协调器 `start()` 里调的 `options.drain(key, force)`，就是 local 建协调器时传进去的那个闭包。绕了一圈：local 把并发调度交给 Coordinator，Coordinator 要真正排空会话时再回调 local，由 local 按 location 找到 `SessionRunner`。
-
-### 会话门面的其他入口
-
-`SessionV2.Service` 是 HTTP 处理器调的会话接口，只管查询、写库、叫醒执行器，自己不跑循环。
-
-它本身没有状态，构造时取六个依赖：`Database`、`EventV2`、`ProjectV2`、`SessionExecution`、`SessionStore`、`LocationServiceMap`。
-
-主要方法：
-
-| 方法 | 干什么 | 谁调它 |
-|---|---|---|
-| `create(input)` | 已存在直接返回；否则 upsert `project` 表，发 v1 的 `Session.Created` 事件（投影时插 `session` 表）。并发创建撞车时 `SessionAlreadyProjected` 被捕获，读已存在的那条返回 | `session.create` 处理器 |
-| `get` / `list` / `messages` / `message` / `context` | 都是读操作。`messages` 按 `seq` 分页，游标是 messageID | 各处理器 |
-| `events(input)` | 先回放库里的事件，再接上实时事件，最后过滤成会话事件（§10） | `session.events` 处理器（SSE） |
-| `history(input)` | 按分页获取会话的事件历史 | `session.history` 处理器 |
-| `prompt(input)` | 完整流程见 §3，大步骤是（整个过程不可中断）：查会话存在 → `resolvePrompt` → 没给 id 就 `msg_` 新建 → `delivery` 默认 `steer` → `SessionInput.admit` → 比对幂等 → `resume !== false` 就 `execution.wake` → 返回 `Admitted` | `session.prompt` 处理器 |
-| `switchAgent` / `switchModel` | 只发切换事件，不做其他事。换成同个模型同变体就直接返回 | 处理器 |
-| `compact` / `wait` / `shell` / `skill` | 全部返回 `OperationUnavailableError`。v2 还没实现 | 处理器映射成 503 |
-| `active` | 直接返回协调器里正在运行的会话集合 | `session.active` |
-| `resume(sessionID)` | 强制跑一次，把积压的待处理输入跑完 | 客户端显式续跑 |
-| `interrupt(sessionID)` | 调执行器的中断接口，外面包一层不可中断保证能发出去 | `session.interrupt` |
-| `revert.stage / clear / commit` | 委托 `SessionRevert`，注意 `stage` 和 `clear` 要 `Effect.provide(locations.get(session.location))`，因为 `Snapshot` 是目录级服务 | 处理器 |
+三家都在往同一个方向走：**持久化的记录是唯一的事实来源，内存只是缓存**。opencode v2 走得最彻底，连“待处理的输入”和“正在执行”都写进了数据库，代价是每一步都要和数据库、事件投影打交道，代码量（core 6.6 万行）也是三家里最大的。
