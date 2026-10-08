@@ -32,11 +32,11 @@ graph LR
 
 ---
 
-## 2. 先看执行边界
+## 2. 整体执行流程
 
-本文分析 OpenCode v2 的本地执行路径：HTTP 输入怎样持久化并唤醒 runner，runner 怎样准备一次请求、消费模型事件、并发执行工具，再根据收尾结果继续或退出。源码路径均相对于仓库的 `packages/`。旧 `opencode` 包的 v1 `SessionPrompt` 不在这条执行链上。
+这篇只看 OpenCode v2 在本地跑的那条路径：一条 HTTP 输入怎么落库、怎么叫醒 runner，runner 怎么拼请求、收模型事件、并发跑工具，最后根据收尾结果决定接着跑还是退出。文中的源码路径都相对仓库的 `packages/`。老 `opencode` 包里 v1 的 `SessionPrompt` 不在这条链上，这里不讲。
 
-先看控制流的嵌套关系。`drain` 是 coordinator 安排的一次执行；其中 `run` 可以消费多条输入；一次 `runTurn` 又可能因压缩重新进入 attempt。上下文超限后的压缩重试只有一次机会，第二次再超就直接失败，详见 §9。
+先看整体的嵌套关系：`drain` 是 coordinator 安排的一次执行，一次 `run` 里可以跑完多条输入，一次 `runTurn` 又可能因为压缩重新进 attempt。上下文超限后压缩重试只有一次机会，第二次再超就直接失败（§9）。
 
 ```mermaid
 flowchart TD
@@ -60,13 +60,13 @@ flowchart TD
   M -.->|输出前溢出且可恢复| X
 ```
 
-正文从一次 `prompt` 进入已有会话开始。§3–§4 解释调度，§5–§8 展开一次 attempt，§9–§10 处理压缩与持久化，最后在 §11 回看服务如何装配。图后的对象说明只展开当前阶段涉及的状态和方法。
+下面从一次 `prompt` 进入已有会话开始讲：§3–§4 是调度，§5–§8 是一次 attempt 里发生的事，§9–§10 是压缩和持久化，§11 再回头看这些服务是怎么装配起来的。每张图后面只介绍这一步用到的对象和方法。
 
 ---
 
 ## 3. 输入接收：从 prompt 到后台 drain
 
-本段从 HTTP handler 进入，到 local execution 调用 runner 为止。先沿时序确认输入、通知和后台执行的关系，再看幂等与并发边界。
+这一节从 HTTP handler 开始，到 local execution 调用 runner 为止。先看时序，搞清楚输入、通知、后台执行三者的关系，再看重复提交和并发怎么处理。
 
 ```mermaid
 sequenceDiagram
@@ -103,9 +103,9 @@ sequenceDiagram
   EX->>RN: provide 目录服务，run(sessionID, force)
 ```
 
-### 接收和取出执行，为什么是两个阶段
+### 为什么要分成接收和取出两步
 
-`prompt` 的关键路径如下，省略会话查询、附件解析和错误类型转换，保留操作顺序：
+`prompt` 的主干代码如下，省略了会话查询、附件解析和错误类型转换，顺序没动：
 
 ```ts
 // core/src/session.ts，节选并省略外围定义
@@ -125,30 +125,30 @@ Effect.uninterruptible(
 )
 ```
 
-`admit` 发布 `PromptAdmitted`，它的投影向 `session_input` 插入记录。记录里有两个序号：`admitted_seq` 表示接收事件的位置，`promoted_seq` 起初为空，表示尚未被取出执行。`SessionInput.hasPending` 就是按会话、`delivery` 和 `promoted_seq IS NULL` 查询。
+`admit` 发一个 `PromptAdmitted` 事件，它的投影往 `session_input` 插一行。这行有两个序号：`admitted_seq` 是接收事件的序号；`promoted_seq` 一开始是空的，表示还没被取出执行。`SessionInput.hasPending` 查的就是这个会话、这种 `delivery` 下有没有 `promoted_seq IS NULL` 的记录。
 
-直到 runner 发布 `Prompted`，投影才更新 `promoted_seq`，并向 `session_message` 写入 user 消息。这两个更新与持久化事件提交处于同一事务中。因此不会提交出“输入已标记为取出，但对应 user 消息没有写入”的半成品状态。
+等 runner 发 `Prompted` 时，投影才填上 `promoted_seq`，同时往 `session_message` 写一条 user 消息。这两处更新和事件写库在同一个事务里，所以不会出现“输入标成已取出了，user 消息却没写进去”的情况。
 
 | 阶段 | `session_input` | 对话历史 | 谁推进 |
 |---|---|---|---|
 | `PromptAdmitted` | 新增记录，`promoted_seq` 为空 | 尚未新增 user 消息 | `SessionV2.prompt` |
 | `Prompted` | 填入 `promoted_seq` | 新增 user 消息 | runner 中的 promotion |
 
-这个拆分让输入接收不依赖 runner 当前是否空闲，也让 `steer` 和 `queue` 可以在不同执行边界进入历史。这里的“取出”只表示输入已进入历史，**不表示模型已经处理完成**；不能用 `promoted_seq` 判断一次用户任务是否成功。
+拆成两步后，接收输入不用管 runner 忙不忙；`steer` 和 `queue` 也能在不同的时机进入历史。注意“取出”只表示输入进了历史，不代表模型已经处理完，所以不能拿 `promoted_seq` 判断一次任务有没有成功。
 
-`resume: false` 会跳过这次提交的 `wake`，但输入仍然入库。它并不是暂停会话的开关：如果 runner 已经在运行，后续查询仍可能取到这条输入。
+`resume: false` 只是这次不调 `wake`，输入照样入库。它不是暂停会话的开关：runner 如果正在跑，后面查库时照样可能把这条输入取走。
 
-### 重复提交靠 id 和内容校验共同处理
+### 重复提交怎么处理
 
-`admit` 先按输入 id 查询：已有记录就返回；没有才发布接收事件。投影插入使用 `onConflictDoNothing()`，没有插入成功则产生 `LifecycleConflict`。`admit` 在发布发生 defect 后会再次查询同一个 id；若记录已经存在，就返回它，否则重新抛出原 defect。这覆盖了两个请求最初都没查到记录、随后竞争插入的情况。
+`admit` 先按 id 查一次，有记录就直接返回，没有才发接收事件。投影插入用的是 `onConflictDoNothing()`，没插进去就报 `LifecycleConflict`。发布出了 defect 时，`admit` 会再按这个 id 查一次：查到了就返回这条，查不到就把原来的 defect 抛出去。这是为了处理两个请求一开始都没查到、然后同时去插的情况。
 
-但“id 已存在”还不足以判定重试成功。回到 `prompt` 后，`equivalent` 继续比较 `sessionID`、`delivery` 和编码后的 prompt 内容；同 id 不同内容会返回 `PromptConflictError`，不会覆盖原输入。这个保证依赖客户端重用同一个 id：未提供 id 时，入口每次都会生成新的 message id。
+不过 id 已存在，不等于这就是一次正常的重试。回到 `prompt` 里，`equivalent` 还会比对 `sessionID`、`delivery` 和编码后的 prompt 内容，id 相同内容不同就返回 `PromptConflictError`，原来的输入不会被覆盖。前提是客户端重试时带的是同一个 id；不带 id 的话，入口每次都会新生成一个 message id。
 
-重复提交且内容一致时，仍会走到 `wake`。所以第一次请求即使已经接收输入、客户端却没收到响应，重发也能再次通知执行器检查工作。
+重复提交、内容也一致时，还是会走到 `wake`。这样第一次请求其实已经收下了输入、只是客户端没收到响应时，重发一次也能再叫醒执行器。
 
-最外层的 `Effect.uninterruptible` 保护接收、校验和唤醒这段操作，避免 Effect 取消恰好落在持久化完成与唤醒之间。它不把数据库和内存调度变成一个事务，也不提供进程崩溃后的自动唤醒保证；崩溃恢复要另看 §10。
+最外面那层 `Effect.uninterruptible` 包住了接收、校验、唤醒三步，防止取消信号正好落在“已经写库、还没 wake”的中间。但它没法把写库和内存调度变成一个事务，进程崩了也不会自动 wake，崩溃恢复见 §10。
 
-### 本段涉及的输入结构
+### 输入的结构
 
 ```ts
 // schema/src/session-input.ts 中 Admitted 的字段摘要
@@ -164,15 +164,15 @@ type Admitted = {
 }
 ```
 
-`Prompt` 保存规范化的 `text`、`files` 和 `agents`。`SessionV2` 负责输入规范化、幂等校验和调用执行接口；`SessionInput` 负责输入生命周期；`SessionExecutionLocal` 负责 location 路由。它们都不持有一份需要和数据库同步的 prompt 内存队列。
+`Prompt` 里是规范化后的 `text`、`files` 和 `agents`。分工上，`SessionV2` 做输入规范化、幂等校验、调执行接口；`SessionInput` 管输入从接收到取出的整个过程；`SessionExecutionLocal` 按 location 找 runner。三者都没有在内存里另存一份 prompt 队列，待处理的输入只在数据库里。
 
-### `wake` 如何保证同一会话不会启动两个 runner
+### `wake`：怎么保证同一个会话只有一个 runner
 
-`SessionExecutionLocal` 在进程级服务中创建一个 coordinator，以 `sessionID` 为 key。它提供的 `drain(sessionID, force)` 每次先读取会话当前的 location，再通过 `locations.get(session.location)` 注入对应目录服务，最后调用 `runner.run({ sessionID, force })`。
+`SessionExecutionLocal` 是进程级服务，里面建了一个以 `sessionID` 为 key 的 coordinator。它交给 coordinator 的 `drain(sessionID, force)` 每次先读会话当前的 location，用 `locations.get(session.location)` 拿到对应目录的服务注入进去，最后调 `runner.run({ sessionID, force })`。
 
-因此，目录服务的选择由 local execution 完成；同一会话的执行串行化由 coordinator 完成。`runTurnAttempt` 还会校验会话的 location 是否仍匹配当前 runner，不匹配就中断。这套内存 coordinator 的串行保证限定在当前实例内，不是跨进程分布式锁。
+也就是说，选哪个目录的服务是 local execution 的事，同一会话不并发跑是 coordinator 的事。另外 `runTurnAttempt` 还会检查会话的 location 和当前 runner 还对不对得上，对不上就中断。coordinator 在内存里，只能保证当前进程内串行，不是跨进程的分布式锁。
 
-Coordinator 的核心状态只有一张 `Map<Key, Entry>`：
+Coordinator 的状态就一张 `Map<Key, Entry>`：
 
 ```ts
 // core/src/session/run-coordinator.ts
@@ -184,7 +184,7 @@ type Entry<E> = {
 }
 ```
 
-`owner` 是执行 fiber，`done` 是调用方等待的完成信号，另外两个字段控制后继执行和中断。看 `wake` 就能理解为什么这里不需要为每次输入创建一个任务：
+`owner` 是正在执行的 fiber，`done` 是给调用方等的完成信号，另外两个字段用来控制后继执行和中断。看一下 `wake` 就知道为什么不用每来一条输入就建一个任务：
 
 ```ts
 const wake = (key: Key) =>
@@ -201,13 +201,13 @@ const wake = (key: Key) =>
   })
 ```
 
-查询和修改 Map 在同一个同步回调中完成，没有 Effect 挂起点。空闲时先登记 entry 再启动 fiber；已有 entry 时只设置 `pendingWake`。连续到来的多次 wake 会合并成一个布尔标记。
+查 Map 和改 Map 在同一个同步回调里，中间没有挂起点，别的 fiber 插不进来。空闲时先登记 entry 再起 fiber；已经有 entry 就只把 `pendingWake` 置上。连着来多次 wake，最后就是一个布尔值。
 
-合并不会丢掉输入数量，因为输入本身已经存在数据库中。这个标记只表达“当前执行期间又收到过工作通知，结束时需要再检查”，不携带 prompt，也不决定取出哪条输入。
+合并了也不会丢输入，因为输入都已经在数据库里了。这个标记的意思只是“跑的过程中又有人喊过，结束时再查一遍”，它不带 prompt，也不管取哪条。
 
-### Runner 已经检查队列，为什么还需要 `pendingWake`
+### runner 自己会查队列，为什么还要 `pendingWake`
 
-考虑 runner 即将退出时的一次交错：
+看 runner 快退出时的一种情况：
 
 ```mermaid
 sequenceDiagram
@@ -224,15 +224,15 @@ sequenceDiagram
   R->>R: 查询数据库，取出新输入
 ```
 
-如果已有执行时直接忽略 wake，这条输入可能落在 runner 最后一次查询之后，当前执行又已经决定退出。`pendingWake` 将这次通知保留到 `settle`，补上退出边界上的检查。
+如果正在跑的时候直接忽略 wake，这条输入恰好落在 runner 最后一次查询之后，runner 又已经决定退出了，这条输入就没人管了。`pendingWake` 把这次通知留到 `settle` 时处理，补上这个空档。
 
-反过来，如果输入到达得更早，当前 runner 已经取走了它，`pendingWake` 仍可能为真。后继 drain 会多检查一次数据库，但不会因此多调用一次模型：wake 启动的执行使用 `force = false`，runner 在没有待处理 steer 或 queue 时直接返回。
+反过来，输入来得早一点，已经被当前 runner 取走了，`pendingWake` 也可能还是 true。这时后继 drain 只是多查一次库，不会多调一次模型：wake 起的执行是 `force = false`，没有待处理的 steer 或 queue 就直接返回。
 
-所以两层检查承担不同职责：runner 的 `hasPending` 决定当前循环是否继续；coordinator 的 `pendingWake` 保证执行交接时收到的通知不会被已有 entry 吞掉。
+所以这两层检查管的事不一样：runner 的 `hasPending` 决定当前循环要不要继续；coordinator 的 `pendingWake` 保证 runner 退出那一刻来的通知不会被吞掉。
 
-### 正常结束、失败和中断，怎样交接等待者
+### 正常结束、失败、中断时，等待者怎么办
 
-`settle` 不能一律“删 entry、唤醒等待者、再启动下一次”。它区分了当前执行的退出结果：
+`settle` 不是简单地“删 entry、通知等待者、再起下一次”，它要看当前执行是怎么退出的：
 
 ```ts
 // core/src/session/run-coordinator.ts，settle 的关键分支
@@ -251,21 +251,21 @@ else {
 Deferred.doneUnsafe(entry.done, exit)
 ```
 
-正常结束且有 pending wake 时，后继 drain 复用同一个 entry，暂不完成 `done`。正在等待这个 entry 的调用方，会继续等后继检查结束。若执行失败或处于 stopping 状态，则原 entry 的 `done` 以原退出结果完成；尚有新 wake 时，另建 entry 承接它，避免把原执行的失败隐藏到后继成功之中。
+正常结束、又有 pending wake 时，后继 drain 直接复用这个 entry，`done` 先不完成，在等它的调用方会一直等到后继也跑完。如果执行失败了，或者正在 stopping，就用原来的退出结果完成原 entry 的 `done`；这时还有新的 wake，就另建一个 entry 去跑。不这么分开的话，原来那次的失败会被后继的成功盖掉。
 
-这里也解释了 `resume` 与 `wake` 的差别：local execution 将 `resume` 映射到 coordinator 的 `run`。`run` 在空闲时以 `force = true` 启动执行；已有执行时加入同一个 `done` 等待，不设置 `pendingWake`。若 entry 正在 stopping，则等待它退出后再调用 `run`。`wake` 则只登记通知，不等待执行完成。
+顺便说一下 `resume` 和 `wake` 的区别。local execution 把 `resume` 映射成 coordinator 的 `run`：空闲时用 `force = true` 起一次执行；已经在跑就一起等同一个 `done`，不设 `pendingWake`；entry 正在 stopping 就等它退出后再 `run`。`wake` 只登记通知，不等执行完。
 
-`run` 用 `uninterruptibleMask` 保护创建和登记 entry，并通过 `restore` 允许取消对 `done` 的等待。执行 fiber 由 coordinator 的 `FiberSet` 持有，因此取消一个等待者不会同时取消共享执行；显式中断要走 `interrupt`。
+`run` 用 `uninterruptibleMask` 包住创建和登记 entry 这一段，等 `done` 的部分用 `restore` 放开，可以取消。执行 fiber 挂在 coordinator 的 `FiberSet` 上，所以某个等待者取消了，不会把大家共用的那次执行也取消掉；真要停下来得调 `interrupt`。
 
-`interrupt` 会先置 `stopping = true`、清掉已有 `pendingWake`，再中断 owner 并等待清理。清理期间若又收到新的 wake，它会重新置位；`settle` 随后创建后继 entry。这区分了中断前积累的通知与中断过程中到达的新通知，但清除通知并不会删除数据库中的输入。
+`interrupt` 先把 `stopping` 置为 true、清掉已有的 `pendingWake`，再中断 owner 并等它清理完。清理期间又来了 wake，`pendingWake` 会重新置上，`settle` 随后建一个后继 entry。这样中断之前攒下的通知被丢掉，中断过程中新来的会保留。清掉通知不会删库里的输入。
 
-后继 `start` 还会先经过 `Effect.yieldNow`，避免同步完成、同步自唤醒的 drain 在 `settle` 中不断递归启动。仓库的 `core/test/session-run-coordinator.test.ts` 分别覆盖了 wake 合并、失败时的后继执行、中断清理期间的新 wake，以及同步自唤醒；这些是阅读上述分支时可以对照的具体场景。
+后继的 `start` 前面还有一个 `Effect.yieldNow`：drain 如果同步跑完、又同步 wake 了自己，没有这一步就会在 `settle` 里一直递归下去。`core/test/session-run-coordinator.test.ts` 里有 wake 合并、失败后的后继执行、中断清理期间的新 wake、同步自唤醒这几个用例，看上面几个分支时可以对照着看。
 
 ---
 
 ## 4. Runner 循环
 
-上一段以 `runner.run({ sessionID, force })` 为出口。这个接口没有 prompt 参数：runner 从数据库查询待处理输入，`promotion` 决定下一次 attempt 取哪一类输入。下面用 A、B、C 三条输入观察两个循环的边界。
+上一节最后调到了 `runner.run({ sessionID, force })`。这个接口不带 prompt，runner 自己去库里查待处理的输入，`promotion` 决定下一次 attempt 取哪一类。下面用 A、B、C 三条输入走一遍，看两层循环分别在哪里退出。
 
 ```mermaid
 sequenceDiagram
@@ -304,9 +304,140 @@ sequenceDiagram
   CO->>CO: settle：pendingWake 为真 → 起后继 drain(force=false)
   CO->>RN: run → hasPending 都为 false → 直接 return
 ```
-### 这一段的执行对象：SessionRunner
 
-`SessionRunner` 从已经记录的历史出发，把待处理的输入跑完。对外接口只有一个方法 `run({ sessionID, force })`，不接收消息参数。
+### 执行组件关系
+
+`SessionExecution` 是会话执行的接口，本地 layer 把它的几个方法直接绑到 `SessionRunCoordinator` 上。Coordinator 管同一会话的并发和等待；真要执行时回调 local 的 `drain`，由 `drain` 按会话的 Location 拿到 `SessionRunner`。
+
+图里的 `SessionExecutionLocal` 指的是本地 layer 和里面的闭包，`CoordinatorEntry` 指协调器为一次执行存的状态，源码里都没有同名的 class。
+
+```mermaid
+classDiagram
+  direction TB
+  class SessionExecution {
+    <<Service global>>
+    active
+    resume(sessionID)
+    wake(sessionID)
+    interrupt(sessionID)
+  }
+  class SessionExecutionLocal {
+    <<local layer>>
+    store: SessionStore
+    locations: LocationServiceMap
+    coordinator: Coordinator
+    drain(sessionID, force)
+  }
+  class SessionRunCoordinator {
+    active: Map
+    run(key)
+    wake(key)
+    interrupt(key)
+    start(key, entry, force, successor)
+    settle(key, entry, exit)
+  }
+  class CoordinatorEntry {
+    done: Deferred
+    owner: Fiber
+    pendingWake: boolean
+    stopping: boolean
+  }
+  class SessionStore {
+    get(sessionID)
+    context(sessionID)
+  }
+  class LocationServiceMap {
+    get(location)
+  }
+  class SessionRunner {
+    <<Service location>>
+    run(sessionID, force)
+  }
+  SessionExecutionLocal ..> SessionExecution : 提供接口实现
+  SessionExecutionLocal --> SessionRunCoordinator : make 并绑定方法
+  SessionRunCoordinator *-- CoordinatorEntry : 每个活跃会话的状态
+  SessionRunCoordinator ..> SessionExecutionLocal : start 回调 drain
+  SessionExecutionLocal --> SessionStore : 查询 session.location
+  SessionExecutionLocal --> LocationServiceMap : 取得 location layer
+  SessionExecutionLocal ..> SessionRunner : provide 后调用 run
+```
+
+`SessionRunner` 的实现在 `session/runner/llm.ts`。layer 构造时拿到依赖的服务，`runTurnAttempt` 这些内部函数都是闭包。下图用 `RunnerImplementation` 代指这组闭包，源码里没有这个类。`LLMEventPublisher` 是每次 attempt 新建的。
+
+```mermaid
+classDiagram
+  direction TB
+  class SessionRunner {
+    <<Service interface>>
+    run(sessionID, force)
+  }
+  class RunnerImplementation {
+    <<llm.ts layer closures>>
+    events: EventV2
+    llm: LLMClient
+    models: SessionRunnerModel
+    tools: ToolRegistry
+    store: SessionStore
+    location: Location
+    db: Database
+    compaction: SessionCompaction
+    run(input)
+    runTurn(sessionID, promotion, step)
+    runTurnAttempt(sessionID, promotion, step, recoverOverflow)
+    runAfterOverflowCompaction(sessionID, promotion, step)
+    failInterruptedTools(sessionID)
+    loadSystemContext(agent)
+  }
+  class SessionInput {
+    <<functions>>
+    hasPending(db, sessionID, mode)
+    promoteSteers()
+    promoteNextQueued()
+  }
+  class SessionContextEpoch {
+    <<functions>>
+    initialize()
+    prepare()
+    reset()
+  }
+  class SessionRunnerModel {
+    <<Service location>>
+    resolve(session)
+  }
+  class ToolRegistry {
+    materialize()
+    settleWith()
+  }
+  class LLMEventPublisher {
+    publish(event, outputPaths)
+    flush()
+    failAssistant(message)
+    failUnsettledTools(message, hostedOnly)
+    stepSettlement()
+  }
+  class SessionCompaction {
+    compactIfNeeded(input)
+    compactAfterOverflow(input)
+  }
+  class TurnTransitionError {
+    transition
+    step
+  }
+  RunnerImplementation ..> SessionRunner : 提供 run 实现
+  RunnerImplementation ..> SessionInput : 查询和取出待处理输入
+  RunnerImplementation ..> SessionContextEpoch : 准备上下文 epoch
+  RunnerImplementation --> SessionRunnerModel : 解析模型
+  RunnerImplementation --> ToolRegistry : 构造工具并执行调用
+  RunnerImplementation ..> LLMEventPublisher : 每次 attempt 创建
+  RunnerImplementation *-- SessionCompaction : layer 构造时创建
+  RunnerImplementation ..> TurnTransitionError : 压缩后切换执行分支
+```
+
+图里只画了主要依赖。系统上下文、skill、引用引导见 §5，工具内部见 §7，location layer 的创建和释放见 §11。
+
+### `SessionRunner`
+
+`SessionRunner` 从库里已有的历史出发，把待处理的输入跑完。对外接口只有一个方法 `run({ sessionID, force })`，不接收消息参数。
 
 错误类型写在方法签名里（`index.ts`）：`RunError = LLMError | ModelError | MessageDecodeError | ContextSnapshotDecodeError | InitializationBlocked | ToolOutputStore.Error`。
 少处理一种，编译就会报错。
@@ -362,17 +493,17 @@ while (shouldRun) {                                                             
 
 两边的循环结构基本一致，区别在于数据来源：pi 读内存，opencode 查数据库。这样换来了崩溃恢复和多进程运行的可能，但每轮至少要多跑五次 SQL。
 
-`promotion` 在每次 attempt 返回后都变成 `steer`，因此工具续接期间可以接入插话，但不会顺手取走下一条 queue。只有内层结束，外层才检查 queue。取出新输入后 `currentStep` 重置为 1，所以循环里的 `step + 1` 必须基于 attempt 返回的 step。
+每次 attempt 返回后 `promotion` 都会改成 `steer`，所以工具续接的过程中可以插话进来，但不会顺手把下一条 queue 也取走，queue 要等内层循环结束了外层才去查。取出新输入后 `currentStep` 会重置为 1，所以循环里的 `step + 1` 得用 attempt 返回的 step 来算。
 
-`runTurnAttempt` 先读取 `latestSequence` 作为 cutoff，`promoteSteers` 只取 `admitted_seq <= cutoff` 的输入。`promoteNextQueued` 则不接收 cutoff，按接收序号取最早一条未处理 queue。这是两种取输入策略，不能理解成同一批快照。
+`runTurnAttempt` 先读 `latestSequence` 当 cutoff，`promoteSteers` 只取 `admitted_seq <= cutoff` 的输入；`promoteNextQueued` 不看 cutoff，直接按接收序号取最早的一条 queue。两者取输入的规则不一样，并不是按同一个快照取的。
 
-这一段的出口是 `runTurn(sessionID, promotion, step)`。下一段展开其中一次 attempt；压缩导致的重入在 §9 展开。
+循环里每一轮调的是 `runTurn(sessionID, promotion, step)`。下一节看其中一次 attempt 里发生了什么，压缩导致的重入放到 §9。
 
 ---
 
 ## 5. runTurnAttempt：把输入、上下文和工具组装成请求
 
-进入本段时，runner 已选定 promotion 与 step；离开时得到请求、工具执行入口和本次 publisher，或者通过压缩信号退出并重入。
+进到这一步时，runner 已经定好了 promotion 和 step。这一步做完，要么拿到请求、工具执行入口和这次的 publisher，要么压缩了一次，通过信号退出去再重进。
 
 ```mermaid
 sequenceDiagram
@@ -423,15 +554,15 @@ sequenceDiagram
 
 另外注意 `materialize` 一次产出两样东西：给模型看的工具定义（definitions）和真正执行用的 `settle`，是同一份快照。到步数上限时会跳过这步。§6 收到本地 tool-call 时，就用这份 `settle` 执行。
 
-### Context Epoch：存什么，如何跨 attempt 更新
+### Context Epoch：存什么，怎么跨 attempt 更新
 
-每次请求模型，除了 agent 自身的指令，还需要提供工作目录、当前日期、`AGENTS.md`、可用技能等系统上下文。这些内容可能在会话进行中变化。opencode 用 Context Epoch 管理它们：先生成一份完整的系统上下文文本，后续变化通过追加消息告知模型，压缩后再重新生成完整文本。
+每次请求模型，除了 agent 自己的指令，还要带上工作目录、当前日期、`AGENTS.md`、可用技能这些系统上下文。这些东西在会话过程中可能会变。opencode 用 Context Epoch 来管：一开始生成一份完整的系统上下文文本，之后有变化就追加一条消息告诉模型，等压缩后再重新生成一份完整的。
 
-这里的 **epoch 可以理解为“共用同一份系统上下文基线的一段时期”**。一次 attempt 是一次模型请求尝试；多个 attempt 可以使用同一个 epoch，只有建立新基线才进入新的阶段。`SessionContextEpoch` 是管理这份状态的服务。
+epoch 可以理解成“共用同一份系统上下文基线的一段时间”。一次 attempt 就是一次模型请求，多个 attempt 可以共用一个 epoch，只有换了新基线才算进入下一个 epoch。管这份状态的服务叫 `SessionContextEpoch`。
 
 #### 一个 epoch 实际存什么
 
-`session_context_epoch` 表为每个会话保存一行当前状态：
+`session_context_epoch` 表里每个会话一行：
 
 | 字段 | 保存的数据 | 用途 |
 |---|---|---|
@@ -440,13 +571,13 @@ sequenceDiagram
 | `snapshot` | 按上下文源的 key 保存的结构化快照，例如环境字段、日期、指令内容和技能清单对应的数据 | 留给程序逐源比对变化，不直接发给模型 |
 | `baseline_seq` | 当前基线的序号边界；压缩后替换基线时设为 `compaction.seq` | 读取历史时，只保留此边界之后的 system 更新消息，避免重复携带已被新基线覆盖的更新 |
 
-**`baseline` 是这一阶段固定的文本，`snapshot` 是最近一次已接受的上下文状态。** 后续发生变化时，快照会向前更新，基线仍保持原样。变化对应的文本另存为消息历史中的 `system` 消息，不是追加到这张表的 `baseline` 字段里。
+`baseline` 在一个 epoch 里是固定不变的文本，`snapshot` 是最近一次确认过的上下文状态。之后有变化时，快照跟着更新，基线不动。描述变化的那段文字存成消息历史里的一条 `system` 消息，不会追加到这张表的 `baseline` 里。
 
-这张表只负责系统上下文；用户消息、模型回复、工具结果存放在消息历史中。agent 自己的 `system` 指令也单独放在 baseline 前面，不属于这里的快照。
+这张表只管系统上下文；用户消息、模型回复、工具结果都在消息历史里。agent 自己的 `system` 指令也不在这里，它单独放在 baseline 前面。
 
 #### 用日期变化走一遍
 
-下面只展示日期这个源，文字是概念示意，不是实际序列化格式。实际基线和快照还包含其他上下文源。
+下面只看日期这一个源，表里的文字是示意，不是实际的序列化格式，真实的基线和快照里还有别的源。
 
 | 时点 | `baseline` 中的日期文本 | `snapshot` 中记录的日期 | 消息历史中的变化 |
 |---|---|---|---|
@@ -456,13 +587,13 @@ sequenceDiagram
 | 再下一次 attempt，日期没变 | 保持不变 | 9 月 20 日 | 与更新后的快照比较，不会重复追加日期更新 |
 | 压缩后成功重建基线 | 新基线写“今天是 9 月 20 日” | 9 月 20 日 | 更新 `baseline_seq`，已被新基线覆盖的旧 system 更新不再带入请求 |
 
-跨天但尚未重建基线时，模型会同时读到旧基线和后面的日期更新；程序则用已经更新到 9 月 20 日的快照判断下一次是否有变化。**固定的是基线，不是模型能获知的上下文，也不是用于比对的快照。**
+跨天之后、基线还没重建的这段时间，模型会同时看到旧基线和后面那条日期更新；程序这边拿已经更新到 9 月 20 日的快照判断下次有没有变化。也就是说，不变的只有基线文本，模型知道的上下文、用来比对的快照都会更新。
 
-这样设计是为了保持请求前缀稳定，增加 provider 复用 prompt cache 的机会；实际缓存命中仍取决于 provider。压缩后的基线替换则把当前系统上下文重新渲染成完整文本，开始下一个 epoch。
+为什么要这么绕？为了让请求前缀尽量不变，provider 才有机会复用 prompt cache（最后能不能命中还是看 provider）。压缩后替换基线，就是把当前系统上下文重新渲染成完整文本，开始下一个 epoch。
 
-#### 每次 attempt 如何准备这份状态
+#### 每次 attempt 怎么准备这份状态
 
-回到本段请求准备图中的 `initialize / prepare`：首次初始化会生成基线和快照；后续 attempt 根据是否出现新压缩，选择替换基线或比对变化。
+对应本节开头那张图里的 `initialize / prepare`：第一次初始化时生成基线和快照；之后每次 attempt 看有没有新的压缩，有就换基线，没有就比对变化。
 
 ```mermaid
 sequenceDiagram
@@ -508,7 +639,7 @@ sequenceDiagram
 
 #### 系统上下文的数据从哪里来
 
-`SystemContext` 把多个上下文源组合起来。每个源通过 `load` 读取结构化数据，通过 `baseline` 渲染完整文本，通过 `update` / `removed` 渲染变化说明。因此，同一份源数据可以用于生成模型可读的文本，也可以保存到快照供程序比对。
+`SystemContext` 把多个上下文源拼在一起。每个源用 `load` 读结构化数据，用 `baseline` 渲染完整文本，用 `update` / `removed` 渲染变化说明。这样同一份数据既能渲染成给模型看的文本，也能存进快照给程序比对。
 
 ```mermaid
 classDiagram
@@ -561,9 +692,9 @@ classDiagram
 | `SkillGuidance` | `core/src/skill/guidance.ts` | 当前 agent 有权限的技能清单，`<available_skills>` 块。按 agent 算，所以在 runner 里和注册表的源合并（`llm.ts`） |
 | `ReferenceGuidance` | `core/src/reference/guidance.ts` | 引用引导 |
 
-### SessionContextEpoch 的读写入口
+### `SessionContextEpoch`
 
-`SessionContextEpoch` 管理 `session_context_epoch` 表，上图对应的入口如下。
+`SessionContextEpoch` 负责读写 `session_context_epoch` 表，上图里用到的几个函数：
 
 | 函数 | 干什么 |
 |---|---|
@@ -571,11 +702,11 @@ classDiagram
 | `prepare(db, events, context, sessionID)` | 表里已有：比对。有新压缩就 `replace`（整个换新基线）；否则 `reconcile`，变了就发 `ContextUpdated` 事件，并在事件的 `commit` 钩子里 `advance` 快照 |
 | `reset(db, sessionID)` | 删行。会话移动目录时用 |
 
-### 本段读哪些会话配置
+### 用到的会话配置
 
-`getSession` 返回 `Session.Info`，`agents.select` 返回当前 agent 的配置。它们影响请求的不同部分：
+`getSession` 拿到 `Session.Info`，`agents.select` 拿到当前 agent 的配置，它们各自影响请求的不同部分：
 
-| 对象与字段 | 本段用途 | 后续影响 |
+| 对象与字段 | 这里用来干什么 | 后面影响什么 |
 |---|---|---|
 | `Session.Info.location` | 校验当前目录和 workspace | 会话已迁移时中断旧 runner |
 | `Session.Info.agent` / `model` | 选择 agent、解析 provider / model / variant | 未指定时分别走默认选择 |
@@ -583,7 +714,7 @@ classDiagram
 | `Agent.Info.steps` | 与 `currentStep` 比较 | 最后一步禁用工具，并追加收尾提示 |
 | `Agent.Info.permissions` | 传给 `tools.materialize` | 过滤定义；真正执行仍需工具内部授权 |
 
-它们的定义分别在 `schema/src/session.ts` 与 `schema/src/agent.ts`。历史消息、模型协议消息和这两份配置在这里汇合，成为一次请求。
+两者分别定义在 `schema/src/session.ts` 和 `schema/src/agent.ts`。历史消息转成模型协议的消息，再加上这两份配置，就拼成了一次请求。
 
 ### 历史从哪里读：SessionHistory 与 SessionStore
 
@@ -604,9 +735,9 @@ system 消息要看 `baselineSeq`，是因为基线序号之前的 system 消息
 | `runnerContext(sessionID, baselineSeq)` | 和 `context` 一样，只是调用方显式传基线序号，供 runner 用 |
 | `message(messageID)` | 按 id 取单条消息 |
 
-### SessionMessage 怎样转换成模型输入
+### SessionMessage 怎么转成模型输入
 
-`SessionMessage` 是事件投影生成的消息类型，对应的记录存放在 `session_message` 表中。下表第二列就是生成它的事件。类型定义在 `schema/src/session-message.ts`，core 里通过 `core/src/session/message.ts` 转发。
+`SessionMessage` 是事件投影出来的消息，存在 `session_message` 表里，下表第二列就是生成它的事件。类型定义在 `schema/src/session-message.ts`，core 里通过 `core/src/session/message.ts` 转发。
 
 ```mermaid
 classDiagram
@@ -717,9 +848,7 @@ classDiagram
 | `completed` | `input`、`content`、`structured`、`outputPaths`、`attachments`、`result` | `Tool.Success` |
 | `error` | `input`、`content`、`structured`、`error`、`result` | `Tool.Failed` |
 
-`provider.executed` 为真表示这个工具是模型供应商自己执行的（比如内置 web search），本地不跑。
-发给模型时，供应商执行的工具把 call 和 result 都放进 assistant 消息的 content 里；本地执行的只放 call，
-result 单独成一条 `role: tool` 消息（`to-llm-message.ts`）。
+`provider.executed` 为真，表示这个工具是模型供应商自己执行的（比如内置 web search），本地不跑。发给模型时，供应商执行的工具把 call 和 result 都放进 assistant 消息的 content 里；本地执行的只放 call，result 单独成一条 `role: tool` 消息（`to-llm-message.ts`）。
 
 ### 解析模型：SessionRunnerModel
 
@@ -836,7 +965,7 @@ classDiagram
 不变的字段：headers、cacheKey、`generation`。
 v2 还没有的：v1 里的每次 prompt 覆盖系统文本、插件修改请求、结构化输出策略，在 v2 里都还是 `missing`（`specs/v2/session.md` 那张表）。
 
-### 步数上限如何同时约束请求和执行
+### 步数上限
 
 到达 `steps` 上限时会同时做三件事：`tools: []`、`toolChoice: "none"`、消息末尾追加一条 assistant 消息（`max-steps.ts`）：
 "CRITICAL - MAXIMUM STEPS REACHED … Tools are disabled until next user input. Respond with text only."
@@ -847,7 +976,7 @@ v2 还没有的：v1 里的每次 prompt 覆盖系统文本、插件修改请求
 
 ## 6. 消费模型流：发布状态与启动工具
 
-本段接过 §5 的 request、materialization 和 publisher。工具执行的内部调用在 §7 展开，本图先看它如何与模型流交错，以及哪些状态要留到 §8 收尾。
+这一节拿着 §5 准备好的 request、materialization 和 publisher 去请求模型。工具内部怎么执行放到 §7，这张图先看工具执行和模型流是怎么交错进行的，以及哪些事要留到 §8 收尾时做。
 
 ```mermaid
 sequenceDiagram
@@ -884,11 +1013,11 @@ sequenceDiagram
   Note over RT,FS: stream Exit 已取得，工具可能仍在执行；收尾见 §8
 ```
 
-图中的工具返回箭头表示完成时的回调，不是 `Stream.runForEach` 在每个 tool-call 后等待工具。`FiberSet.run` 注册 fiber 后继续消费模型事件；工具分支和模型分支通过同一个 `Semaphore(1)` 串行发布会话事件。这里同时存在两种关系：工具执行可以并发，publisher 的状态更新按 permit 串行。
+图里工具返回的箭头是工具跑完后的回调，`Stream.runForEach` 并不会在每个 tool-call 后停下来等工具，`FiberSet.run` 把 fiber 挂上去就接着消费模型事件了。工具这边和模型流那边发会话事件时抢的是同一个 `Semaphore(1)`，所以工具可以并发跑，但 publisher 的状态更新是一条一条来的。
 
-`step-finish` 也不等于立即提交 `Step.Ended`。publisher 先记下 finish 和 token 等 settlement 信息，attempt 等工具结束后才完成 step 收尾。模型流失败时 `ensuring(flush)` 仍执行，防止文本或工具输入的流式片段停留在未关闭状态。
+收到 `step-finish` 也不会马上发 `Step.Ended`。publisher 只是先把 finish 原因、token 用量这些记下来，等工具都跑完了 attempt 才去收尾。模型流失败时 `ensuring(flush)` 照样会执行，把没关的文本、工具输入片段都关掉。
 
-### 流内状态由谁持有：LLMEventPublisher
+### `LLMEventPublisher`
 
 `createLLMEventPublisher` 把 `llm.stream` 返回的 16 种 `LLMEvent` 转成会话事件，再 `events.publish`。每轮创建一个，只在这一轮内使用。
 文件注释："Persist one provider turn without executing tools or starting a continuation turn."
@@ -913,13 +1042,11 @@ sequenceDiagram
 | `failUnsettledTools(message, hostedOnly)` | 所有没 `settled` 的工具发 `Tool.Failed`。`hostedOnly` 为真只处理 provider 执行的 |
 | `assistantMessageID(callID)` | 给 runner 查这个工具调用属于哪条 assistant |
 
-一致性检查很严格：同一个 id 重复 start、name 变了、result 比 call 先到，都会 `Effect.die`。
-也就是不假设 provider 返回的流式数据一定正确。
+一致性检查很严格：同一个 id 重复 start、name 变了、result 比 call 先到，都会 `Effect.die`。也就是说它不假设 provider 返回的流一定是对的。
 
 ### 模型事件映射成哪些会话事件
 
-会话事件是 v2 的数据来源，最后一列说明了每种事件会更新哪张表。事件定义在 `schema/src/session-event.ts`。每个事件用 `Event.define({ type, durable?, schema })` 造（`schema/src/event.ts`）。
-带 `durable: { aggregate: "sessionID", version }` 的事件会写库，不带的只广播。
+v2 的数据都是从会话事件来的，表格最后一列是每种事件会更新哪张表。事件定义在 `schema/src/session-event.ts`，每个事件用 `Event.define({ type, durable?, schema })` 造（`schema/src/event.ts`）。带 `durable: { aggregate: "sessionID", version }` 的会写库，不带的只广播。
 
 | 事件族 | 类型名前缀 | 持久化？ | 谁发 | 投影成什么 |
 |---|---|---|---|---|
@@ -947,7 +1074,7 @@ sequenceDiagram
 
 ## 7. 执行工具：权限等待、文件修改与结果回写
 
-这里展开上一图的 materialization.settle。审批等待与实际执行必须放在同一条调用链中看：等待发生在工具 fiber 内，决定返回后才能继续执行并生成 settlement。
+这一节展开上一张图里的 `materialization.settle`，以 `edit` 为例。权限审批和实际执行要放在同一条调用链里看：等用户审批是在工具 fiber 里等的，用户回复之后工具才接着执行、生成 settlement。
 
 ```mermaid
 sequenceDiagram
@@ -1011,13 +1138,12 @@ sequenceDiagram
 ### 执行规则
 
 1. 先记录再执行（`llm.ts`）：`publish(event)` 发出 `Tool.Called` 并写库之后，才调 `settle`。进程在这之间挂掉，重启后 `failInterruptedTools` 能看到一个 `running` 的工具并标失败。
-2. 工具执行与结果发布的取消边界不同：`uninterruptibleMask` 中的 `restore` 让 settle 本身可中断，成功后的 `publish(toolResult)` 留在 mask 内，避免 Effect 取消插在取得 settlement 与发布结果之间。这不覆盖进程崩溃或写库失败，不能当成副作用与结果记录的原子事务。
+2. 执行可以取消，发布结果不能：`uninterruptibleMask` 里用 `restore` 包住 settle，所以执行过程可以被中断；拿到结果后的 `publish(toolResult)` 在 mask 里，取消信号插不进“拿到 settlement”和“发布结果”之间。但进程崩溃、写库失败它管不了，工具的副作用和结果记录并不是一个原子操作。
 3. 并行执行，串行发布：每个 tool-call 立刻进 `FiberSet`，互不等待；但 `withPublication` 信号量让事件一条一条发。文档："Eager local-tool execution is intentionally unbounded in the current local slice."
 
 ### 工具结果回传
 
-下一轮 `entriesForRunner` 读到这条 assistant 消息，`content` 里的 tool 项已经是 `completed`。`to-llm-message.ts` 把每个本地执行的 tool 项转成一条 `role: tool` 消息，
-内容是 `ToolOutput.toResultValue({ structured, content })`。`outputPaths` 里的落盘路径已经写进 content 的预览文本里了。
+下一轮 `entriesForRunner` 读到这条 assistant 消息时，`content` 里的 tool 项已经是 `completed`。`to-llm-message.ts` 把每个本地执行的 tool 项转成一条 `role: tool` 消息，内容是 `ToolOutput.toResultValue({ structured, content })`。`outputPaths` 里的落盘路径已经写进 content 的预览文本里了。
 
 ### 工具无结果时的文案
 
@@ -1029,7 +1155,7 @@ sequenceDiagram
 | `Tool execution failed: …` | | 工具 fiber 以非中断原因失败（一般是 `ToolOutputStore.Error`） |
 | `Stale tool call: …` / `Unknown tool: …` | `registry.ts` | 工具在 materialize 之后被替换或注销 |
 
-### 本段对象关系
+### 类图
 
 ```mermaid
 classDiagram
@@ -1139,17 +1265,17 @@ classDiagram
 
 ### `Tool.make`
 
-`Tool.make(config)` 定义一个具体工具：`config` 提供描述、输入和输出 Schema，以及真正执行业务的 `config.execute`。调用 `Tool.make` 时只创建工具，不会执行它。
+`Tool.make(config)` 用来定义一个工具：`config` 里有描述、输入输出 Schema，以及真正干活的 `config.execute`。调 `Tool.make` 只是创建工具，不会执行。
 
-返回的工具值是 `Object.freeze({})`，对应的 `Runtime` 保存在模块级 `WeakMap` 中。外部通过 `Tool.definition`、`Tool.settle` 等函数访问这些能力，不直接操作内部实现。
+返回的工具是一个 `Object.freeze({})` 空对象，对应的 `Runtime` 存在模块级的 `WeakMap` 里。外面要用只能通过 `Tool.definition`、`Tool.settle` 这些函数，碰不到内部实现。
 
-| `Runtime` 成员 | 职责 |
+| `Runtime` 成员 | 干什么 |
 |---|---|
-| `definition(name)` | 把输入、输出 Schema 转成 JSON Schema，生成并按名字缓存 `ToolDefinition`，供模型了解如何调用工具 |
-| `settle(call, context)` | 解码输入、调用 `config.execute`、编码输出，最终生成 `ToolOutput`；具体流程见下文 |
-| `permission` | 工具用于目录过滤的权限动作名。`Tool.withPermission(tool, "edit")` 可覆盖默认名字；例如 `edit` / `write` / `apply_patch` 都使用 `edit`，让同一条规则覆盖这些工具 |
+| `definition(name)` | 把输入、输出 Schema 转成 JSON Schema，生成并按名字缓存 `ToolDefinition`，告诉模型这个工具怎么调 |
+| `settle(call, context)` | 解码输入、调 `config.execute`、编码输出，最后生成 `ToolOutput`，流程见下面 |
+| `permission` | 过滤工具时用的权限动作名。`Tool.withPermission(tool, "edit")` 可以改掉默认名字，比如 `edit` / `write` / `apply_patch` 都用 `edit`，一条规则就能管住这几个工具 |
 
-这里的 `settle` 负责**一个具体工具的执行过程**：
+这里的 `settle` 管的是单个工具的执行过程：
 
 ```text
 call.input
@@ -1161,15 +1287,15 @@ call.input
   → 返回 ToolOutput { structured, content }
 ```
 
-输入不合法时返回 `ToolFailure`，不会进入 `config.execute`；输出不符合 Schema 时也返回 `ToolFailure`。没有独立的 structured 转换时，`structured` 使用编码后的 output。没有配置 `toModelOutput` 时，字符串 output 默认变成 text content，其他类型默认不生成 content。
+输入不合法直接返回 `ToolFailure`，不会进 `config.execute`；输出不符合 Schema 也返回 `ToolFailure`。没配 structured 转换时，`structured` 就用编码后的 output。没配 `toModelOutput` 时，字符串 output 默认转成 text content，其他类型就没有 content。
 
-`Tool.settle(tool, call, context)` 只是从 `WeakMap` 找到这个工具的 `Runtime`，再调用上述 `Runtime.settle`。
+`Tool.settle(tool, call, context)` 只是从 `WeakMap` 里找到这个工具的 `Runtime`，再调上面的 `Runtime.settle`。
 
 ### `ToolRegistry`
 
-`ToolRegistry` 管理当前目录可用的工具。它把进程级的 `ApplicationTools` 和目录级的本地注册项合在一起，为本次 attempt 返回 `Materialization { definitions, settle }`：`definitions` 发给模型，`settle` 留给 runner 处理模型返回的 tool-call。
+`ToolRegistry` 管当前目录能用的工具。它把进程级的 `ApplicationTools` 和目录级的本地注册项合到一起，每次 attempt 返回一个 `Materialization { definitions, settle }`：`definitions` 发给模型，`settle` 留给 runner 执行模型发回来的 tool-call。
 
-**`Materialization.settle` 是外层入口，内部会调用 `Tool.make` 保存的 `Runtime.settle`。两者串在同一条调用链上，`config.execute` 只执行一次。**
+注意这里有两个 settle：`Materialization.settle` 是外层入口，里面再调 `Tool.make` 存下的 `Runtime.settle`。它们在同一条调用链上，`config.execute` 只执行一次。
 
 ```text
 runner 收到 tool-call
@@ -1183,29 +1309,27 @@ runner 收到 tool-call
       → 返回 Settlement { result, output?, outputPaths? }
 ```
 
-所以，`Runtime.settle` 关注输入、业务执行和输出类型；`ToolRegistry` 的 `settle` 关注工具选择、注册项是否过期，以及怎样把执行结果交回 runner。
+`Runtime.settle` 管输入、执行和输出类型；`ToolRegistry` 这层的 settle 管找哪个工具、注册项有没有过期、结果怎么交回 runner。
 
-| 方法 | 职责 | 调用方 |
+| 方法 | 干什么 | 谁调它 |
 |---|---|---|
 | `register(tools)` | 校验名字（`/^[A-Za-z][A-Za-z0-9_-]{0,63}$/`），按名字压栈。Scope 关闭时通过 `addFinalizer` 移除本次注册项，恢复之前的同名工具 | 工具的 layer（`bash.ts`, `edit.ts` 等） |
 | `materialize(permissions)` | 以 `ApplicationTools` 为基础，用本地注册项覆盖同名工具；过滤 `whollyDisabled` 的工具（规则 `resource: "*"` 且 `effect: "deny"`），返回持有本次注册表快照的 `{ definitions, settle }` | `runTurnAttempt` |
 | `settleWith(input, advertised)` | 重新查找注册项（本地优先），用 `identity` 检查它是否仍是之前提供给模型的那个工具；通过后调用 `Tool.settle`，再整理结果 | `Materialization.settle` |
 
-如果模型调用的名字不在本次 `Materialization` 中，返回 `Unknown tool`；如果原来提供的注册项已消失或被替换，返回 `Stale tool call`，不会执行新的同名工具。`Tool.settle` 返回的 `ToolFailure` 会转换成 `Settlement.result` 中的 error；成功输出则交给 `ToolOutputStore.bound`，再生成 `result` 和可选的 `outputPaths`。
+模型调的名字不在这次的 `Materialization` 里，返回 `Unknown tool`；当初给模型的那个注册项已经没了或被换掉了，返回 `Stale tool call`，不会去执行新的同名工具。`Tool.settle` 返回的 `ToolFailure` 会转成 `Settlement.result` 里的 error；成功的输出交给 `ToolOutputStore.bound`，再生成 `result` 和可选的 `outputPaths`。
 
-这里的权限过滤只决定哪些工具定义提供给模型。针对具体路径、命令等资源的执行授权，仍由工具自己的 `config.execute` 调用 `PermissionV2` 完成。职责分别是：`ToolRegistry` 选择和检查注册项，`Runtime.settle` 包装业务执行，`ToolOutputStore.bound` 处理过大的输出。
+这里的权限过滤只决定给模型看哪些工具。具体到某个路径、某条命令能不能执行，还是工具自己在 `config.execute` 里调 `PermissionV2` 判断。
 
 ### `ToolOutputStore`
 
 `ToolOutputStore` 在工具输出太长时把完整内容写到文件，只给模型头尾预览和文件路径。
 
-`bound(input)`：把 content 里的 text 拼起来（没 content 就 JSON 化 `structured`）；
-行数 ≤ 2000 且字节 ≤ 50KB 原样返回；否则写到 `<data>/tool-output/tool_<id>`，返回 `boundedPreview`（头 + "... output truncated; full content saved to … ..." + 尾）。
-限额可以在配置的 `tool_output.max_lines / max_bytes` 改。`cleanup` 删 7 天前的文件，server 启动时挂了个 `cleanupNode`。
+`bound(input)`：把 content 里的 text 拼起来（没 content 就 JSON 化 `structured`）；行数 ≤ 2000 且字节 ≤ 50KB 原样返回；否则写到 `<data>/tool-output/tool_<id>`，返回 `boundedPreview`（头 + "... output truncated; full content saved to … ..." + 尾）。限额可以在配置的 `tool_output.max_lines / max_bytes` 改。`cleanup` 删 7 天前的文件，server 启动时挂了个 `cleanupNode`。
 
 ### `PermissionV2`
 
-`PermissionV2` 是工具副作用之前的一道门。它不负责执行工具，只回答三个结果：
+`PermissionV2` 是工具产生副作用之前的一道检查。它不执行工具，只给出三种结果之一：
 
 ```text
 allow：直接继续执行
@@ -1213,12 +1337,12 @@ deny：直接阻止，不询问用户
 ask：暂停当前工具，等用户选择 once / always / reject
 ```
 
-权限实际在两个时机使用：
+权限在两个地方用到：
 
-1. `ToolRegistry.materialize` 在把工具列表发给模型前，隐藏被规则完整禁用的工具。例如某个 action 对 `resource: "*"` 是 deny，模型就不会看到它。
-2. 模型真的调用工具后，工具在产生副作用之前调用 `permission.assert(...)`，对这一次操作的具体目标再判断。第一步只是减少模型可见的工具，不代替这里的执行检查。
+1. `ToolRegistry.materialize` 把工具列表发给模型前，先把被规则整个禁掉的工具藏起来。比如某个 action 对 `resource: "*"` 是 deny，模型就看不到这个工具。
+2. 模型真的调了工具，工具在产生副作用前调 `permission.assert(...)`，针对这次要操作的具体对象再判断一次。第一步只是让模型少看到几个工具，不能代替这一步。
 
-`Tool.withPermission(tool, "edit")` 只告诉注册表“这个工具按哪个 action 做可见性过滤”，不会自动执行授权；真正的 `assert` 仍由工具在正确的副作用边界前调用。
+`Tool.withPermission(tool, "edit")` 只是告诉注册表“过滤这个工具时按哪个 action 算”，不会自动授权；`assert` 还是得工具自己在产生副作用前调。
 
 #### 一次权限请求里有什么
 
@@ -1243,8 +1367,7 @@ yield* permission.assert({
 | `sessionID` / `agent` | 用哪个会话和 agent 的规则来判断 |
 | `source` | 是哪条 assistant 消息里的哪个 tool call 发起了请求，供客户端定位和显示 |
 
-一条规则就是 `{ action, resource, effect }`。`action` 和 `resource` 都支持通配符；多条规则同时匹配时，排在最后的那条生效。
-例如：
+一条规则就是 `{ action, resource, effect }`。`action` 和 `resource` 都支持通配符；多条规则同时匹配时，排在最后的那条生效。比如：
 
 ```ts
 [
@@ -1254,9 +1377,9 @@ yield* permission.assert({
 ]
 ```
 
-这表示一般操作允许，读取 `.env` 要问用户，而读取 `.env.example` 仍然允许。完全没有规则匹配时，默认结果是 `ask`，不是自动允许。
+意思是一般操作都允许，读 `.env` 要问用户，读 `.env.example` 还是允许。一条规则都没匹配上时，默认是 `ask`，不是直接放行。
 
-#### `assert` 怎样暂停工具，再由 UI 唤醒
+#### `assert` 怎么让工具停下来等用户
 
 ```mermaid
 sequenceDiagram
@@ -1288,8 +1411,7 @@ sequenceDiagram
   end
 ```
 
-代码里的 `Deferred` 就是图中的“一次性等待闸门”：`assert` 在 `Deferred.await` 停住；`reply` 成功或失败这个 Deferred，原来那个工具 fiber 才继续或退出。
-等待中的请求放在 `pending` Map，客户端也通过 `list` / `forSession` / `get` 读取它们。目录服务被释放时，所有还在等待的 Deferred 都会按拒绝处理，避免工具永远挂住。
+图里的“一次性等待闸门”在代码里就是一个 `Deferred`：`assert` 停在 `Deferred.await` 上，`reply` 把这个 Deferred 置成成功或失败，原来那个工具 fiber 才接着跑或者退出。等待中的请求放在 `pending` Map 里，客户端通过 `list` / `forSession` / `get` 读。目录服务被释放时，还在等的 Deferred 全部按拒绝处理，工具不会一直挂着。
 
 三个回复的区别：
 
@@ -1299,18 +1421,18 @@ sequenceDiagram
 | `always` | 请求带有 `save` 时，把其中的字符串作为 allow 规则写进当前 project 的 `PermissionSaved` 表，再放行当前请求；同会话里其他现在也能命中这些规则的 pending 请求会一起放行。没有 `save` 时只放行当前请求 |
 | `reject` | 拒绝当前请求，并把同一会话里其他 pending 请求一起拒绝；没有反馈文案时，runner 把它识别成用户拒绝并停止本次排空 |
 
-#### 规则最终怎样合并
+#### 规则怎么合并
 
-判断顺序不是简单地把所有规则拼起来：
+并不是把所有规则拼在一起就完事，判断顺序是这样的：
 
 1. 根据 `sessionID` 找到会话，再确定当前 agent，取它配置的 permission rules；找不到 agent 时使用全 deny。
 2. 先只看 agent 规则。如果这次任一 resource 被 agent 明确 deny，立即 deny。项目里记住的 `always` 不能覆盖 agent 的硬禁止。
 3. 没有硬禁止，再把项目已保存的 allow 规则放到 agent 规则后面。因为后面的匹配规则优先，它可以把原来的 ask 变成 allow。
 4. 一个请求可以有多个 resources：任一个 deny，整体 deny；否则任一个 ask，整体 ask；全部 allow 才整体 allow。
 
-主要入口可以归纳成：
+主要方法：
 
-| 方法 | 谁使用 | 行为 |
+| 方法 | 谁调它 | 干什么 |
 |---|---|---|
 | `assert(input)` | 工具执行代码 | 完成判断；allow 立即返回，deny 报错，ask 发事件并等待用户回复 |
 | `ask(input)` | `session.permission.create` HTTP 接口 | 只判断并在需要时创建 pending，请求本身不等待；返回 `{ id, effect }` |
@@ -1321,16 +1443,13 @@ sequenceDiagram
 
 ### `QuestionV2`
 
-和 `PermissionV2` 结构一样：`pending` Map + Deferred。`ask` 发 `Asked` 事件后等答复；`reply` 返回答复；`reject` 以 `RejectedError` 失败。
-`question` 工具（`tool/question.ts`）先 `permission.assert({ action: "question" })` 再 `question.ask`。
+和 `PermissionV2` 结构一样：`pending` Map + Deferred。`ask` 发 `Asked` 事件后等答复；`reply` 返回答复；`reject` 以 `RejectedError` 失败。`question` 工具（`tool/question.ts`）先 `permission.assert({ action: "question" })` 再 `question.ask`。
 
 ### `LocationMutation.resolve`
 
 `LocationMutation.resolve` 把工具传进来的路径解析成规范路径、权限资源名，以及是否属于外部目录。
 
-规则：相对路径必须落在 Location 内（否则 `relative_escape`）；绝对路径落在 Location 内但 realpath 逃出去了是 `location_escape`；
-绝对路径在 Location 外算外部路径，资源名用规范绝对路径，并附一个 `externalDirectory` 授权描述（action `external_directory`，resource `<目录>/*`）。
-内部路径的资源名是相对路径。
+规则：相对路径必须落在 Location 内（否则 `relative_escape`）；绝对路径落在 Location 内、但 realpath 逃出去了，是 `location_escape`；绝对路径在 Location 外算外部路径，资源名用规范绝对路径，再附一个 `externalDirectory` 授权描述（action `external_directory`，resource `<目录>/*`）。内部路径的资源名是相对路径。
 
 ---
 
@@ -1375,9 +1494,9 @@ sequenceDiagram
   end
 ```
 
-收尾位于 `Effect.uninterruptibleMask` 中，但 providerStream、溢出恢复和等待工具通过 `restore` 保持可中断。退出结果被保存成 `Exit`，之后才能区分“模型流失败”“工具等待失败”和“用户明确拒绝”。不能在模型流停止时直接返回，否则正在执行的工具以及 publisher 中的未完成项都失去了收尾位置。
+收尾整个包在 `Effect.uninterruptibleMask` 里，只有 providerStream、溢出恢复、等工具这几处用 `restore` 放开，可以被中断。各段的退出结果先存成 `Exit`，后面才分得清是模型流失败、等工具失败，还是用户明确拒绝。为什么不在模型流一停就直接返回？因为这时工具可能还在跑，publisher 里也还有没收尾的东西，直接返回就没人管它们了。
 
-`Step.Ended` 的判定是存在 `stepSettlement` 且没有 provider 错误，不是简单的“所有工具成功”。工具的失败状态和 step 的结束信息分别记录；最终是否向上抛 cause，再由后面的分支决定。
+发不发 `Step.Ended`，看的是有没有 `stepSettlement`、有没有 provider 错误，而不是工具是不是都成功了。工具失败和 step 结束是分开记的；最后要不要把 cause 往上抛，由后面的分支决定。
 
 收尾时按这个顺序判断：
 
@@ -1400,10 +1519,9 @@ sequenceDiagram
 
 ## 9. 压缩：怎样退出并重新进入 attempt
 
-本段展开 §5 请求前和 §8 输出前溢出两条转换路径。转换带回当前 step；重入时要重新读取历史，不能沿用压缩前已构造好的 request。
+压缩有两个入口：§5 里请求发出前的主动压缩，和 §8 里模型还没开始输出就报溢出之后的压缩。两条路都会带着当前 step 退出去再重进 attempt，重进时要重新读历史，不能用压缩前拼好的那个 request。
 
-opencode v2 目前没有 provider 重试。`LLMClient` 里没有 retry，runner 头注释 "Bound provider retries" 没勾，
-`SessionEvent.Retried` 定义了但没人发。一次 `LLMError` 就是这轮失败：`Step.Failed` 落库，排空结束。
+opencode v2 目前没有 provider 重试。`LLMClient` 里没有 retry，runner 头注释里 "Bound provider retries" 那项没勾，`SessionEvent.Retried` 定义了但没人发。一次 `LLMError` 就是这轮失败：`Step.Failed` 落库，排空结束。
 所以循环外面的处理只有压缩这一种。
 
 ```mermaid
@@ -1455,8 +1573,7 @@ sequenceDiagram
 estimate({ system, messages, tools }) > context - max(generation.maxTokens ?? limits.output, buffer)
 ```
 
-`estimate` 是 `Token.estimate(JSON.stringify(...))`，粗估。`context` 来自 `model.route.defaults.limits.context`（目录里的 `limit.context`）。
-`buffer` 默认 20000。`auto: false` 可以关掉。
+`estimate` 是 `Token.estimate(JSON.stringify(...))`，粗估。`context` 来自 `model.route.defaults.limits.context`（目录里的 `limit.context`）。`buffer` 默认 20000。`auto: false` 可以关掉。
 
 ### 压缩实现
 
@@ -1468,25 +1585,19 @@ estimate({ system, messages, tools }) > context - max(generation.maxTokens ?? li
 
 ### 压缩后的历史
 
-`SessionHistory.messageRows`（`history.ts`）：有 compaction 时取 `seq >= compaction.seq`，所以历史变成 `[compaction 消息, 之后的所有消息]`。
-`to-llm-message.ts` 把 compaction 消息渲染成一条 user 消息：`<conversation-checkpoint><summary>…</summary><recent-context>…</recent-context></conversation-checkpoint>`。
-同时 `SessionContextEpoch.prepare`（`context-epoch.ts`）发现 `compaction.seq > baseline_seq`，走 `replace` 重新渲染一份完整基线，`baseline_seq` 设成 compaction 的 seq。
-所以压缩后的第一轮请求里，系统提示词是重新生成的完整基线，历史只有一条 checkpoint 加上之后的消息。
+`SessionHistory.messageRows`（`history.ts`）：有 compaction 时取 `seq >= compaction.seq`，所以历史变成 `[compaction 消息, 之后的所有消息]`。`to-llm-message.ts` 把 compaction 消息渲染成一条 user 消息：`<conversation-checkpoint><summary>…</summary><recent-context>…</recent-context></conversation-checkpoint>`。同时 `SessionContextEpoch.prepare`（`context-epoch.ts`）发现 `compaction.seq > baseline_seq`，走 `replace` 重新渲染一份完整基线，`baseline_seq` 设成 compaction 的 seq。所以压缩后的第一轮请求里，系统提示词是重新生成的完整基线，历史只有一条 checkpoint 加上之后的消息。
 
 ### 溢出恢复
 
-`runTurn` 传 `compactAfterOverflow` 进去；`runAfterOverflowCompaction` 不传。
-第二次溢出时 `recoverOverflow` 是 undefined，溢出恢复的条件不成立，于是把溢出错误 publish 出去变成 `Step.Failed`。
-如果溢出发生在已经开始输出之后（`hasAssistantStarted()` 为真），不恢复，直接当普通错误。文档："recovery never loops or replays partial side effects."
+`runTurn` 会传 `compactAfterOverflow` 进去，`runAfterOverflowCompaction` 不传。所以第二次溢出时 `recoverOverflow` 是 undefined，恢复条件不成立，溢出错误就被 publish 出去，变成 `Step.Failed`。如果溢出发生在已经开始输出之后（`hasAssistantStarted()` 为真），不恢复，直接当普通错误。文档："recovery never loops or replays partial side effects."
 
 ### 转换信号：TurnTransitionError
 
-名字叫 Error，实际是用来控制流程的信号。`runTurnAttempt` 在请求前压缩成功或流退出后溢出恢复成功时，通过 `Effect.die(new TurnTransitionError(...))` 将转换信号交给外层。`runTurn` 的 `catchDefect` 识别信号，选择再次调用自己或切换到 `runAfterOverflowCompaction`。这条路径跨过了普通的 `{ needsContinuation, step }` 返回值。
-两种转换：`ContinueAfterCompaction`（主动压缩完成）和 `ContinueAfterOverflowCompaction`（溢出后压缩完成），都带当前 `step`。
+名字叫 Error，其实是控制流程用的信号。请求前压缩成功，或者流退出后溢出恢复成功时，`runTurnAttempt` 用 `Effect.die(new TurnTransitionError(...))` 把信号抛给外层；`runTurn` 用 `catchDefect` 接住，决定是再调一次自己，还是转到 `runAfterOverflowCompaction`。这条路不走正常的 `{ needsContinuation, step }` 返回值。两种转换：`ContinueAfterCompaction`（主动压缩完成）和 `ContinueAfterOverflowCompaction`（溢出后压缩完成），都带当前 `step`。
 
 ### 压缩对象与预算
 
-`SessionCompaction` 集中实现图中的预算判断、摘要请求与压缩事件发布。`make({ events, llm, config })` 返回两个函数。
+图里的预算判断、摘要请求、发压缩事件都在 `SessionCompaction` 里。`make({ events, llm, config })` 返回两个函数。
 
 | 函数 / 常量 | 内容 |
 |---|---|
@@ -1505,7 +1616,7 @@ estimate({ system, messages, tools }) > context - max(generation.maxTokens ?? li
 
 ## 10. 事件提交：持久化、客户端同步与恢复
 
-前面的 publish 最终汇到这里。先看一次持久化事件的事务边界，再看投影对象和表结构；恢复能做什么，取决于这些边界已经提交了什么。
+前面所有的 publish 最后都走到这里。先看一个持久化事件是怎么在事务里写进去的，再看投影和表结构，最后看崩溃恢复：能恢复到什么程度，取决于崩溃前哪些东西已经提交了。
 
 ### 事件写库
 
@@ -1534,13 +1645,11 @@ sequenceDiagram
   EV-->>P: 带 durable.seq 的事件
 ```
 
-`event` 表是数据的来源，`session_message` 相当于缓存。两者在同一个事务里写入，所以不会出现事件写进去了、消息却没更新的情况。
-投影函数抛异常整个事务回滚，发布方拿到的是 defect。
+`event` 表是数据的来源，`session_message` 相当于缓存。两者在同一个事务里写入，所以不会出现事件写进去了、消息却没更新的情况。投影函数抛异常整个事务回滚，发布方拿到的是 defect。
 
 ### 事务内的投影：SessionProjector
 
-`SessionProjector` 负责把事件投影成表里的数据。它在 `EventV2` 上用 `events.project(定义, 函数)` 注册了 29 个投影函数，
-投影和事件写库在同一个事务里执行（`event.ts`）。
+`SessionProjector` 负责把事件投影成表里的数据。它在 `EventV2` 上用 `events.project(定义, 函数)` 注册了 29 个投影函数，投影和事件写库在同一个事务里执行（`event.ts`）。
 
 主要方法：
 
@@ -1552,13 +1661,11 @@ sequenceDiagram
 
 ### 同一份消息更新逻辑：SessionMessageUpdater
 
-`SessionMessageUpdater` 是一个纯函数 `update(adapter, event)`，对 33 种会话事件各写了一个 case，决定每个事件怎么修改消息。
-它不知道底下是 SQLite 还是内存数组：`memory(state)` 给了一个数组版适配器，前端也用它。
+`SessionMessageUpdater` 是一个纯函数 `update(adapter, event)`，对 33 种会话事件各写了一个 case，决定每个事件怎么改消息。它不知道底下是 SQLite 还是内存数组：`memory(state)` 给了一个数组版适配器，前端也用它。
 
 §6 列出了事件族与主要投影结果，这里补充两条消息更新规则：
 
-- `step.started`：先把上一条未完成的 assistant 标成 `completed`，再新建一条空 content 的 assistant。
-  `snapshot.start` 从事件里带过来。
+- `step.started`：先把上一条未完成的 assistant 标成 `completed`，再新建一条空 content 的 assistant，`snapshot.start` 从事件里带过来。
 - `tool.failed`：只有 `pending` 或 `running` 才转 `error`。已经 `completed` 的不动。
 
 ### 事件服务的接口
@@ -1575,7 +1682,7 @@ sequenceDiagram
 | `durable({ aggregateID, after })` | 返回一个流：先 `readAfter` 把库里 `seq > after` 的全读出来，再 `Stream.concat` 一个实时流，每次被唤醒就再读一次。叫醒信号是 `PubSub.sliding(1)`，连续提交合并 |
 | `replay` / `replayAll` / `claim` / `remove` | 跨节点同步用的。序号不连续、owner 不匹配都会 die |
 
-因为投影在事务里执行，事件写入和状态表更新要么都成功，要么都失败。`Prompted` 事件的投影（写 user 消息 + 标 promoted）也因此原子。
+因为投影在事务里执行，事件写入和状态表更新要么都成功，要么都失败。`Prompted` 的投影（写 user 消息 + 标 promoted）也是靠这个保证原子的。
 
 ### 持久化表结构
 
@@ -1647,40 +1754,31 @@ classDiagram
 | `session_context_epoch` | | `SessionContextEpoch.insert / replace / advance` | 一个会话一行。`baseline` 是发给模型的系统提示词原文，`snapshot` 是结构化快照用来比对。 |
 | `event` / `event_sequence` | `core/src/event/sql.ts` | `EventV2.commitDurableEvent`（`event.ts`） | `event_sequence` 存每个聚合（会话）的最新序号；写事件时在同一个事务里读序号、跑投影、写两张表。 |
 
-SQLite 连接在 `core/src/database/database.ts`：WAL 模式、`synchronous = NORMAL`、`busy_timeout = 5000`。
-库文件位置由 `path()` 决定，`OPENCODE_DB` 环境变量可以指到 `:memory:`。
+SQLite 连接在 `core/src/database/database.ts`：WAL 模式、`synchronous = NORMAL`、`busy_timeout = 5000`。库文件位置由 `path()` 决定，`OPENCODE_DB` 环境变量可以指到 `:memory:`。
 
 ### 客户端同步
 
-`session.events` 处理器（`server/src/handlers/session.ts`）返回 `session.events({ sessionID, after })` 的 SSE。
-底层 `EventV2.durable`（`event.ts`）：先一次性读 `seq > after` 的全部，再接一个流，每次被唤醒就再查一次。
-叫醒信号是容量 1 的 sliding PubSub，连续多次提交合并成一次查询。只有持久化事件会走这条流；`Text.Delta` 这类要另外订阅 `EventV2.subscribe`。
-文档："The first `sessions.events(...)` contract is durable-only during both replay and live tailing."
+`session.events` 处理器（`server/src/handlers/session.ts`）返回 `session.events({ sessionID, after })` 的 SSE。底层是 `EventV2.durable`（`event.ts`）：先一次性读出 `seq > after` 的全部事件，再接一个流，每次被叫醒就再查一次。叫醒信号是容量 1 的 sliding PubSub，连续多次提交会合并成一次查询。只有持久化事件走这条流，`Text.Delta` 这类要另外订阅 `EventV2.subscribe`。文档原话："The first `sessions.events(...)` contract is durable-only during both replay and live tailing."
 
 ### 崩溃恢复
 
-进程挂了，内存里什么都没了，库里有：`session_input`（哪些输入还没取出执行）、`session_message`（历史，包括 `running` 状态的工具）、`event`（全部事件）。
-重启后：
+进程挂了，内存里什么都没了，库里还有：`session_input`（哪些输入还没取出执行）、`session_message`（历史，包括 `running` 状态的工具）、`event`（全部事件）。重启后：
 
 1. 客户端调 `session.resume`（或再发一条 prompt）→ `coordinator.run`（force）或 `wake`。
 2. `run` 先检查 force 和待处理输入；确定需要执行后，`failInterruptedTools`（`llm.ts`）给上下文中所有 `pending` / `running` 的工具项发 `Tool.Failed("Tool execution interrupted")`。
 3. 进入循环，按 promotion 取出输入并重新准备请求；空队列的显式 resume 也可以从既有历史继续。
 
-文档里写明了还没做的部分："Post-crash continuation recovery is intentionally deferred. A wake does not infer that ambiguous provider work is safe to retry after an input has already been promoted."
-也就是说：输入已取出执行、请求已发出、进程挂了，重启后 `wake` 不会自动重发请求；要靠显式 `resume`。
+文档里写明了还没做的部分："Post-crash continuation recovery is intentionally deferred. A wake does not infer that ambiguous provider work is safe to retry after an input has already been promoted." 也就是说：输入已取出执行、请求已发出、进程挂了，重启后 `wake` 不会自动重发请求；要靠显式 `resume`。
 
 ### 中断
 
-`session.interrupt` → `coordinator.interrupt`（`run-coordinator.ts`）→ `Fiber.interrupt(owner)`。
-runner 的 `uninterruptibleMask` 保证中断只落在 `restore` 包住的地方：等 provider 流、等工具 fiber、等权限答复。
-收尾（`llm.ts`）把没结果的工具标 `Tool execution interrupted`，assistant 标 `Provider turn interrupted`。
-已入库的输入不会因此删除。下次 wake 会处理尚未 promoted 的输入；已经进入历史的输入能否续跑，仍需区分显式 resume 与普通 wake。
+`session.interrupt` → `coordinator.interrupt`（`run-coordinator.ts`）→ `Fiber.interrupt(owner)`。runner 的 `uninterruptibleMask` 保证中断只落在 `restore` 包住的地方：等 provider 流、等工具 fiber、等权限答复。收尾时（`llm.ts`）把没结果的工具标 `Tool execution interrupted`，assistant 标 `Provider turn interrupted`。已经入库的输入不会被删，下次 wake 会接着处理还没取出的输入；已经进了历史的那条要不要续跑，得看是显式 resume 还是普通 wake（见上面的崩溃恢复）。
 
 ---
 
 ## 11. 回看启动：这些服务怎样装配
 
-运行路径中的 SessionExecution、runner 和目录上下文都通过 Effect 服务取得。本段从 CLI 启动进入，解释为何 execution 是进程级、runner 是目录级，以及接口在哪里替换成 local 实现。
+前面用到的 SessionExecution、runner、目录上下文，都是通过 Effect 服务拿到的。这一节从 CLI 启动开始看：为什么 execution 是进程级的、runner 是目录级的，以及 `SessionExecution` 接口是在哪换成 local 实现的。
 
 ```mermaid
 sequenceDiagram
@@ -1725,13 +1823,13 @@ sequenceDiagram
 | 6 | `core/src/location-services.ts` | 目录服务懒建 |
 | 7 | `server/src/middleware/session-location.ts` | 每个会话请求进来先查目录再 provide |
 
-server 启动时先构建 global 服务；某个 Location 首次被使用时，才会构建它对应的 location 服务，包括工具注册和 runner。
+server 启动时只建 global 服务；某个 Location 第一次被用到时，才去建它的 location 服务，工具注册和 runner 都是这时候建的。
 
-### 先用两个目录看这套机制在做什么
+### 先用两个目录举个例子
 
-假设 server 同时处理 `/repo-a` 和 `/repo-b`。它们使用同一个 `Database`，但有各自的 `ToolRegistry`：A 注册的工具不能跑到 B 的注册表里。
+假设 server 同时在处理 `/repo-a` 和 `/repo-b`。两者共用一个 `Database`，但各有各的 `ToolRegistry`，A 注册的工具不能跑到 B 的注册表里去。
 
-如果用普通 JavaScript 手动组织，大致会写成下面这样。这里只演示对象关系，不是 OpenCode 的实际代码：
+如果用普通 JavaScript 手写，大概是这样（只是示意对象关系，不是 OpenCode 的代码）：
 
 ```js
 const database = createDatabase()
@@ -1754,9 +1852,9 @@ handleRequest(servicesA) // 使用 A 的 ToolRegistry
 handleRequest(servicesB) // 使用 B 的 ToolRegistry
 ```
 
-**OpenCode 也是先选好一组对象，再让处理请求的代码使用它们。** Effect 帮它传递这些对象，不用每层函数都手动接收 `services` 参数。这就是这里的依赖注入（DI）。
+OpenCode 做的也是这件事：先选好一组对象，再让处理请求的代码去用。区别是 Effect 帮它把这组对象一层层传下去，不用每个函数都加一个 `services` 参数。这就是这里说的依赖注入（DI）。
 
-### `Service`：代码怎样取得这些对象
+### `Service`：代码怎么拿到这些对象
 
 上面的 `services.tools`，在 Effect 中写成：
 
@@ -1764,9 +1862,9 @@ handleRequest(servicesB) // 使用 B 的 ToolRegistry
 const tools = yield* ToolRegistry.Service
 ```
 
-`ToolRegistry.Service` 是取对象用的 key。外层提供 A 的对象，这里拿到 A；外层提供 B 的对象，这里拿到 B。Effect 把保存这组对象的地方叫作 `Context`。
+`ToolRegistry.Service` 是取对象用的 key。外层提供 A 的对象，这里拿到 A；外层提供 B 的对象，这里拿到 B。Effect 把存这组对象的地方叫 `Context`。
 
-外层通过 `Effect.provide` 指定使用哪一组：
+外层用 `Effect.provide` 指定用哪一组：
 
 ```ts
 const program = Effect.gen(function* () {
@@ -1781,13 +1879,13 @@ program.pipe(Effect.provide(locations.get(refA)))
 program.pipe(Effect.provide(locations.get(refB)))
 ```
 
-`locations` 是 `LocationServiceMap` 的实例，负责按 Location 找到对应的服务。真实请求里，外层先从 `session` 查出 `session.location`，再选择那一组对象；`ToolRegistry` 自己不需要判断当前请求属于哪个目录。
+`locations` 是 `LocationServiceMap` 的实例，按 Location 找对应的那组服务。真实请求里，外层先从 `session` 表查出 `session.location`，再选那一组；`ToolRegistry` 自己完全不用管当前请求是哪个目录的。
 
-### `Layer` 和 `LayerNode`：这些对象怎样创建
+### `Layer` 和 `LayerNode`：这些对象怎么创建
 
-前面的示意代码直接调用了 `createToolRegistry()`。在 OpenCode 中，创建逻辑写在 `Layer` 里：先取得 `ApplicationTools`、`ToolOutputStore` 等依赖，再创建注册表和 `register`、`materialize` 方法。
+前面的示意代码直接调了 `createToolRegistry()`。OpenCode 里创建逻辑写在 `Layer` 里：先拿到 `ApplicationTools`、`ToolOutputStore` 这些依赖，再创建注册表和 `register`、`materialize` 方法。
 
-具体怎么使用 Layer？下面用一个只有 `list()` 方法的 `DemoTools` 演示完整过程。它是教学示例，不是 OpenCode 的真实 `ToolRegistry`。
+Layer 具体怎么用？下面拿一个只有 `list()` 方法的 `DemoTools` 走一遍完整过程（演示用的，不是 OpenCode 的 `ToolRegistry`）。
 
 ```ts
 import { Context, Effect, Layer } from "effect"
@@ -1820,11 +1918,11 @@ const result = await Effect.runPromise(
 // result: ["read", "bash"]
 ```
 
-运行到第三步时，Effect 执行 `toolsLayer` 中的创建逻辑，得到 `{ list: ... }` 对象，把它放到 `DemoTools` 这个 key 下，然后运行 `program`。所以 `yield* DemoTools` 能拿到刚才创建的对象。
+跑到第 ③ 步时，Effect 才去执行 `toolsLayer` 里的创建逻辑，得到 `{ list: ... }` 对象，放到 `DemoTools` 这个 key 下，再运行 `program`，所以 `yield* DemoTools` 能拿到刚创建的对象。
 
-注意三个动作的区别：`Layer.effect` **定义创建逻辑**；`Effect.provide(toolsLayer)` **把这份创建逻辑接给 program**；`Effect.runPromise` **开始执行，触发对象创建和 program 运行**。前两步只是组合代码，还没有执行 `names` 的初始化。
+这三步要分清楚：`Layer.effect` 是定义怎么创建；`Effect.provide(toolsLayer)` 是把这份创建逻辑接到 program 上；`Effect.runPromise` 才是真正开始跑，这时才创建对象、运行 program。前两步只是在拼代码，`names` 还没初始化。
 
-实际的 `ToolRegistry` 也是这个用法，只是创建逻辑更长，而且要先拿到 `ApplicationTools` 和 `ToolOutputStore`。这些依赖的 Layer 可以先接到它的 Layer 上，写法示意如下：
+真实的 `ToolRegistry` 也是这么用，只是创建逻辑长一些，而且得先有 `ApplicationTools` 和 `ToolOutputStore`。依赖的 Layer 可以先接到它的 Layer 上，大概这么写：
 
 ```ts
 const readyLayer = registryLayer.pipe(
@@ -1835,11 +1933,11 @@ const readyLayer = registryLayer.pipe(
 const runnable = program.pipe(Effect.provide(readyLayer))
 ```
 
-这里 `dependencyLayers` 表示已经准备好的依赖 Layer，`program` 表示使用 `ToolRegistry.Service` 的业务 Effect。`Layer.provide` 给创建过程提供依赖，`Effect.provide` 给业务代码提供服务。
+`dependencyLayers` 是准备好的依赖 Layer，`program` 是用到 `ToolRegistry.Service` 的业务代码。`Layer.provide` 是给创建过程喂依赖，`Effect.provide` 是给业务代码提供服务。
 
-**上面显式提供依赖的操作，是 Effect 的 Layer 使用方式，不是 OpenCode 额外要求业务代码做的事情。** Effect 提供服务读取、依赖类型检查、实例构建和资源释放，但原生 Layer 不会像自动装配的 DI 容器那样，根据服务类型自动寻找并连接对应的实现。即使类型已经说明 `ToolRegistry` 需要 `ApplicationTools.Service`，应用仍要指定由哪个 Layer 提供它，并通过 `provide` 等组合操作接起来。这些连接通常集中在装配入口，不需要每个业务函数都写一遍。
+上面这种手动 provide 依赖的写法，是 Effect 的 Layer 本来的用法，不是 OpenCode 额外加的要求。Effect 管服务读取、依赖的类型检查、实例构建和资源释放，但原生的 Layer 不像那种自动装配的 DI 容器，会按类型自己去找实现接上。就算类型上已经写明 `ToolRegistry` 需要 `ApplicationTools.Service`，应用还是得指定由哪个 Layer 来提供，再用 `provide` 这类操作接起来。好在这些连接一般都集中在装配入口，不用每个业务函数都写一遍。
 
-OpenCode 为了减少这种手动组合，额外实现了 `LayerNode`：各模块在 `deps` 中声明直接依赖，`LayerNode.compile` 统一生成相应的 `Layer.provide` 连接。**依赖关系仍需显式声明，省掉的是各处手写 Layer 组合的代码。** 例如 `ToolRegistry.node`：
+为了少写这些手动组合，OpenCode 自己加了一个 `LayerNode`：每个模块在 `deps` 里声明自己直接依赖谁，`LayerNode.compile` 统一生成对应的 `Layer.provide`。依赖还是要显式声明，省掉的只是到处手写 Layer 组合的代码。比如 `ToolRegistry.node`：
 
 ```ts
 export const node = makeLocationNode({
@@ -1849,17 +1947,17 @@ export const node = makeLocationNode({
 })
 ```
 
-这段声明只表达三件事：
+这段声明就说了三件事：
 
 - `service`：创建好的对象通过哪个 key 提供给业务代码。
 - `layer`：用哪份创建逻辑。
 - `deps`：创建前需要准备哪些依赖。
 
-外面的 `makeLocationNode` 再说明：这个服务要按 Location 分别创建。如果用 `makeGlobalNode`，则是在这套 server 装配中共享的服务。
+外面套的 `makeLocationNode` 表示这个服务要按 Location 各建一份；换成 `makeGlobalNode` 就是整个 server 共享一份。
 
-所以 **`LayerNode` 是一条装配记录，保存 Layer、依赖关系和 global / location 标记**。它不是服务实例。`LayerNode.compile` 沿着 `deps` 把各个 Layer 接好，之后交给 Effect 创建对象。
+所以 `LayerNode` 只是一条装配记录，存着 Layer、依赖关系和 global / location 标记，它本身不是服务实例。`LayerNode.compile` 顺着 `deps` 把各个 Layer 接好，剩下的交给 Effect 去创建对象。
 
-可以直接对照前面的普通 JavaScript：
+和前面的普通 JavaScript 对照一下：
 
 | 普通 JavaScript 中的工作 | 这里由谁负责 |
 |---|---|
@@ -1872,7 +1970,7 @@ export const node = makeLocationNode({
 
 `Database`、`EventV2` 等 global 服务在这套 server 中共享；`Config`、`ToolRegistry`、`Watcher`、`SessionRunner` 等 location 服务按 Location 分开。
 
-`LocationServiceMap` 管理每个 Location 的那一组对象，可以先把它理解成下面这张表：
+`LocationServiceMap` 管着每个 Location 的那组对象，可以先把它想成这样一张表：
 
 ```text
 LocationServiceMap
@@ -1882,23 +1980,23 @@ LocationServiceMap
 两组服务共用 Database、EventV2 等 global 依赖。
 ```
 
-这里的 key 是 `Location.Ref`，包含 `directory` 和可选的 `workspaceID`。同一个 Ref 下的多个 session 使用同一组服务，不会每个 session 都新建一个 `ToolRegistry`。
+key 是 `Location.Ref`，里面有 `directory` 和可选的 `workspaceID`。同一个 Ref 下的多个 session 共用一组服务，不会每个 session 都建一个 `ToolRegistry`。
 
-它的生命周期按下面的顺序发生：
+生命周期是这样的：
 
-1. **server 启动：**先创建 global 服务，包括 `LocationServiceMap`。此时不必创建 A、B 的 location 服务。
-2. **A 第一次被使用：**创建 A 的服务并保存下来。创建时只为 A 新建 location 部分，global 依赖继续共享。
-3. **A 再次被使用：**取出已有对象；B 第一次被使用时，另建 B 的对象。
-4. **A 暂时没人使用：**保留这组对象，方便后续请求复用。持续闲置 60 分钟后才释放；仍有人使用时不按这个闲置期限回收。
-5. **释放后再次使用 A：**重新创建 A 的服务。
+1. **server 启动：**先建 global 服务，包括 `LocationServiceMap`。这时还不用建 A、B 的 location 服务。
+2. **A 第一次被用到：**建 A 的服务并存下来。只为 A 新建 location 那部分，global 依赖还是共享的。
+3. **A 再次被用到：**直接取已有的；B 第一次被用到时，另建一份 B 的。
+4. **A 暂时没人用：**先留着，后面的请求还能复用。连续闲置 60 分钟才释放；还有人在用就不会回收。
+5. **释放后又用到 A：**重新建一份。
 
-代码在 `core/src/location-services.ts` 的 `buildLocationServiceMap` 中实现这套规则：`LayerMap` 负责按 Ref 缓存和闲置回收；`hoist` 分离 global 依赖，`Layer.fresh` 让每个 Location 创建自己的 location 对象。
+代码在 `core/src/location-services.ts` 的 `buildLocationServiceMap`：`LayerMap` 按 Ref 缓存、闲置回收；`hoist` 把 global 依赖拎出来共享，`Layer.fresh` 让每个 Location 建自己的一份 location 对象。
 
-释放服务时，也要关闭它持有的资源。例如 `Watcher` 创建文件监听时登记一个清理函数，释放时执行 `unsubscribe()`。Effect 用 `Scope` 统一管理这些清理函数；管理整张 `LayerMap` 的 Scope 关闭时，也会释放它管理的资源。
+服务释放时还得把它占着的资源关掉。比如 `Watcher` 建文件监听时登记了一个清理函数，释放时执行 `unsubscribe()`。这些清理函数由 Effect 的 `Scope` 统一管，整张 `LayerMap` 所在的 Scope 关闭时，里面的资源也会一起释放。
 
-### 接回一次 session 的执行
+### 回到一次 session 的执行
 
-有了上面的对象关系，再看实际调用就只剩三步：
+有了上面这些，再看实际调用就简单了：
 
 ```text
 SessionExecutionLocal 收到 sessionID
@@ -1915,33 +2013,30 @@ SessionRunner.Service.use((runner) => runner.run({ sessionID, force })).pipe(
 )
 ```
 
-读这段时，可以先看下面一行：`provide` 根据 `session.location` 提供对象；再看上面一行：`Service.use` 取得其中的 `SessionRunner`，调用 `run`。
+这段倒着读比较好懂：先看下面一行，`provide` 按 `session.location` 提供那一组服务；再看上面一行，`Service.use` 从中拿到 `SessionRunner`，调它的 `run`。
 
-`SessionExecutionLocal` 自身是 global 服务，但它没有固定保存 A 或 B 的 runner。每次执行时根据 session 选择，所以一个执行器可以处理多个 Location。
+`SessionExecutionLocal` 本身是 global 服务，手里并没有固定哪个目录的 runner，每次执行时按 session 现选，所以一个执行器能处理多个 Location。
 
 ### server 装配
 
 `applicationServices` 是进程级组：Database、EventV2、httpClient、ToolOutputStore.cleanupNode、SessionV2、PermissionSaved、PtyTicket、Credential、PtyEnvironment、LocationServiceMap。
 
-`makeRoutes`：`AppNodeBuilder.build(applicationServices, [[SessionExecution.node, SessionExecutionLocal.node]])`，
-v2 的执行器就是在这一行接进来的。`AppNodeBuilder.build`（`app-node-builder.ts`）发现图里有未绑定的 `LocationServiceMap.node` 就自动用 `buildLocationServiceMap` 补上。
+`makeRoutes`：`AppNodeBuilder.build(applicationServices, [[SessionExecution.node, SessionExecutionLocal.node]])`，v2 的执行器就是在这一行接进来的。`AppNodeBuilder.build`（`app-node-builder.ts`）发现图里有未绑定的 `LocationServiceMap.node` 就自动用 `buildLocationServiceMap` 补上。
 
-两个中间件决定请求在哪个目录下执行：`sessionLocationLayer`（`server/src/middleware/session-location.ts`）从路径里的 `sessionID` 查 `session` 表拿目录；
-`locationLayer`（`server/src/location.ts`）从 query `location[directory]` 或 header `x-opencode-directory` 拿，默认 `process.cwd()`。
+两个中间件决定请求在哪个目录下执行：`sessionLocationLayer`（`server/src/middleware/session-location.ts`）从路径里的 `sessionID` 查 `session` 表拿目录；`locationLayer`（`server/src/location.ts`）从 query `location[directory]` 或 header `x-opencode-directory` 拿，默认 `process.cwd()`。
 
-### 本地执行实现怎样绑定到接口
+### 本地执行实现怎么绑到接口上
 
 `SessionExecutionLocal` 负责根据会话 id 找到会话所在目录的 runner。文件头注释：*"Current-process routing for implicit-local Locations. Future remote placement belongs here."*
 
-它不是在收到 `wake` 时临时创建协调器。`SessionExecutionLocal` 的 layer 初始化时先取出全局的 `SessionStore` 和 `LocationServiceMap`，
-然后立刻调用 `SessionRunCoordinator.make({ drain })` 创建一个进程内协调器。这里传入的 `drain(sessionID, force)` 是 local 定义的闭包：
+协调器不是收到 `wake` 时才临时建的。`SessionExecutionLocal` 的 layer 初始化时，先拿到全局的 `SessionStore` 和 `LocationServiceMap`，接着就调 `SessionRunCoordinator.make({ drain })` 建好一个进程内的协调器。传进去的 `drain(sessionID, force)` 是 local 自己定义的闭包：
 
 1. 用 `SessionStore.get(sessionID)` 查出会话，拿到它的 `location`。
 2. 用 `locations.get(session.location)` 取出该目录的 Effect layer。
 3. 把这层目录服务 `provide` 给 `SessionRunner.Service.use(...)`，再调用 `runner.run({ sessionID, force })`。
 4. 非中断错误先记日志，再原样返回给协调器处理。
 
-`make()` 返回协调器后，local 用它组装出真正注册到 `SessionExecution.Service` token 下的对象：
+拿到协调器后，local 用它拼出真正注册到 `SessionExecution.Service` 下的对象：
 
 ```ts
 SessionExecution.Service.of({
@@ -1952,13 +2047,11 @@ SessionExecution.Service.of({
 })
 ```
 
-所以运行时没有一层额外的 `SessionExecutionLocal.wake()` 转发：`SessionV2` 拿到的 `execution.wake` 本身就是这个协调器的 `wake` 函数。
-反过来，协调器的 `start()` 最终执行的 `options.drain(key, force)`，就是创建协调器时由 local 传进去的那个闭包。
-两者由此形成闭环：local 把并发调度交给 Coordinator，Coordinator 需要真正排空会话时再回调 local；local 再负责按 location 找到 `SessionRunner`。
+所以运行时并没有一层 `SessionExecutionLocal.wake()` 在中间转发，`SessionV2` 拿到的 `execution.wake` 就是协调器的 `wake`。反过来，协调器 `start()` 里调的 `options.drain(key, force)`，就是 local 建协调器时传进去的那个闭包。绕了一圈：local 把并发调度交给 Coordinator，Coordinator 要真正排空会话时再回调 local，由 local 按 location 找到 `SessionRunner`。
 
 ### 会话门面的其他入口
 
-`SessionV2.Service` 是 HTTP 处理器调用的会话接口，只负责查询、写库和唤醒执行器，自己不跑循环。
+`SessionV2.Service` 是 HTTP 处理器调的会话接口，只管查询、写库、叫醒执行器，自己不跑循环。
 
 它本身没有状态，构造时取六个依赖：`Database`、`EventV2`、`ProjectV2`、`SessionExecution`、`SessionStore`、`LocationServiceMap`。
 
