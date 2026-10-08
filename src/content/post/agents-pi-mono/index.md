@@ -30,6 +30,7 @@ graph LR
 | `@earendil-works/pi-coding-agent` | `packages/coding-agent` | 交互式 CLI 产品：会话、扩展、压缩、重试、三种模式 | §4、§6–§12 |
 | `@earendil-works/pi-codemode` / `pi-mcp` | `packages/codemode`、`packages/mcp` | 让模型写 JS 脚本批量调工具；MCP 客户端。coding-agent 用它们做了两个内置扩展 | §4.4 |
 | `@earendil-works/pi-durable` | `packages/durable` | 把会话、模型调用、工具调用都先写进存储再往下走的 harness，进程死了能接着跑。还是实验性的 | §13 |
+| `@earendil-works/chord` | `packages/chord` | 插件、服务、跨进程可复制状态的底层运行时，不依赖任何 pi 包 | §14 |
 
 `pi-ai`封装了对各个模型厂商的调用，`pi-agent-core`是Agent最核心的事件循环逻辑，是我们需要重点学习的部分，`pi-coding-agent`是基于core封装的完整产品。如果我们想要做自己的 Coding Agent，那么就可以使用 `pi-ai` 和 `pi-agent-core`。
 
@@ -2006,7 +2007,182 @@ sequenceDiagram
 
 ---
 
-## 14. 可以借鉴的设计与不足
+## 14. chord：插件、服务和可复制状态（实验）
+
+`@earendil-works/chord`（`packages/chord`，约 8800 行）是 pi 仓库里一个独立的底层包。它的 README 开头就说明：它在 pi 仓库里开发，但**不是 pi 的一部分**，不依赖任何其他 pi 包。它给自己的定位是“应用组装运行时”。
+
+它要解决的问题是：一个功能常常要拆到好几个进程里跑。比如一个插件，一部分在后台 agent 进程里调模型、改文件，一部分在终端界面里画状态，还有一部分将来可能在网页里。chord 提供一套通用机制，让同一个插件可以拆成几块，分别加载到该去的进程里，几块之间像调本地服务一样互相调用，状态自动同步。
+
+现在用到它的是 `pi-durable`（§13）和 coding-agent 的实验性 client/server 架构，主产品 `pi` 命令不用。
+
+### 14.1 五个概念
+
+| 概念 | 是什么 |
+|---|---|
+| Service | 一个带类型的服务标识，`defineService<T>("pi.transcript")`。分单例（一个提供者）和 keyed（按 key 有多个实例）两种。标成 `local` 的只在本进程用，否则可以暴露给其他进程 |
+| Facet | 插件里能单独加载的一块。`setup(env)` 里同步声明：我提供什么服务（`provide` / `provideMany`）、我要用什么服务（`use` / `observe`） |
+| FacetHost | 一个进程里装载 facet 的宿主。所有 facet 声明完后，校验整张依赖图，按“提供者先于使用者”的顺序激活，关闭时倒序释放 |
+| Replicated state | 一份有唯一权威来源的状态。提供者用 `change(context, draft => {...})` 改，一次回调就是一个原子修订；本地和远端的订阅者拿到的都是完整的不可变值 |
+| Context | 类似 Go 的 `context`：带取消信号，也能携带调用范围内的值。chord 里所有异步调用都显式传它 |
+
+```mermaid
+classDiagram
+  class Service~T~ {
+    id: string
+    local: boolean
+  }
+  class Facet {
+    id: string
+    setup(env)
+  }
+  class FacetEnvironment {
+    +use(service) T
+    +observe(service, handler)
+    +provide(service, implementation)
+    +provideMany(service) ServiceSpawner
+    +replicatedState(initial) MutableReplicatedState
+    +own(disposal)
+    +onActivate(callback) / onDeactivate(callback)
+  }
+  class FacetHost {
+    services: RemoteServiceProvider
+    +reload(facets)
+    +dispose()
+  }
+  class ServiceSpawner~T~ {
+    +spawn(key, implementation) close
+  }
+  class ReplicatedState~T~ {
+    value: T
+    +subscribe(listener) unsubscribe
+  }
+  class MutableReplicatedState~T~ {
+    +change(context, mutate)
+    +replace(context, value)
+  }
+  class RemoteServiceSource {
+    +catalogue(context)
+    +open(services) RemoteServices
+  }
+  Facet ..> FacetEnvironment : setup 时拿到
+  FacetHost o-- Facet
+  FacetEnvironment ..> ServiceSpawner : provideMany 返回
+  FacetEnvironment ..> MutableReplicatedState : replicatedState 返回
+  ReplicatedState <|-- MutableReplicatedState
+  FacetHost ..> RemoteServiceSource : 解析其他进程提供的服务
+```
+
+一个服务的接口里只能有两种成员：返回 Promise、最后一个参数是 `Context` 的方法，以及 `ReplicatedState`。参数、返回值、状态都必须是严格的 JSON。这个约束在类型层面检查（`RemoteServiceContract<T>`），因为这些东西随时可能要跨进程传。
+
+### 14.2 一个例子：实验性的 pi server / client
+
+`coding-agent/src/experimental/services/` 用 chord 把 pi 拆成了三个部分：
+
+| 范围 | 跑在哪 | 提供的服务 |
+|---|---|---|
+| server | 常驻的服务进程 | `SessionDirectory`（会话列表，可复制状态）、`SessionManagement`（建、删、连接会话）、`PresentationPlugins` |
+| session | 每个会话一个 worker 进程，里面跑 durable 的 Harness | `AgentController`（提问、插话、排队、中断、压缩）、`Transcript`（对话视图，可复制状态）、`Models`、`SessionPlugins` |
+| presentation | 终端界面进程 | `SlashCommands`、`PresentationUI`，都标成 local，只在本进程用 |
+
+服务的定义就是一个接口加一个标识：
+
+```ts
+// experimental/services/transcript.ts
+export interface Transcript {
+  readonly state: ReplicatedState<ConversationView>;
+}
+export const Transcript = defineService<Transcript>("pi.transcript");
+```
+
+session worker 里提供它的 facet 只有几行，状态直接用 durable 的 `conversation.viewState()`：
+
+```ts
+// experimental/services/transcript-provider.ts
+export async function createTranscriptServiceFacet(conversation: Conversation, context: Context): Promise<Facet> {
+  const state = await conversation.viewState(context);
+  return defineFacet({
+    id: "@pi/transcript",
+    setup(env) {
+      env.own(() => state.dispose());
+      env.provide(Transcript, { state });
+    },
+  });
+}
+```
+
+`AgentController` 是一组方法：`prompt`、`steer`、`followUp`、`cancelQueued`、`abort`、`compact`、`waitForPrompt`，每个都是 `(请求, context) => Promise<JSON 结果>`。
+
+终端界面那边的 facet 只写 `env.use(Transcript)`、`env.use(AgentController)`，不用关心这两个服务在哪个进程。宿主会去连上的 server 和 session 那里找；连接建立前，拿到的句柄处于“未连接”状态，连上之后自动接通。
+
+```mermaid
+sequenceDiagram
+  participant TUI as 终端界面 facet
+  participant CH as chord（两端的宿主和传输）
+  participant W as session worker
+  participant H as durable Harness
+
+  TUI->>CH: env.use(Transcript)、env.use(AgentController)
+  CH->>W: 订阅 pi.transcript
+  W-->>CH: 当前 ConversationView 完整快照
+  CH-->>TUI: 状态就绪，渲染
+  TUI->>CH: agentController.prompt({ message }, context)
+  CH->>W: 一次远程调用
+  W->>H: conversation.submit(...)
+  loop 每次 durable 提交
+    H->>W: viewState 发布一个原子修订（一批精确操作）
+    W->>CH: 按这个订阅自己的路径字典编码增量
+    CH-->>TUI: 应用增量，得到新的完整不可变值
+  end
+```
+
+README 里特别提到：durable 每次提交都直接发布精确的操作，worker 自己不用写任何 reducer；界面拿到的副本、补齐、序号、断档检测全由 chord 负责。
+
+### 14.3 增量同步
+
+可复制状态能高效同步，靠的是 `@earendil-works/chord/delta` 里的增量跟踪器（`delta/tracker.ts`，2200 多行）：
+
+```ts
+import { applyImmutable, track } from "@earendil-works/chord/delta";
+
+const tracker = track({ output: "", count: 0 });
+const change = tracker.beginChange();
+change.state.output += "done\n";      // 在草稿上像改普通对象一样改
+change.state.count += 1;
+const prepared = change.prepare();     // 得到新的不可变值 + 一批操作
+tracker.adopt(prepared);
+const replica = applyImmutable(prepared.base, prepared.ops);   // 另一端按操作重放
+```
+
+记录下来的操作是有语义的：字符串的追加和从头截断、数组的插入删除和重排、设值、删除。模型流式输出时，`output` 字段每次只多一小段，传过去的就只是“追加这一段”，而不是整个字符串。改动太多时会合并成一次整体替换。
+
+几条约定：
+
+- 不可变：已发布的值不能再改，未改动的子树在前后修订之间共享。
+- 有界：每个订阅最多排队 100 个待发修订；再多就把整个队列换成一次完整快照（reset），订阅者先处理 reset 再接着收增量。
+- 远端断线或提供者被替换时，副本变成“未就绪”，重新同步后才恢复。
+
+### 14.4 热重载
+
+`FacetHost.reload(facets)` 先激活新一代的 facet，校验通过后再切换。对单例服务来说，使用者手里的句柄在切换过程中一直可用，不会断开。实验性 TUI 里的 `/reload` 就是这么做的：重新打包插件，加载新一代，切过去，再释放旧的。
+
+chord 还自带打包和加载工具：`@earendil-works/chord/bundler` 用 esbuild 把插件的每个 facet 入口（约定是 `src/session.ts`、`src/tui.ts` 这样）打成独立的 CommonJS 文件，并生成一个清单；`@earendil-works/chord/node` 的加载器校验 SHA-256 后用 `node:vm` 执行，不进 Node 的模块缓存，所以旧一代可以被垃圾回收。
+
+### 14.5 和其他几家的对比
+
+opencode 和 kimi-code 也都有自己的服务装配机制，但侧重点不同：
+
+| | pi 的 chord | opencode v2 | kimi-code |
+|---|---|---|---|
+| 依赖注入 | facet 声明提供 / 使用，宿主校验依赖图 | Effect 的 Layer + 自己的 `LayerNode` 图 | VS Code 风格的 `createDecorator` / `InstantiationService` |
+| 层级 | 没有固定层级；按进程分（server / session / presentation） | 进程级 / 目录级两级 | App / Session / Agent 三级子容器 |
+| 按 key 的实例 | keyed 服务，由提供者主动 `spawn(key, 实现)`；同一个 key 不能重复建 | 目录级服务由 `LayerMap` 按目录懒建并缓存 | 工作区由 `WorkspaceInstanceManager.getOrCreate` 缓存 |
+| 跨进程 | 核心能力：服务远程调用，状态以增量复制 | 不在装配机制里，靠 HTTP 接口加事件流 | 不在装配机制里，靠 wire 协议 |
+
+chord 最有特点的是最后一行：把“跨进程”放进了服务模型本身，一个服务在本进程还是在另一个进程，对使用者是透明的。代价是接口必须是严格 JSON，所有调用都是异步的。
+
+---
+
+## 15. 可以借鉴的设计与不足
 
 ### 可以借鉴的设计
 
