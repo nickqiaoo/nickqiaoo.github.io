@@ -226,7 +226,11 @@ turn_input 路由（StartOrSteer/StartIfIdle/Steer）、ActiveTurn/TurnState/Tas
 
 还没做（4.2 遗留项照旧）：AgentControl 重构详述、预热、扩展钩子、Guardian。另外这一轮还有一些新东西没写：world-state 快照随渲染上下文一起持久化、prediction fork、删除只带部分历史的子 agent fork（#51329）、turn lineage。
 
-## 5. kimi-code（暂无文章，供参考）
+## 5. kimi-code（2026-10-08 已写：`agents-kimi-code/index.md`，seriesOrder 4）
+
+按 `21406fb4c`（2026-09-30，应用 2.1.1）写成，以 study-notes 的 A4 走读为底稿，关键名字逐个对照过当前代码。结构：包结构 → DI 三级作用域与 WorkspaceInstanceManager → 四台状态机 → agent 装配 → AgentLoopService 适配层 → 一次 prompt（步闸门、请求字段、事件翻译、轮次判定）→ 工具（攒批、执行器、权限 13 条、插话信号）→ 插话时序 → 五层失败处理与压缩 → wire.jsonl 持久化与撤销 → 设计取舍 → 四家对照。10 张 mermaid 图已校验。
+
+以下为写文章前的旧记录，供参考。
 
 版本从 0.43 升到 2.1.1。2.0.0 只是因为新增了 `/desktop`（#3849），不是架构变更。
 
