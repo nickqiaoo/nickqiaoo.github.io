@@ -1,6 +1,7 @@
 ---
 title: "codex 源码解析"
 description: ""
+updatedDate: "2026-10-08"
 publishDate: "2026-09-11"
 tags: ["codex", "agent"]
 series: agents

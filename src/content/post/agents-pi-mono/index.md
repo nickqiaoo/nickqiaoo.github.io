@@ -1,6 +1,7 @@
 ---
 title: "pi-agent 源码解析"
 description: ""
+updatedDate: "2026-10-08"
 publishDate: "2026-09-13"
 tags: ["pi", "agent"]
 series: agents
