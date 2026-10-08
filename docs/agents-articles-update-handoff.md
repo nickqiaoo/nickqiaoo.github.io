@@ -156,6 +156,19 @@ v2 的 `core/src` 约 6.4 万行（旧文章写的是约 3.3 万行）。设计�
 
 ---
 
+### 3.4 进度（2026-10-08，对照 `7a2647f32a..1cedd3272`）
+
+§3.1 的 12 条和 §3.2 的大部分已改完，另外处理了 09-28 之后的新变化：
+- 新增 §2.5“提示词和工具也写进对话记录”（system 消息、段落补丁、`declareToolChanges`、`resolveTranscript`、`prepareRequest` 从会话投影上下文）。
+- §3 核心层：`finishTurn` 取代 `shouldStopAfterTurn`，新增 `prepareRequest`、`runToolCall`；runLoop 伪代码重写。
+- §4 产品层：AgentSession 字段与方法、SessionManager（`context_edit`、`usage`、投影、`_hasConversation`）、扩展系统（41 个事件、`pi.on` 返回取消函数、`turn_end` / `agent_before_settle` 边界、`context_with_system`、`user_bash` 出错即拦截、jiti 按需加载）、§4.4 新增工具暴露方式和四个内置扩展（codemode / tool-search / mcp / llama.cpp）。
+- §5：42 家服务商（41 家聊天 + typesafe 分类），协议表重算；模型分 chat / image / classifier 三类；Anthropic 模块的中途 system 消息。
+- §6–§12：装配顺序、prompt 流程、重试改为 `context_edit`、压缩判定、会话树投影、全屏 TUI、RPC 的 `disposition`。
+- §13 整节重写为 `pi-durable`（原 harness 已在 `7fd478a2e` 删除）。
+- §14 两张表更新。
+
+没写的：durable 的 chord 细节、`pi-env`、`pi-client` / `pi-server` / `pi-protocol`、虚拟模型路由只提了一句、CacheWarmer 只在 §6 带过。
+
 ## 4. codex：逐条修改 + 补充
 
 > **进度（2026-09-28）**：4.1 已全部改完，4.2 中的第 1、3 条已补上（§11 新增"即时打断"小节，§13 改写了恢复流程），第 2 条只改了 `agent_control` 那一行。**还没做的**：4.2 的第 2 条（AgentControl 重构详述）、第 4 条（预热）、第 5 条（扩展钩子）、第 6 条（中途换环境只在 §5 表格里提了一句）、第 7 条（Guardian）、第 8 条（小项）。另外核对时发现 `ResponseEvent` 实际是 17 种（下文写的 16 有误，文章已改为 17）。
