@@ -1,13 +1,14 @@
 ---
 title: "kimi-code 源码解析"
 description: ""
+updatedDate: "2026-10-16"
 publishDate: "2026-10-08"
 tags: ["kimi", "agent"]
 series: agents
 seriesOrder: 4
 ---
 
-> 对照的是 MoonshotAI/kimi-code 的 `21406fb4c`（2026-09-30，应用版本 2.1.1）。源码路径省略前缀 `packages/agent-core-v2/src/`，比如 `agent/loop/loopService.ts` 指 `packages/agent-core-v2/src/agent/loop/loopService.ts`。
+> 对照的是 MoonshotAI/kimi-code 的 `18c6d6427`（2026-10-16，应用版本 2.2.0）。初版对照的是 `21406fb4c`（09-30，2.1.1），10-16 核对了之后的 42 个提交：循环、状态机、上下文内存、持久化这些主干没有改动，新增的是外部变更通知（§6.5），另有权限开关（§7.4）、MCP 工具按需加载的默认值（§6.3）几处小改动，变化最大的 tower 功能本文没有展开。源码路径省略前缀 `packages/agent-core-v2/src/`，比如 `agent/loop/loopService.ts` 指 `packages/agent-core-v2/src/agent/loop/loopService.ts`。
 >
 > 有两点先说明。一是 `agent-core-v2`、`kap-server`、`transcript` 三个包不允许写注释，JSDoc 也不行，lint 里的 `scripts/check-no-comments.mjs` 会检查。设计说明只能去 `packages/agent-core-v2/docs/zh/` 下找：`llm.md` 讲 LLM 请求库的设计原则，`event-name.md` 讲状态机里状态、事件的命名规范。二是这个仓库重构很频繁，一天合好几个结构性 PR 很常见，所以下文只引文件和函数名，不引行号。
 
@@ -34,7 +35,7 @@ flowchart TD
 
 | 包 | 行数（不含测试） | 干什么 |
 |---|---|---|
-| `agent-core-v2` | 约 13.8 万 | 唯一的引擎，本文几乎全部内容 |
+| `agent-core-v2` | 约 14.2 万 | 唯一的引擎，本文几乎全部内容 |
 | `kap-server` | 约 3.1 万 | 把会话暴露成 REST（`/api/v1`）和 WebSocket |
 | `klient` | 约 5900 | 按“服务名 + 方法名”调用引擎的门面，`memory` 传输在同进程里直接拿服务实例，`ipc` 传输跨进程 |
 | `acp-server` | 约 5600 | 编辑器用的 Agent Client Protocol |
@@ -42,7 +43,7 @@ flowchart TD
 | `pi-tui` | 约 1.9 万 | 终端界面库，从 pi-mono 的 `packages/tui` 拷过来单独维护（见包里的 `UPSTREAM.md`） |
 | `minidb` | 约 1.9 万 | 纯 Node 的嵌入式 KV 数据库，给会话索引和搜索用 |
 | `tree-sitter-bash` | 约 5000 | 纯 TypeScript 的 bash 解析器，权限判断危险命令时用 |
-| `kosong` / `kaos` | | 早期的 LLM 抽象层和执行环境抽象层，引擎已经不依赖 `kosong` |
+| `kosong` | | 早期的 LLM 抽象层，引擎已经不依赖它。早期的执行环境抽象层 `kaos` 已经在 10-12 删掉了（#4184） |
 
 `apps/` 下除了 `kimi-code`，还有 VS Code 插件、`kimi-inspect`（调试工具）和 `vis`（可视化）。
 
@@ -50,9 +51,9 @@ flowchart TD
 
 | 目录 | 行数 | 放什么 |
 |---|---|---|
-| `agent/` | 约 3.5 万 | Agent 作用域的服务：循环、请求、上下文、工具执行、权限、压缩、任务…… |
+| `agent/` | 约 3.6 万 | Agent 作用域的服务：循环、请求、上下文、工具执行、权限、压缩、任务…… |
 | `app/` | 约 2.4 万 | App 作用域的服务：配置、事件总线、认证、MCP 注册、会话索引、遥测 |
-| `features/` | 约 2 万 | 可插拔功能：`plan`、`goal`、`cron`、`swarm`、`tower`、`reminder`、`externalHooks`、`skill` |
+| `features/` | 约 2.3 万 | 可插拔功能：`plan`、`goal`、`cron`、`swarm`、`tower`、`reminder`、`externalHooks`、`skill` |
 | `human/` | 约 1.9 万 | 通用引擎：几台 XState 状态机、事件存储、一个 7700 行的 LLM 请求库 |
 | `_base/` | 约 1 万 | 依赖注入内核、生命周期、事件、日志 |
 | `workspace/` / `session/` | 约 6900 / 5900 | 工作区和会话级别的服务 |
@@ -520,7 +521,7 @@ turn 状态机调请求函数时，会把 `history + produced`（开轮时的历
 | 请求参数（温度、思考强度等） | 同上，`profile.resolveRequestParams()` | 本轮内不变 |
 | 系统提示词 | 同上，`profile.getSystemPrompt()` | 本轮内不变 |
 | `max_tokens` | 综合模型最大输出、预留上下文、配置上限、当前已用 token 数 | 每次重算。最近的提交（#4091）改成只有显式配置时才传这个上限 |
-| 工具列表 | 工具注册表 → `toolSelect.shapeTools()` → 去掉“延迟披露”的工具 | 每次重算。MCP 工具刚连上、plan 模式刚切换、`select_tools` 刚加载了新工具，下一步就能看到 |
+| 工具列表 | 工具注册表 → `toolSelect.shapeTools()` → 去掉“延迟披露”的工具（按需加载的 MCP 工具，模型要先调 `select_tools` 才能用；每个 MCP 服务器可以在 `mcp.json` 里设 `deferred`，10-14 起还有全局默认值 `default_deferred`） | 每次重算。MCP 工具刚连上、plan 模式刚切换、`select_tools` 刚加载了新工具，下一步就能看到 |
 | 消息 | `context.get()` → `toolSelect.shapeHistory()` → 上下文投影 `projector.project()` → 解析媒体 | 每次重算。上一步写进去的回复、工具结果、刚消费的通知、钩子注入的提醒都在里面 |
 
 也就是说，模型配置在一轮内固定，工具和消息每一步重新算。用户在一轮中途切模型，不会出现同一轮前后两步用不同模型的情况；而 MCP 工具一连上，下一步就能用。
@@ -562,6 +563,20 @@ turn 状态机调请求函数时，会把 `history + produced`（开轮时的历
 `endTurn` 先等 `wire.jsonl` 写完（`drainPersisted`），再作废本轮范围内没用掉的通知，最后发 `turn.ended`。
 
 `afterChain` 是挂在 `ActiveTurn` 上的一条 promise 链。每一步的收尾工作（写 `step.end`、跑钩子、判断轮次是否结束）都接在它后面，下一步的 `gate()` 第一件事就是 `await` 它。这样上一步没收尾完，下一步不会开始。
+
+### 6.5 系统提示词过时了怎么办：`AgentChangeNotifierService`
+
+系统提示词是绑定 profile 时渲染的，AGENTS.md 的内容、可用技能列表都渲染在里面。渲染结果作为 `ProfileBind` 事件写进 `wire.jsonl`，恢复会话时直接用记录里的文本，不重新渲染，这样提示缓存不会失效。代价是 AGENTS.md 改了、装了新技能、子 agent 的配置变了，系统提示词里写的还是旧的。
+
+以前只有 AGENTS.md 有处理：监听文件变化，提醒模型“这些文件在注入后改过了，去读最新的”。10-16（#4019）把这件事统一交给新的 `AgentChangeNotifierService`（`agent/changeNotifier/`，Agent 作用域，只在主 agent 上工作）：
+
+1. 绑定 profile 时，把这次渲染进系统提示词的 AGENTS.md、技能列表记成“模型已知的版本”（代码里叫 beliefs），作为状态 `changeNotifier.snapshot` 写进 `wire.jsonl`。
+2. 项目指令、技能目录、子 agent 目录任何一个发出变化事件，就重新读一遍，和记下的版本比较。
+3. 有差异就先更新记录，再调 `reminder.notify()`：往上下文内存追加一条 `<system-reminder>` 包着的 user 消息，不触发新的一轮，模型下一次请求时就能看到。提醒的内容有几类：哪些 AGENTS.md 改了或删了（让模型去读最新内容）；工作区里有哪些 AGENTS.md 没进系统提示词；新的技能列表（整个替换旧的）；子 agent 的 profile 和模型池增删了哪些。
+
+用户在界面里执行 `/reload`（kap-server 的会话 reload 接口）时：先让旧会话的 notifier 静音，重载配置和插件，关掉会话再从 `wire.jsonl` 恢复，最后让新会话的 notifier 把三类变化各检查一遍。因为比较的基准是写在 `wire.jsonl` 里的“模型已知的版本”，而不是进程内存，所以重启、恢复之后也不会重复提醒或漏掉提醒。
+
+这和 opencode 的 `InstructionState`、codex 的 `WorldState` 是同一个思路：系统提示词保持不动，变化作为追加的消息告诉模型。区别是 opencode 每一步开始前都会把所有指令来源重读一遍、算哈希比较，kimi 则是收到变化事件或者 `/reload` 时才比较。
 
 ---
 
@@ -673,6 +688,8 @@ sequenceDiagram
 | 11 | `default-tool-approve` | 默认放行的只读工具 |
 | 12 | `git-cwd-write-approve` | 在 git 工作区内写文件放行 |
 | 13 | `fallback-ask` | 兜底：问 |
+
+第 3、8、9 条是三条内置的“守卫”（guard）策略。配置 `[permission] dangerous_command_guard = false`（或环境变量 `KIMI_CODE_DANGEROUS_COMMAND_GUARD=false`）可以把它们一起关掉；10-16（#4250）之前这个开关只管危险命令那一条。关掉之后，“需要时询问”模式下只剩用户自己配的 `ask` 规则会弹审批。`Read` / `Write` / `Edit` 工具对密钥文件的硬拦截不受影响，那不在策略链里。
 
 ### 7.5 插话怎么打断工具
 
