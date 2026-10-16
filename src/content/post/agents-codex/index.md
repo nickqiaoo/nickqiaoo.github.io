@@ -1,7 +1,7 @@
 ---
 title: "codex 源码解析"
 description: ""
-updatedDate: "2026-10-08"
+updatedDate: "2026-10-16"
 publishDate: "2026-09-11"
 tags: ["codex", "agent"]
 series: agents
@@ -30,9 +30,9 @@ graph TD
   SBX["sandboxing · linux-sandbox · windows-sandbox-rs · execpolicy<br/>平台沙箱 · 执行策略"]
 ```
 
-TUI、`codex exec`、SDK 这些客户端都不直接碰 core，而是通过 app-server 的 JSON-RPC 接口来建线程、发输入、收事件。TUI 现在默认连一个共享的本地后台 app-server daemon：`DaemonAutoStart` 已经是 Stable 且默认开启（`features/src/lib.rs`，#47179），`tui/src/startup_orchestration.rs` 在启动时判断要不要拉起 daemon，连接目标是 `AppServerTarget::{Embedded, LocalDaemon, Remote}` 三选一（`tui/src/lib.rs:321`）。加 `--no-daemon`、打开 agents 总览或连远程工作区时才退回进程内 app-server；另外还有几种情况也会退回：要先走 Bedrock 登录向导，WSL 的 codex home 放在 Windows 盘上，Windows 下以管理员权限启动（无法拉起分离的后台进程），以及本地开关和已在跑的 daemon 对不上。`codex exec` 仍然固定走进程内。真正的执行循环和状态都在 core 里，这也是本篇要重点看的部分。
+TUI、`codex exec`、SDK 这些客户端都不直接碰 core，而是通过 app-server 的 JSON-RPC 接口来建线程、发输入、收事件。TUI 现在默认连一个共享的本地后台 app-server daemon：`DaemonAutoStart` 已经是 Stable 且默认开启（`features/src/lib.rs`，#47179），`tui/src/startup_orchestration.rs` 在启动时判断要不要拉起 daemon，连接目标是 `AppServerTarget::{Embedded, LocalDaemon, Remote}` 三选一（`tui/src/lib.rs:331`）。加 `--no-daemon`、打开 agents 总览或连远程工作区时才退回进程内 app-server；另外还有几种情况也会退回：要先走 Bedrock 登录向导，WSL 的 codex home 放在 Windows 盘上，Windows 下以管理员权限启动（无法拉起分离的后台进程），以及本地开关和已在跑的 daemon 对不上。`codex exec` 仍然固定走进程内。真正的执行循环和状态都在 core 里，这也是本篇要重点看的部分。
 
-下文沿着 app-server → core 这条路径往下讲，源码路径都以 `codex-rs/` 为根。主要入口在 `core/src/thread_manager.rs`、`core/src/session/turn_input.rs`、`core/src/tasks/` 和 `core/src/session/turn.rs`。这里分析的是开源仓库的代码（最近一次对照的是 2026-10-08 的 `529cd6b860`），线上托管服务实际跑的是哪个版本不在讨论范围内。
+下文沿着 app-server → core 这条路径往下讲，源码路径都以 `codex-rs/` 为根。主要入口在 `core/src/thread_manager.rs`、`core/src/session/turn_input.rs`、`core/src/tasks/` 和 `core/src/session/turn.rs`。这里分析的是开源仓库的代码（最近一次对照的是 2026-10-16 的 `6ae8b8aa7c`，上一次是 10-08 的 `529cd6b860`），线上托管服务实际跑的是哪个版本不在讨论范围内。
 
 ---
 
@@ -388,6 +388,7 @@ classDiagram
     <<enum>>
     UserInput(content, client_id)
     ResponseItem(ResponseItem)
+    AnnotatedResponseItem(item, retain)
     InterAgentCommunication(InterAgentCommunication)
   }
   class TurnInputMode {
@@ -441,7 +442,7 @@ classDiagram
 |---|---|
 | `UserInput` | 七种。`Text` 里的 `text_elements` 是 UI 用的高亮区间，不发给模型。`Skill` / `Mention` 是 `@技能` `@应用` 的引用，§6 会展开成注入的上下文。 |
 | `TurnInputRequest` | 一次提交的全部参数。`thread_settings` 是"顺便改一下线程设置"（模型、审批策略等），**开新轮和 steer 都会应用**，只是 steer 时对当前轮不生效。 |
-| `TurnInput`（协议版） | 三种。`ResponseItem` 变体让客户端直接提交一条历史条目（比如 IDE 给的上下文）。 |
+| `TurnInput`（协议版） | 四种。`ResponseItem` 变体让客户端直接提交一条历史条目（比如 IDE 给的上下文）。10-09（#52671）加的 `AnnotatedResponseItem` 多带一个只给 harness 看的 `retain` 标注：客户端提交的工具输出标了 `retain: true`，历史里会记成“客户端写的”，标注本身不进模型请求。配合默认关闭的 `retain_client_tool_outputs` 特性，这类输出（客户端常用它来下达任务说明）在压缩和开新窗口时会整条保留，不被截掉（#52937）。 |
 | `TurnInputMode` | 三种路由。`Steer { expected_turn_id }` 是乐观并发控制：你决定 steer 到 Session 收到之间那一轮可能已经结束，带上你以为的 turn_id，不匹配就拒绝。 |
 | `TurnStartOptions` | 只在这次提交启动了新轮次时才用。`parent_turn_id` / `root_turn_id` 在多 agent 场景下记录父轮次和根轮次的 id。 |
 | `TurnInputSubmission` | 三种结果。`Started` / `Steered` 只表示"core 收下了"，不等 hook、不等落盘、不等模型请求完成。 |
@@ -874,7 +875,7 @@ base instructions 相当于常说的 system prompt。请求体里已经没有单
 
 要注意，AGENTS.md、权限、工作目录、skill 清单、多 agent 模式这些都不在 base instructions 里，而是历史里另外的消息。
 
-还有一个开发中、默认关闭的开关 `incremental_tools`（#50464），只对 Lite 模式生效。打开后，工具定义和 base instructions 不再每次请求都拼到 `input` 前面，而是作为两个 `WorldState` section（`TopLevelToolsState`、`BaseInstructionsState`）在每个上下文窗口开头写进历史一次。之后工具有增删，只追加一条描述变化的 `AdditionalTools` 或说明消息，不再整份重发。
+还有一个开发中、默认关闭的开关 `incremental_tools`（#50464），只对 Lite 模式生效。打开后，工具定义和 base instructions 不再每次请求都拼到 `input` 前面，而是作为两个 `WorldState` section（`TopLevelToolsState`、`ModelInstructionsState`，后者 10-14 之前叫 `BaseInstructionsState`）在每个上下文窗口开头写进历史一次。之后工具有增删，只追加一条描述变化的 `AdditionalTools` 或说明消息，不再整份重发。10 月又补了两点：每批新增或变化的命名空间前面统一加一条 developer 说明，告诉模型“之前的工具除非明确移除都还能用，新定义覆盖旧定义”（#52295，措辞可以由模型目录的 `model_messages.tools.incremental_tools` 覆盖）；base instructions 以前只在窗口开头记一次，同一个模型的目录刷新后指令就过时了，现在模型或指令内容任一变化都会追加一条 `model_instructions` developer 消息，压缩后的新窗口直接用最新的指令（#53872）。
 
 #### `WorldState` 的全量注入与增量更新
 
@@ -948,11 +949,11 @@ sequenceDiagram
 |---|---|---|
 | 客户端 developer instructions | developer | `TurnContext.developer_instructions`，合并进主 developer 消息 |
 | 模型切换、personality、审批与沙箱、协作模式、持久执行规则 | developer | `build_world_state_for_step` 中对应的 `WorldStateSection` |
-| 可用 skill 清单 | developer | skills extension 提供的 `skills` / `orchestrator_skills` / `host_skills` section，使用 `<skills_instructions>` 标记 |
+| 可用 skill 清单 | developer | skills extension 提供的 `skills` / `cloud_skills` / `host_skills` section，使用 `<skills_instructions>` 标记 |
 | Apps / plugins 的通用使用规则 | developer | 当前确实有可用能力且模型配置允许时加入 |
 | 多 agent 模式、token budget、guardian 或托管策略 | 独立 developer 消息 | 这些片段必须单独成条，不与普通 developer 内容合并 |
 | AGENTS.md | user（contextual user） | `StepContext.loaded_agents_md`，使用 `# AGENTS.md instructions` 标记 |
-| 环境信息 | user（contextual user） | cwd、Git 分支、日期、时区、shell、网络和文件系统等 `<environment_context>` |
+| 环境信息 | user（contextual user） | cwd、Git 分支、日期、时区、shell、网络和文件系统等 `<environment_context>`。日期和时区可以用 `include_environment_context_time = false` 关掉（默认开，#52164） |
 | 推荐但尚未安装的插件 | developer（并入主 developer 消息） | `RecommendedPluginsInstructions`，使用 `<recommended_plugins>` 标记。#47349 之前是 contextual user 消息，旧 rollout 里的这种消息仍然能被识别 |
 
 “contextual user”是 Codex 用 `role: user` 写进历史的运行时上下文，和用户真正发的消息分开记。模型会看到它们，但 UI 一般不会把它们当成普通聊天消息显示。
@@ -1557,7 +1558,7 @@ classDiagram
 
 | 类型 | 作用 |
 |---|---|
-| `ToolExecutor<Invocation>` | 最小契约：名字、给模型看的 `ToolSpec`、`handle`。`supports_parallel_tool_calls` 默认 `false`；`exec_command` 覆盖为 `true` |
+| `ToolExecutor<Invocation>` | 最小契约：名字、给模型看的 `ToolSpec`、`handle`。`supports_parallel_tool_calls` 默认 `false`；`exec_command` 和一批只读工具覆盖为 `true`（10-08 的 #52245 放开了技能和记忆的列举与读取、对话历史的搜索与读取、插件和子 agent 列表、当前时间、剩余上下文、`get_goal`，创建和更新 goal 仍然独占） |
 | `CoreToolRuntime` | core 内部扩展：传给 hook 的数据、就绪等待（MCP 工具要等服务器连上）、参数流式 diff。所有 handler 都实现它 |
 | `ToolExposure` | 六种。`Direct` 进初始工具清单；`Deferred` 只能靠 `tool_search` 找到；`Hidden` 注册了但模型看不见（比如 hook 专用） |
 | `ToolInvocation` | handler 收到的全部参数。`step_context` 是那一步的快照，`tracker` 是这一轮的文件 diff 累加器 |
@@ -1657,7 +1658,7 @@ sequenceDiagram
 | `list_mcp_resources` / `read_mcp_resource` 等 | 有 MCP 资源 |
 | `spawn_agent` / `send_message` / `wait_agent` / `list_agents` / `interrupt_agent` / `followup_task` | `collab_tools_enabled` |
 | `tool_search` | 有 `Deferred` 工具时在 `finalize_tool_router` 里自动加 |
-| `code_mode` / `code_mode_wait`（名字见 `codex_code_mode::PUBLIC_TOOL_NAME`） | `ToolMode::CodeMode` |
+| `exec` / `wait`（`codex_code_mode::PUBLIC_TOOL_NAME` / `WAIT_TOOL_NAME`） | `ToolMode::CodeMode` |
 
 ---
 
@@ -1742,6 +1743,8 @@ sequenceDiagram
 ### `on_task_finished`
 
 `on_task_finished` 做一轮结束后的收尾：记下执行结果和本轮用量，把还没来得及处理的 steer 写进历史，然后告诉客户端任务是完成了还是被中断了。注意这些 steer 只是写进了历史，模型并没有处理过，要等下一次请求才会看到。
+
+“取出最后一批 steer”和“写进历史”之间以前有个空档：这时到达的输入可能排在已经取完的那批后面没人管，或者抢在那批前面写进历史。10-12（#53452）起，开始取最后一批之前先把当前轮次标成“收尾中”（`ActiveTurn.finishing`，一个取消令牌），等最后一批写完再取消它。收尾中的轮次不再接受注入，新来的 steer 会被当成没有活动轮次处理；迟到的客户端回复和通知则等这个令牌取消后再追加，保证排在最后一批后面。已经预留、还没开始的轮次不受影响，照常收输入。
 
 然后清掉当前任务状态，flush 历史。清之前会确认状态还是这一轮的，免得把新任务的状态删了。最后看邮箱里有没有要自动开一轮的消息，有的话就接着开下一轮。
 
@@ -1897,7 +1900,7 @@ assistant 消息的 phase 现在有三种（`MessagePhase`）：`Commentary` 是
 没处理的邮件留在 `mailbox_pending_mails` 里，之后有两种方式被处理：
 
 - 用户下次发消息开新一轮时，`start_task` 先把邮箱里的邮件取出来并进这一轮（§5）。
-- 如果邮件带 `trigger_turn = true`，会话一空闲，`maybe_start_turn_for_pending_work`（`tasks/mod.rs:442`）就自动开一轮去处理它，不用等用户。
+- 如果邮件带 `trigger_turn = true`，会话一空闲，`maybe_start_turn_for_pending_work`（`tasks/mod.rs:457`）就自动开一轮去处理它，不用等用户。
 
 ### 中断的传播路径
 
@@ -2014,7 +2017,7 @@ sequenceDiagram
 
 用文字再过一遍：
 
-1. 能不能重试。`err.retry_delay(...)` 返回 `None` 就直接退出。`ContextWindowExceeded` 和 `UsageLimitReached` 其实在这之前就单独处理了：前者把 token 状态标成窗口已满，后者更新 rate limits，然后都直接返回错误。
+1. 能不能重试。`err.retry_delay(...)` 返回 `None` 就直接退出。`ContextWindowExceeded` 和 `UsageLimitReached` 其实在这之前就单独处理了：前者把 token 状态标成窗口已满，后者更新 rate limits，然后都直接返回错误。10-12（#53451）起又多了一种不可重试的错误 `ResponseIncomplete`：服务端发来 `response.incomplete`（比如回复写到了 `max_output_tokens`），以前当成普通的流错误，会重试，压缩时还会换模型再试；现在保留服务端给的原因，立即停止处理这个流，这一轮以错误结束。这和 opencode 同一周的做法正好相反，opencode 遇到输出上限会自动续写（见 opencode 篇 §5.5）。
 2. 是不是走无限连接重试。开了 `UnboundedConnectionRetries`，错误是普通模型请求的 `ConnectionFailed`，不是内部会话，也不是 Amazon Bedrock，就走这条：等待时间从 5 秒开始翻倍，最多 60 秒。它单独计数，不占普通重试的次数。
 3. 普通次数用完了，看能不能换传输。`try_switch_fallback_transport` 成功就从 WebSocket 切到 HTTP，普通重试计数清零，接着试。
 4. 普通次数还没用完。计数加一，按服务端建议的时间或本地退避等一下，再试。次数上限是 provider 的 `stream_max_retries`。
@@ -2028,11 +2031,13 @@ sequenceDiagram
 
 ```rust
 let needs_follow_up = model_needs_follow_up || has_pending_input;
-let should_roll_over = needs_follow_up
-    && (sess.take_new_context_window_request().await || token_limit_reached);
+let candidate = if needs_follow_up { async_compaction::take_ready(&sess, &turn_context).await } else { None };
+let should_roll_over = auto_compaction_enabled
+    && needs_follow_up
+    && (sess.take_new_context_window_request().await || token_limit_reached || candidate.is_some());
 ```
 
-也就是说，执行中压缩要同时满足两个条件：还有活要干，并且要求了新窗口或者窗口到了阈值。比如刚跑完工具，`model_needs_follow_up == true`，工具结果一加进来历史就到阈值了，那就先压缩，再把结果交给模型。
+也就是说，执行中压缩要同时满足两个条件：还有活要干，并且要求了新窗口、窗口到了阈值、或者后台已经准备好了一份压缩结果（`candidate`，见下文“后台压缩”）。`auto_compaction_enabled` 只在实验性的“预测分叉”线程上为假（线程上挂了 `AutoCompactionDisabled`，#53678），这种线程要完整保留从父线程继承来的上下文，所以前、中、后三个时机的自动压缩都跳过。比如刚跑完工具，`model_needs_follow_up == true`，工具结果一加进来历史就到阈值了，那就先压缩，再把结果交给模型。
 
 ```mermaid
 sequenceDiagram
@@ -2102,6 +2107,16 @@ sequenceDiagram
 
 还要注意，请求真的返回 `ContextWindowExceeded` 时，并不会自动“压缩后重试”。源码里只有 Guardian review budget 耗尽这个专门的分支，会在同一步里压缩补救一次，其他的窗口超限没有这条路。
 
+#### 后台压缩（实验，默认关闭）
+
+10 月中旬加了一套后台压缩（`session/async_compaction.rs`，#53595、#53614、#53620、#53800），由特性开关 `async_compaction` 控制，默认关闭，而且只对支持远程压缩 V2 的 provider、没开 `TokenBudget` 时生效。思路是：别等窗口满了才停下来压缩，在用量到一个更低的阈值时就在后台先压着，等真正需要时直接拿来用。
+
+1. **发起**。在执行前、执行中、本轮结束这三个检查点，`maybe_start` 看当前上下文是否到了 `model_async_compact_threshold_percent`（按上下文窗口算，默认 65%；前台自动压缩看的是模型的 `auto_compact_token_limit`，模型目录没配时是窗口的 90%），而且还没到前台必须压缩的程度。满足就把当前历史、base instructions、`WorldState`、路由状态和鉴权身份打包，用 HTTP 发一个远程压缩请求，放在会话级的后台任务里跑。同一个历史版本、模型、压缩哈希、鉴权身份只发一次。
+2. **采纳**。前台走到压缩检查点时，`take_ready` 看后台有没有已经完成的结果。有，`should_roll_over` 就为真，走正常的压缩安装路径。安装前要校验：结果对应的历史版本、前缀长度、模型、鉴权身份和现在是否一致。通过的话**只替换当时截下来的那段历史前缀**，后台压缩期间新增的消息、工具输出、`WorldState` 的变化都原样保留。校验不过就丢掉这份结果，照常继续。
+3. **兜底**。前台真的需要压缩时，如果有一个兼容的后台请求还在跑，就等它而不是重新发一个；采纳的结果装上后还是超窗口，就再做一次前台压缩。
+
+被取消的轮次不会再发起新的后台压缩，但已经在跑的继续跑完，留给之后复用；会话关闭时才取消并回收。
+
 ### `run_auto_compact` 的实现分支
 
 `run_auto_compact` 只管选用哪种实现，三种做的事不太一样：
@@ -2115,7 +2130,7 @@ sequenceDiagram
 “本地压缩”说的是新历史由本地代码拼，摘要本身还是要请求模型生成。流程是：
 
 1. 复制一份历史，加上总结的要求，发一个不带工具的摘要请求。
-2. 摘要请求本身也超窗口的话，就从这份历史的开头删掉一些老条目再试；删不动了就报错。
+2. 摘要请求本身也超窗口的话，就从这份历史的开头删掉一些老条目再试；删不动了就报错。摘要的流式输出会先缓冲着，等到 `response.completed` 才写进历史（10-14 的 #53932）；以前流断在一半时，半截摘要会留在历史和 rollout 里。回复被判为 `ResponseIncomplete` 时压缩直接失败，不再换模型重试。
 3. 拿到摘要后，用（截过长度的）用户消息加摘要拼成新历史。
 4. 用 `build_compaction_replacement_history` 把初始上下文补进新历史（见下文）。
 5. 调 `replace_compacted_history` 替换内存里的历史，写一条 `RolloutItem::Compacted` 等恢复用的记录，再按当前模型重新算 token 用量。
@@ -2348,7 +2363,7 @@ app-server 的 legacy 路径用 `ThreadHistoryBuilder` 一条条处理 rollout �
 
 步骤是：
 
-1. 确认有正在跑的 `Regular` 任务，再看已加载的子 agent，有还活着的就拒绝交接。
+1. 确认有正在跑的 `Regular` 任务。以前还要看已加载的子 agent，有还活着的就返回 `HasLiveDescendants` 拒绝交接，调用方得先把子 agent 停掉、卸载。10-15（#54414）去掉了这个限制：现在暂停根轮次时，会顺带关闭共用同一个本地 agent 运行时的所有会话，并挡住新的启动。
 2. 先 flush，再停任务。这样 flush 失败了原任务还能继续跑。flush 完还要再查一次当前任务，因为等的过程中任务可能已经结束或者换了。
 3. 取走 `ActiveTurn`，取消任务，等它退出，超时就强制 abort。这条路径不写 `TurnComplete` / `TurnAborted`。
 4. 清掉 pending input 和等用户回复的请求，关掉会话运行时，停掉还会产生记录的组件。
@@ -2363,9 +2378,9 @@ sequenceDiagram
   participant N as 接替 worker
 
   C->>S: SuspendTurnAndShutdown
-  S->>S: 检查 Regular 任务和已加载的活跃后代
-  break 未运行、任务类型不支持或有活跃后代
-    S-->>C: NotActive / UnsupportedTask / HasLiveDescendants
+  S->>S: 检查 Regular 任务
+  break 未运行或任务类型不支持
+    S-->>C: NotActive / UnsupportedTask
   end
   S->>L: flush：先保存现有记录
   L-->>S: Ok 或 Err
@@ -2382,7 +2397,7 @@ sequenceDiagram
     S->>T: task_handle.abort；等待退出
   end
   Note over S,T: 不写 TurnComplete / TurnAborted
-  S->>S: clear_pending；shutdown_session_runtime
+  S->>S: clear_pending；shutdown_session_runtime；开始关闭共用运行时的子 agent 会话
   S->>L: flush：保存最后产生的记录
   L-->>S: Ok 或 Err
   break 最后一次 flush 失败
@@ -2397,6 +2412,8 @@ sequenceDiagram
   Note over C,N: 外部调度方此时才可安排接替；调度实现不在本图范围内
   N->>N: 恢复会话，再继续未完成轮次
 ```
+
+返回成功只保证根轮次已经停下、它的 writer 已经 flush 并关闭；子 agent 的清理是另外完成的。调用方在把所有权交给别的 worker 之前，要自己等整棵树关完，或者拦住并终止这些子 agent 的持久化 writer。被打断的子 agent 不会自动恢复，接手的 worker 用原来的轮次 id 恢复根轮次，子 agent 不会重新启动。
 
 要注意，已经收下但还没写进历史的 pending input，还有在等审批这类内存里的状态，都不会被保存下来。接手的 worker 拿到的是已经存下的历史和“这轮没做完”这个状态，不是整个进程的完整快照。
 
