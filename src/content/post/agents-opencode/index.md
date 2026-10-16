@@ -1,16 +1,18 @@
 ---
 title: "opencode 源码解析"
 description: ""
-updatedDate: "2026-10-08"
+updatedDate: "2026-10-16"
 publishDate: "2026-09-14"
 tags: ["opencode", "agent"]
 series: agents
 seriesOrder: 2
 ---
 
-> 本文在 2026-10 按 opencode 的 `v2` 分支整篇重写过，对照的是 `origin/v2` 的 `216c311744`（2026-10-08，`@opencode/cli` 2.0.24）。9 月的旧版分析的是 `dev` 分支里一份 6 月从 v2 分出来的早期原型，很多名字（`promoteSteers`、`runTurnAttempt`、`PermissionV2`、`lildax`）在正式的 v2 里已经不存在了。旧版还能在博客仓库的 git 历史里找到。
+> 本文对照的是 opencode `dev` 分支的 `7b99646cf1`（2026-10-16，`@opencode/cli` 2.0.30）。下文的源码路径都相对 `packages/`。
 >
-> opencode 现在有两条线：`dev` 分支是 v1 的维护线（`packages/opencode`，1.18.x）；`v2` 分支是重写后的新架构，命令名还是 `opencode`（另有一个 `opencode2`）。下文的源码路径都相对 v2 分支的 `packages/`。
+> 先说分支。2026-10-10 的 `5caf1f9f6f`（“chore: promote v2 to dev”）把重写后的 v2 合进了默认分支 `dev`，从此 `dev` 就是 v2，命令名还是 `opencode`（另有一个 `opencode2`）。v1 的维护线搬到了新开的 `v1` 分支（`packages/opencode`，1.19.x，只出补丁版本），它是 10-09 从合并前的 `dev` 分出来的。原来的 `v2` 分支停在合并那一刻，不再更新。所以现在看 v2 的代码直接看 `dev` 就行。
+>
+> 本文 10-08 的版本对照的是当时 `origin/v2` 的 `216c311744`（2.0.24）；10-16 按 `dev` 核对了这之后核心包的 122 个提交，主干结构没有变，变化集中在 Step 的结果类型（§5.5、§7.2）、工具参数校验（§7.1）、内置工具（§8）和指令来源（§6.1）。9 月更早的版本分析的是旧 `dev` 分支里一份 6 月从 v2 分出来的早期原型，很多名字（`promoteSteers`、`runTurnAttempt`、`PermissionV2`、`lildax`）在正式的 v2 里已经不存在了，旧版还能在博客仓库的 git 历史里找到。
 
 ## 1. 包与进程模型
 
@@ -31,7 +33,7 @@ graph LR
 
 | 包 | 目录 | 行数（不含测试） | 干什么 |
 |---|---|---|---|
-| `@opencode/core` | `core/src` | 约 6.6 万 | 内核。会话门面、输入收件箱、执行调度、runner、工具、权限、事件总线、插件、服务装配 |
+| `@opencode/core` | `core/src` | 约 6.8 万 | 内核。会话门面、输入收件箱、执行调度、runner、工具、权限、事件总线、插件、服务装配 |
 | `@opencode/ai` | `ai/src` | 约 3.1 万 | 模型层。`LLMRequest` / `LLMEvent` 统一格式，几十种协议，还有生图、语音、转写、视频 |
 | `@opencode/protocol` | `protocol/src` | 约 4300 | 用 Effect 的 `HttpApi` 定义所有 HTTP 接口，server 和 client 都从这里生成 |
 | `@opencode/server` | `server/src` | 约 4100 | 只实现 protocol 里定义的 handler，把调用转给 core |
@@ -52,6 +54,8 @@ v2 的一个基本设计是：**客户端从不直接调用 core**。TUI、CLI�
 
 所以默认情况下，开好几个终端跑 `opencode`，用的是同一个后台服务，会话、权限请求、后台任务都在这个服务里。这也是后面“崩溃恢复”（§11）能成立的前提：同一时刻只有一个托管服务会去恢复会话。
 
+别的设备也能连这个托管服务。`opencode pair` 让服务生成一个配对码，打印带配对码的链接（只能用一次，几分钟后过期），能从别的机器访问的地址还会印成二维码，手机或另一台电脑打开链接就成了这个服务的客户端。托管服务默认只监听本机，所以 `pair` 会提示两种办法：用 SSH 把端口转发过去，或者 `opencode service set hostname 0.0.0.0` 让局域网能访问。10 月新增的 `pair --remote`（`cli/src/services/remote-tunnel.ts`）是第三种：第一次使用时征求同意，然后托管服务通过 OpenTunnel 在一个随机子域名上对外暴露（端到端加密，还要服务密码），不在同一个网络里也能连。
+
 ---
 
 ## 2. 整体执行流程
@@ -66,7 +70,7 @@ flowchart TD
   D --> S["advanceToStep：处理控制项、投递输入、准备上下文"]
   S --> R["runStep：自动压缩检查、拼请求"]
   R --> T["SessionStep.attempt：读模型流，边读边并发跑工具"]
-  T -->|Retry / Continue / Compacted / RecoverFull| R
+  T -->|Retry / Continue / Compacted / RecoverFull / OutputLimit| R
   T -->|Completed| N{"needsContinuation？"}
   N -->|是：有工具结果要交回模型| S
   N -->|否| S2["advanceToStep：还有待投递的输入？"]
@@ -541,7 +545,7 @@ while (true) {
 }
 ```
 
-`attempt` 的结果有五种，`runStep` 分别这样处理：
+`attempt` 的结果有六种，`runStep` 分别这样处理：
 
 | 结果 | 含义 | `runStep` 怎么办 |
 |---|---|---|
@@ -550,6 +554,13 @@ while (true) {
 | `Continue` | 已经输出了一部分，流断了 | 同样等待，然后补一条系统通知“上次回复被打断了，从断的地方接着说，别重复”，换一个新的 assistant 消息 id 再来 |
 | `Compacted` | 服务端说上下文太长，已经压缩完 | 换新 assistant 消息 id 再来。这种恢复一个 Step 只做一次 |
 | `RecoverFull` | 服务端拒绝了“接着上次的状态继续”（比如 WebSocket 续传的状态过期了） | 立即用完整上下文重发一次，不等待。也只做一次 |
+| `OutputLimit` | 请求正常结束，但结束原因是 `length`：回复写到输出上限被截断了 | 见下 |
+
+`OutputLimit` 是 10-13 加的（`a3f7f42ac9`）。以前被截断的回复按 `Completed` 处理，模型话说一半，会话就停了。现在 `runStep` 这样处理：
+
+- 先看最近三条 user / assistant 消息（包括刚截断的这条）是不是**全都**是因为 `length` 结束的 assistant 消息。是的话说明已经续写过两次还是写不完，报 `output-limit` 错误，Step 失败。
+- 这一步里有本地工具调用（`needsContinuation`），就按普通的 `Completed` 结束 Step，工具结果交回模型时它自然会接着写。
+- 否则补一条系统通知：“上次回复到了输出上限，不要道歉、不要复述，把剩下的工作拆成小块”，换一个新的 assistant 消息 id 再来一次。
 
 每次循环都重新 `prepareContext` + `load`，因为等待期间指令可能变了、历史可能多了东西。但重试**不会再投递新输入**，用户在这期间的插话要等这个 Step 结束。
 
@@ -585,6 +596,8 @@ return {
   ]),
 }
 ```
+
+`discovery` 这一项除了自动发现的 `AGENTS.md`，还包括配置文件 `instructions` 数组里点名的文件。v2 的配置格式早就接受这个字段，但直到 10-15（`1e63a3bb73`）才真正去读：`config/plugin/instruction.ts` 把每一项解析成文件，加进 `InstructionDiscovery` 的文件表，排在 `AGENTS.md` 之后。相对路径和通配符从工作目录往上一直找到项目根，`~/` 从家目录算，`http(s)://` 地址在加载配置时抓取（5 秒超时，抓不到就保留上次的内容）。本地文件改了会像 `AGENTS.md` 一样作为指令变化出现（§6.2）。
 
 指令来源的顺序是有讲究的：按“在不同会话之间有多通用”从高到低排，越通用的越靠前。这样拼出来的指令开头部分在很多会话里都一样，提示缓存更容易命中。日期、环境这些每天每个目录都不一样的，放在最后。
 
@@ -727,6 +740,7 @@ classDiagram
     +toolExecution(id, name, result)
     +failTool(id, error)
     +failUnsettledTools(error)
+    +failIncompleteTools()
     +failAssistant(error)
     +flush() / streamed()
     +startAssistant()
@@ -746,6 +760,7 @@ classDiagram
     Continue(error, decision)
     Compacted
     RecoverFull
+    OutputLimit(needsContinuation)
   }
   SessionStep ..> AttemptInput
   SessionStep *-- Publisher : 每次 attempt 新建
@@ -777,6 +792,7 @@ classDiagram
 - 每个工具 fiber 自己负责发结果事件：成功就 `toolOutput.truncate`（§8.4）后发 `tool.success`；工具返回 `Tool.Error` 就发 `tool.failed`，模型能看到错误信息。
 - 用户拒绝权限或者关掉提问对话框，不算工具失败，而是作为“拒绝”留在 fiber 的错误通道里，由 `attempt` 统一处理（§9）。
 - 流要读到底，不是看到 finish 事件就停，这样下一次请求能接着用这次响应留下的状态。
+- **参数不合法就不执行，也不修补**。以前 `ai` 包解析不了工具参数时，会尽量从半截 JSON 里抢救出一个对象（解析不出就当成 `{}`）照样执行。10 月起（`c9e1ed7080`、`a3f7f42ac9`）改成发一个 `tool-input-error` 事件，这个调用直接标失败、不执行，错误信息里附上参数的前 2048 个字符，让模型知道自己写成了什么样。失败原因分三种：JSON 解析不了；本次回复因为 `length` 结束，参数是被输出上限截断的（提示模型把大块内容拆成几次调用）；流结束了参数还没写完。
 
 文本和推理的增量（`text.delta`、`reasoning.delta`）是**临时事件**，只推给在线的客户端，不写库，而且会攒一小段时间批量发。每段文字结束时的 `text.ended` 才是持久化的，带完整内容。
 
@@ -792,7 +808,7 @@ classDiagram
 6. 其他情况：有拒绝的工具发失败（“用户拒绝了这次调用”），还没结果的工具统一标失败，Step 标中断或失败。
 7. 有结束原因就算用量和费用，再抓一次工作区快照，和开始时的快照比，得到这一步改了哪些文件，一起写进 `step.ended`。
 
-最后返回 `Completed({ needsContinuation })`。`needsContinuation` 的定义很直接：这一步里有没有**本地执行的**工具调用（被调用或者已经有结果）。有，就需要把结果交回模型，runner 会再跑一个 Step；provider 自己执行的工具（比如服务端的网页搜索）不算。
+最后返回 `Completed({ needsContinuation })`；如果结束原因是 `length`，返回 `OutputLimit({ needsContinuation })`，交给 runner 决定要不要续写（§5.5）。`needsContinuation` 的定义很直接：这一步里有没有**本地执行的**工具调用（被调用或者已经有结果）。有，就需要把结果交回模型，runner 会再跑一个 Step；provider 自己执行的工具（比如服务端的网页搜索）不算。
 
 ### 7.3 重试策略
 
@@ -871,7 +887,7 @@ classDiagram
 | `subagent` | 派子 agent（§13） |
 | `skill` | 加载技能 |
 | `webfetch` / `websearch` | 抓网页、搜索 |
-| `opencode` | `session_rename`、`session_move`、`models` 几个操作会话和查模型的小工具 |
+| `opencode` 命名空间 | `session_rename`、`session_move`、`worktree_create` / `worktree_list` / `worktree_remove`、`models`、`list_mcp_resources` / `read_mcp_resource` 这些管理 opencode 自身的小工具。三个 worktree 工具是 10-08 从插件挪进 core 的（`7d179e83f4`），`worktree_remove` 会删文件，所以要过 `edit` 权限 |
 
 ### 8.3 快照：每次请求固定一份
 
@@ -881,7 +897,9 @@ classDiagram
 2. 分成两组：`codemode: false` 的工具**直接**声明给模型；其余的（默认值）都收进 Code Mode。
 3. Code Mode 里有工具时，额外声明一个名叫 `execute` 的工具：模型写一段脚本，在脚本里调这些工具（§13）。
 
-上面表里的内置工具都标了 `codemode: false`，所以模型直接看到它们。插件和 MCP 加进来的工具默认进 Code Mode，不占工具声明。少数本身就把工具包成了 Code Mode 的 MCP 服务是例外，会被自动设成 `codemode: false`，避免两层 Code Mode 套在一起（`plugin/mcp-codemode-defaults.ts`）。
+上面表里的内置工具，除了 `opencode` 命名空间，都标了 `codemode: false`，模型直接看到它们。`opencode` 命名空间里那些不常用的管理工具，和插件、MCP 加进来的工具一样进 Code Mode，不占工具声明。
+
+Code Mode 的工具目录写进 system 时有预算（约 2000 token，`codemode/catalog.ts`）：每个命名空间都列出名字和工具数，具体的工具签名则各命名空间轮流挑，挑到预算用完为止。目录不全时，说明里会告诉模型“目录只列了一部分”，让它在 `execute` 脚本里先调 `search(...)` 找到工具，再按返回的路径调用。工具可以标 `pinned: true`，保证自己的签名一定被列出来；`session_move` 和三个 worktree 工具就是这样标的。少数本身就把工具包成了 Code Mode 的 MCP 服务是例外，会被自动设成 `codemode: false`，避免两层 Code Mode 套在一起（`plugin/mcp-codemode-defaults.ts`）。
 
 快照的 `execute` 只执行这次请求宣告过的工具。之后注册表变了，只影响后面的请求。被钩子删掉的工具、名字对不上的工具、最后一步的工具调用，都各自返回一个错误结果，不影响同一批里的其他调用。
 
@@ -1006,6 +1024,8 @@ return event.effect
 默认设置：`auto: true`，`keep: 15000`（摘要旁边原样保留最近约 15000 token 的对话）。
 
 溢出压缩时，既然服务端已经拒绝了，说明估算偏低，第一次就把目标定在估算值的 70%；如果压缩请求本身也太长，再依次降到 50%、35%。
+
+压缩请求的输出上限要按实际发出去的请求来算。拼请求时按目标大小留了输出空间，但对话已经压不动时，真正发出去的请求可能比目标大，输入加输出就超过了窗口。10-15（`ae8d59f8b5`）起，每次发压缩请求前都按这次请求的估算大小重新算一遍输出上限，只往小调。
 
 ### 10.2 两种压缩方式
 
@@ -1139,6 +1159,8 @@ sequenceDiagram
 
 ### 12.1 两级服务
 
+v2 整个建在 Effect 4 上，之前用的是 4.0 的 rc 版（本文上一版对照时是 `4.0.0-rc.112`），10-10（`41b03dea0f`）升到了正式版 4.0.1，原来 `effect/unstable/http`、`effect/unstable/socket` 这些模块也随之转正成 `effect/http`、`effect/socket`。
+
 core 里的服务分两级：
 
 | 级别 | 声明方式 | 例子 | 生命周期 |
@@ -1203,6 +1225,8 @@ core 把它包成一个叫 `execute` 的工具（`core/src/codemode/tool.ts`）�
 - **前台**（默认）：等子会话跑完，返回它最后一条回复，以及子会话 id。之后可以带着这个 id 继续和同一个子 agent 对话。
 - **后台**（`background: true`）：立即返回“已经在后台跑了”，由 `Job.Service` 管着。子会话结束时，通过收件箱给父会话投一条 synthetic 通知，父会话的模型自然就看到了结果。工具描述里专门叮嘱模型：别轮询、别重复做同样的事。
 
+后台任务的生命周期比启动它的目录服务长：父会话所在目录长时间不活跃，那套目录级服务会被回收（§4 的 `inactivity`），以前这时子 agent 的完成通知会跟着丢掉。10-08（`ee0e614221`）起，`SubagentJob` 成了一个全局服务，任务和监听它完成的 fiber 都用全局的上下文启动，不再挂在发起它的目录上。
+
 用户在界面上跑的 shell 命令也走类似的路：立即在后台开始，结束后作为 synthetic 输入入库（`resume: false`，不会叫醒空闲的会话）。
 
 ### 13.3 会话迁移
@@ -1232,4 +1256,4 @@ server 启动时会在后台跑 `core/src/database/v1-migration.bun.ts`（1100 �
 | 大量工具 | Code Mode（`execute` 工具） | codemode 扩展 + tool_search | Code Mode + 工具搜索 |
 | 崩溃恢复 | 执行声明 + 启动时自动续跑，最多 10 次 | 主线没有；实验性的 pi-durable 在做 | 从 rollout 恢复历史，不自动续跑 |
 
-三家都在往同一个方向走：**持久化的记录是唯一的事实来源，内存只是缓存**。opencode v2 走得最彻底，连“待处理的输入”和“正在执行”都写进了数据库，代价是每一步都要和数据库、事件投影打交道，代码量（core 6.6 万行）也是三家里最大的。
+三家都在往同一个方向走：**持久化的记录是唯一的事实来源，内存只是缓存**。opencode v2 走得最彻底，连“待处理的输入”和“正在执行”都写进了数据库，代价是每一步都要和数据库、事件投影打交道，代码量（core 6.8 万行）也是三家里最大的。
