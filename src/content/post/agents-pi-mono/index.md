@@ -1,7 +1,7 @@
 ---
 title: "pi-agent 源码解析"
 description: ""
-updatedDate: "2026-10-08"
+updatedDate: "2026-10-16"
 publishDate: "2026-09-13"
 tags: ["pi", "agent"]
 series: agents
@@ -19,8 +19,8 @@ graph LR
   AG["pi-agent-core<br/>机制层：Agent / agent-loop"] --> AI
   AI["pi-ai<br/>协议层：Models / Provider / 各家 API"]
   DU["pi-durable<br/>持久化 harness（实验）"] --> AI
-  DU --> CHORD["chord<br/>可复制的文档状态"]
-  CA -. 只有 experimental 目录用 .-> DU
+  DU --> CHORD["chord<br/>对象运行时 + 可复制状态"]
+  ENV["pi-env<br/>远程执行环境"] --> DU
 ```
 
 | 包（npm 名） | 目录 | 干什么 | 本篇重点 |
@@ -30,13 +30,18 @@ graph LR
 | `@earendil-works/pi-coding-agent` | `packages/coding-agent` | 交互式 CLI 产品：会话、扩展、压缩、重试、三种模式 | §4、§6–§12 |
 | `@earendil-works/pi-codemode` / `pi-mcp` | `packages/codemode`、`packages/mcp` | 让模型写 JS 脚本批量调工具；MCP 客户端。coding-agent 用它们做了两个内置扩展 | §4.4 |
 | `@earendil-works/pi-durable` | `packages/durable` | 把会话、模型调用、工具调用都先写进存储再往下走的 harness，进程死了能接着跑。还是实验性的 | §13 |
-| `@earendil-works/chord` | `packages/chord` | 插件、服务、跨进程可复制状态的底层运行时，不依赖任何 pi 包 | §14 |
+| `@earendil-works/pi-env` | `packages/env` | 给 durable 用的远程执行环境：工具通过 SSH 在另一台机器上跑 | §13.5 |
+| `@earendil-works/chord` | `packages/chord` | 跨进程的对象运行时：契约、对象、可复制状态、热重载，只依赖 TypeBox | §14 |
 
 `pi-ai`封装了对各个模型厂商的调用，`pi-agent-core`是Agent最核心的事件循环逻辑，是我们需要重点学习的部分，`pi-coding-agent`是基于core封装的完整产品。如果我们想要做自己的 Coding Agent，那么就可以使用 `pi-ai` 和 `pi-agent-core`。
 
 10 月初 `pi-agent-core` 做了一次瘦身（`7fd478a2e`）：以前放在 `packages/agent/src/harness/` 下的 2 万多行实验性 harness 整个删掉了，现在这个包只剩 `Agent`、`agent-loop.ts`、代理流和类型定义，一共 2500 行左右。harness 的思路搬进了新的 `pi-durable` 包，见 §13。
 
-本文对照的是 pi-mono 2026-10-08 的 `1cedd3272`。
+本文对照的是 pi-mono 2026-10-16 的 `790271cd0`（`pi-coding-agent` 1.3.0）。10-08 的上一版对照的是 `1cedd3272`，这之间的 147 个提交里，主线（`pi-agent-core` 一行没改，`AgentSession` 和 `pi-ai` 有几处修改，见 §6、§7.2、§8.3）变化不大，大的变化在实验部分：
+
+- 10-12 的 `7472cda0d` 删掉了实验性的 server 栈：`packages/client`、`packages/protocol`、`packages/server` 三个包，以及 coding-agent 里的 `src/experimental/`、`src/client/`。coding-agent 从此不再依赖 chord，主产品 `pi` 和 durable、chord 完全没有关系了。
+- 同一天的 `0104fef1e` 把 chord 整个换成了一套新运行时（代码里叫 chord2），它来自 pi-private 仓库里的 `apps/p2`（取代原来 Pi Mobile 的新应用，不开源）。§14 按新版重写。
+- durable 继续往前走：工具嵌套调用、按需加载的工具、能在重启后续跑的 Code Mode 等（§13.5）。
 
 ---
 
@@ -479,8 +484,8 @@ Agent 里存了这些字段：
 | 方法 | 干什么 | 谁调它 |
 |---|---|---|
 | `subscribe(listener)` | 注册事件监听。监听器按注册顺序 `await`，`agent_end` 的监听器跑完运行才算结束。 | `AgentSession` 构造函数 |
-| `prompt(input, images?)` | 发起新运行。已有运行在跑就抛错。先 `normalizePromptInput` 把字符串包成 `UserMessage`，再 `runPromptMessages`。 | `AgentSession._runAgentPrompt` |
-| `continue()` | 不加新消息，从现有上下文继续。最后一条是 assistant 时：先看 steer 队列有没有东西，有就当作新 prompt 跑；再看 followUp 队列；都没有就抛错。最后一条是 user/toolResult 时走 `runContinuation`。 | `AgentSession._runAgentPrompt` 的重试/压缩后继续 |
+| `prompt(input, images?)` | 发起新运行。已有运行在跑就抛错。先 `normalizePromptInput` 把字符串包成 `UserMessage`，再 `runPromptMessages`。 | `AgentSession._startRun` |
+| `continue()` | 不加新消息，从现有上下文继续。最后一条是 assistant 时：先看 steer 队列有没有东西，有就当作新 prompt 跑；再看 followUp 队列；都没有就抛错。最后一条是 user/toolResult 时走 `runContinuation`。 | `AgentSession._startRun` 的重试/压缩后继续 |
 | `steer(msg)` / `followUp(msg)` | 入队，不做别的。 | `AgentSession._queueSteer` / `_queueFollowUp` |
 | `hasQueuedMessages()` | 两个队列任一非空。 | `AgentSession._handlePostAgentRun` |
 | `abort()` | 触发 `activeRun.abortController.abort()`。 | `AgentSession.abort` |
@@ -586,7 +591,8 @@ classDiagram
     +bindExtensions(bindings) / reload()
     +subscribe(listener) / dispose()
     +getContextUsage() / getSessionStats()
-    -_runAgentPrompt(messages)
+    -_startRun(trigger)
+    -_prepareRun(trigger) messages
     -_handlePostAgentRun() boolean
     -_runBeforeSettleBoundary() boolean
     -_handleAgentEvent(event)
@@ -731,7 +737,7 @@ classDiagram
 |---|---|
 | 装配 | `constructor` / `_buildRuntime` / `_refreshToolRegistry` / `_bindExtensionCore` / `_installAgentToolHooks` / `_installAgentNextTurnRefresh` / `_installAgentRequestProjection` / `_installAgentBoundaryHooks` / `_rebuildSystemPrompt` / `_applyToolLoadout` / `setActiveToolsByName` / `bindExtensions` / `reload` |
 | 输入 | `prompt` / `_runInputHandlers` / `_tryExecuteExtensionCommand` / `_expandSkillCommand` / `steer` / `followUp` / `_queueUserInput` / `_queueSteer` / `_queueFollowUp` / `sendCustomMessage` / `sendUserMessage` |
-| 运行 | `_runAgentPrompt` / `_handlePostAgentRun` / `_runBeforeSettleBoundary` / `abort` / `waitForIdle` / `_emitAgentSettled` |
+| 运行 | `_startRun` / `_prepareRun` / `_handlePostAgentRun` / `_runBeforeSettleBoundary` / `abort` / `waitForIdle` / `_emitAgentSettled` |
 | 事件 | `_handleAgentEvent` / `_emitExtensionEvent` / `_emit` / `subscribe` / `dispose` |
 | 重试 | `_isRetryableError` / `_prepareRetry` / `_omitRecoveryAttempt` / `_willRetryAfterAgentEnd` / `abortRetry` |
 | 压缩 | `_checkCompaction` / `_runAutoCompaction` / `compact` / `_compactBeforeNextAssistantResponse` / `getContextUsage` |
@@ -1001,7 +1007,7 @@ jiti 本身现在也是第一次需要加载扩展时才 `import()` 进来（`lo
 |---|---|
 | `codemode` | 注册一个 `codemode` 工具（默认不激活）：模型写一段 JavaScript，在 `pi-codemode` 自带的解释器里跑，脚本通过 `tools.xxx()` 调用其他工具。嵌套调用走 `ctx.executeTool()`，也要经过参数校验、`tool_call` / `tool_result` 钩子和权限检查。只有脚本的输出会回到模型，中间结果不会。`store()` / `load()` 的值写进会话的 `codemode-store` 自定义条目，所以每个分支各自独立 |
 | `tool-search` | 注册 `tool_search` 工具（默认不激活），按关键词搜 `codemode` / `deferred` 工具，搜到就激活，让它们出现在声明里 |
-| `mcp` | 连接 `mcp.json` 里配置的 MCP 服务，工具注册成 `mcp__<server>__<tool>`。默认暴露方式是 `codemode`：MCP 工具不进模型的工具声明，只能从 codemode 脚本里调，同时自动激活 `codemode` 工具。设成 `deferred` 就改为激活 `tool_search`。连接在后台进行，第一次提问只等有 `direct` 工具的服务 |
+| `mcp` | 连接 `mcp.json` 里配置的 MCP 服务，工具注册成 `mcp__<server>__<tool>`。默认暴露方式是 `codemode`：MCP 工具不进模型的工具声明，只能从 codemode 脚本里调，同时自动激活 `codemode` 工具。设成 `deferred` 就改为激活 `tool_search`。连接在后台进行，第一次提问只等有 `direct` 工具的服务。会调用其他工具的工具（`codemode`、`tool_search`）在定义里用 `reachesTools(input)` 声明这次调用会碰到哪些工具，MCP 扩展据此只等这次调用需要的服务连好，并决定该激活哪个工具；以前它是自己解析 codemode 脚本来判断的，10-12（`24382bedd`）改成了现在这样，`pi-codemode` 也不再内置任何 MCP 相关的代码 |
 | `llama.cpp` | 把本地 llama.cpp 服务注册成一个服务商：聊天模型走 `openai-completions` 协议，也能当分类模型用；`/llama` 命令可以从 Hugging Face 下载、加载模型 |
 
 这样做的目的是让 MCP 带来的几十上百个工具不撑大请求：它们不进工具声明，模型需要时再去搜、或者在脚本里调。
@@ -1322,7 +1328,7 @@ sequenceDiagram
   AS->>ER: bindCore(actions, state, providers)
   AS->>AS: _refreshToolRegistry() → setActiveToolsByName() → _rebuildSystemPrompt()
   AS->>AG: agent.state.tools = [...]；提示词只算出 _baseSystemPromptOptions，等第一次 prompt 时才写成 system 消息
-  AS->>AS: 恢复的会话：_restoreToolsFromTranscript() 按记录里最后声明的工具恢复激活列表
+  AS->>AS: 恢复的会话且用默认工具集：_restoreToolsFromTranscript(modifiers) 按记录里最后声明的工具恢复激活列表
   SDK-->>M: { session, extensionsResult }
   M->>Mode: runRpcMode(runtime) / new InteractiveMode(runtime).run() / runPrintMode(runtime)
   Mode->>AS: bindExtensions({ uiContext, mode, commandContextActions, ... })
@@ -1368,7 +1374,7 @@ sequenceDiagram
 6. `_installAgentBoundaryHooks()`：给 `agent.finishTurn` 赋值，发 `turn_end` 边界事件（§4.3）
 7. `_installHiddenDeclarationsProjection()` 和 `_installAgentForcedPromptProjection()`：在 `agent.transformContext` 外面各套一层。前者把 `prepareLoadout` 要求隐藏的工具声明从请求里去掉；后者在扩展用 `before_agent_start` 整个替换了提示词时，把所有 system 消息折成一条带新提示词的，只影响这次请求，不写进记录
 8. `_buildRuntime({ activeToolNames, includeAllExtensionTools: true })`
-9. 没指定初始工具时，`_restoreToolsFromTranscript()` 按会话记录里最后声明的工具恢复激活列表
+9. 用的是默认工具集（没有用 `--tools` 白名单点名工具）时，`_restoreToolsFromTranscript(modifiers)` 按会话记录里最后声明的工具恢复激活列表，再套用命令行里 `--tools +name` / `-name` 这种增减项。以前的判断条件是“没传初始工具”，而 SDK 总会传，所以这一步其实从来没执行过，恢复的会话会丢掉中途激活的工具；10-13（`6f2f164ab`）修好了
 
 每个 `_install*` 都先把 `Agent` 上原来的回调存下来，新回调里再调用它，所以多层安装可以叠加，SDK 调用方自己设的回调也不会被覆盖。
 
@@ -1415,11 +1421,12 @@ sequenceDiagram
   AS->>AS: _expandSkillCommand + expandPromptTemplate
   AS->>AS: isStreaming？→ _queueSteer / _queueFollowUp → return
   AS->>AS: 校验模型与鉴权
-  AS->>AS: _checkCompaction(上一条 assistant, false)
-  AS->>ER: emitBeforeAgentStart(...) → 改提示词参数 / 追加 custom 消息
+  AS->>AS: _startRun({ messageType: "user", prompt, images })
+  AS->>AS: _prepareRun：_checkCompaction(上一条 assistant, false)
+  AS->>ER: emitBeforeAgentStart(trigger, ...) → 改提示词参数 / 追加 custom 消息
   AS->>AS: messages = [UserMessage, ...pendingNextTurnMessages, ...custom]
   AS->>AS: _preparePromptAndToolLoadout：提示词有变化就在最前面加一条 system 消息
-  AS->>AS: _runAgentPrompt(messages)
+  AS->>SM: flush 准备期间攒下的 bash / custom 消息
   AS->>AG: agent.prompt(messages)
   AG->>AG: runWithLifecycle：activeRun、isStreaming=true
   AG->>L: runAgentLoop(messages, createContextSnapshot(), createLoopConfig(), processEvents, signal, streamFunction)
@@ -1461,18 +1468,29 @@ sequenceDiagram
 | ③ | `_runInputHandlers`：让订阅了 `input` 的扩展先看一眼 | 扩展返回 `handled` |
 | ④ | `/skill:name args` 展开成 `<skill>` 块；`/template args` 展开提示词模板 | — |
 | ⑤ | `isStreaming` 为真：按 `options.streamingBehavior` 走 `_queueFollowUp` 或 `_queueSteer`。没给 behavior 就抛错 | 排队后返回 |
-| ⑥ | 把上一轮攒下的 bash 消息和 custom 消息 flush 进会话（§9.3） | — |
-| ⑦ | 没模型抛错；`modelRuntime.hasConfiguredAuth` 或 `checkAuth` 都不通过就抛错（OAuth 场景给不同文案） | 抛错 |
-| ⑧ | `_checkCompaction(lastAssistant, skipAbortedCheck=false)`：上一次被用户中断的响应也可能已经溢出，这里补查一次 | — |
-| ⑨ | `emitBeforeAgentStart`：把 `_baseSystemPromptOptions` 交给扩展，扩展可以改其中的段落、选中的工具，可以追加 custom 消息，也可以用 `systemPrompt` 整个替换这次的提示词。这一步放在处理图片之前，因为扩展可能会换模型，图片要按新模型的要求缩放 | — |
-| ⑩ | 组 `messages`：一条 `UserMessage`（文本 + 图片），后面跟 `_pendingNextTurnMessages` 里攒的 custom 消息，再跟扩展追加的 custom 消息 | — |
-| ⑪ | `_preparePromptAndToolLoadout(result.systemPromptOptions)`：按扩展改过的参数设置工具、生成段落补丁。有补丁就把这条 system 消息放到 `messages` 最前面；参数存进 `_runSystemPromptOptions`，这次运行后面几轮都用它 | — |
-| ⑫ | `_runAgentPrompt(messages)` | — |
+| ⑥ | 没模型抛错；`modelRuntime.hasConfiguredAuth` 或 `checkAuth` 都不通过就抛错（OAuth 场景给不同文案） | 抛错 |
+| ⑦ | `_startRun({ messageType: "user", prompt, images })`，见 §7.2 | — |
 
-### 7.2 `_runAgentPrompt`
+### 7.2 `_startRun`
+
+10-12（`a447ba11f`）原来的 `_runAgentPrompt` 拆成了 `_startRun(trigger)` 和 `_prepareRun(trigger)` 两个方法。拆分的原因是：以前只有用户输入开跑时才会走“补查压缩 → `before_agent_start` → 组消息”这一套，扩展用 `sendMessage({ triggerTurn: true })` 发 custom 消息开跑时直接调 `_runAgentPrompt`，扩展收不到 `before_agent_start`，提示词补丁也不会生成。现在两条路都走 `_startRun`，区别只在 `trigger` 是 `{ messageType: "user", prompt, images }` 还是 `{ messageType: "custom", message }`，扩展可以从事件的 `messageType` 看出这次是哪种。
+
+`_prepareRun(trigger)` 做开跑前的准备，返回这次运行的起始消息：
+
+| 步 | 做什么 |
+|---|---|
+| ① | `_checkCompaction(lastAssistant, skipAbortedCheck=false)`：上一次被用户中断的响应也可能已经溢出，这里补查一次 |
+| ② | `emitBeforeAgentStart(trigger, _baseSystemPromptOptions)`：扩展可以改其中的段落、选中的工具，可以追加 custom 消息，也可以用 `systemPrompt` 整个替换这次的提示词。这一步放在处理图片之前，因为扩展可能会换模型，图片要按新模型的要求缩放 |
+| ③ | 组 `messages`：第一条是用户消息（文本 + 按模型缩放过的图片）或触发这次运行的 custom 消息，后面跟 `_pendingNextTurnMessages` 里攒的 custom 消息，再跟扩展追加的 custom 消息 |
+| ④ | `_preparePromptAndToolLoadout(result.systemPromptOptions)`：按扩展改过的参数设置工具、生成段落补丁。有补丁就把这条 system 消息放到 `messages` 最前面；参数存进 `_runSystemPromptOptions`，这次运行后面几轮都用它 |
+
+`_startRun` 拿到消息后，先把准备期间攒下的 bash 消息和 custom 消息 flush 进会话（§9.3），这样它们排在这次运行的起始消息前面，和空闲时提交的效果一样；然后开跑：
 
 ```ts
 this._isAgentRunActive = true;
+const messages = await this._prepareRun(trigger);   // 出错就复位状态、flush、抛出
+this._flushPendingBashMessages();
+this._flushPendingCustomMessages();
 try {
   await this.agent.prompt(messages);
   while (!this._agentRunAbortRequested) {
@@ -1668,7 +1686,9 @@ sequenceDiagram
 
 ### 8.3 输出截断
 
-`stopReason === "length"` 时不执行任何一个工具调用，每个都生成一条错误 `toolResult`，文案让模型重新发完整参数。源码注释里写了原因：流式返回的工具参数最后是靠一个容错的 JSON 解析器补全的，截断的消息里，工具调用可能解析成功、校验也通过，但参数其实不完整。自己写 agent 时要注意这一点。
+`stopReason === "length"` 时不执行任何一个工具调用，每个都生成一条错误 `toolResult`，文案让模型重新发完整参数。源码注释里写了原因：流式返回的工具参数是边收边用一个容错的 JSON 解析器补全的，截断的消息里，工具调用可能解析成功、校验也通过，但参数其实不完整。自己写 agent 时要注意这一点。
+
+没有截断、但模型写出来的参数本身不是合法 JSON 时，以前也是这个容错解析器兜底：只保留出错位置之前解析出的字段，工具照样执行。10-14（`87f9a3641`）起，`pi-ai` 对**已经结束**的工具调用改用严格解析（只保留修复非法字符串转义这类小修补），解析失败时参数记为 `{}`，原因和原始文本放进 `argumentsError`，`validateToolArguments` 会把它作为校验错误返回给模型，工具不执行。opencode 在同一周做了同样的修改（见 opencode 篇 §7.1）。
 
 ### 8.4 `edit` 工具
 
@@ -1732,11 +1752,11 @@ sequenceDiagram
 
 | 字段 | 谁往里放 | 什么时候 flush | 为什么不能立刻插 |
 |---|---|---|---|
-| `_pendingCustomMessages` | `sendCustomMessage` 在流式中且 `triggerTurn: false` | `turn_end` 时和运行结束时 | 立刻插会落在 assistant 的 toolCall 和 toolResult 之间，严格校验顺序的 provider 会拒绝 |
-| `_pendingBashMessages` | `recordBashResult` 在流式中 | 运行结束时（`_runAgentPrompt` 的 finally） | 同上 |
-| `_pendingNextTurnMessages` | `sendCustomMessage` 带 `deliverAs: "nextTurn"` | 下一次 `prompt()` 组消息时 | 语义就是"和用户下一句一起发" |
+| `_pendingCustomMessages` | `sendCustomMessage` 在流式中且 `triggerTurn: false` | `turn_end` 时、下一次运行开跑前、运行结束时 | 立刻插会落在 assistant 的 toolCall 和 toolResult 之间，严格校验顺序的 provider 会拒绝 |
+| `_pendingBashMessages` | `recordBashResult` 在流式中 | 下一次运行开跑前和运行结束时（`_startRun`） | 同上 |
+| `_pendingNextTurnMessages` | `sendCustomMessage` 带 `deliverAs: "nextTurn"` | 下一次运行组起始消息时（`_prepareRun`） | 语义就是"和用户下一句一起发" |
 
-`sendCustomMessage` 的完整分支：`nextTurn` → 攒着；流式中且要触发 → `agent.steer` 或 `agent.followUp`；不流式且要触发 → 直接 `_runAgentPrompt`；流式中不触发 → 攒到 turn_end；不流式不触发 → 立刻追加进状态和会话。
+`sendCustomMessage` 的完整分支：`nextTurn` → 攒着；流式中且要触发 → `agent.steer` 或 `agent.followUp`；不流式且要触发 → `_startRun`（同样会发 `before_agent_start`）；流式中不触发 → 攒到 turn_end；不流式不触发 → 立刻追加进状态和会话。
 
 ---
 
@@ -1772,7 +1792,7 @@ sequenceDiagram
   else 队列里还有扩展在 agent_end 里塞的消息
     AS-->>AS: return agent.hasQueuedMessages()
   end
-  Note over AS: 返回 false 时，_runAgentPrompt 再发 agent_before_settle 边界事件，扩展还能要求继续
+  Note over AS: 返回 false 时，_startRun 再发 agent_before_settle 边界事件，扩展还能要求继续
 ```
 
 ### 10.1 重试
@@ -1856,7 +1876,7 @@ flowchart TD
 
 | 模式 | 入口 | 怎么进 | 怎么出 |
 |---|---|---|---|
-| 交互式 TUI | `InteractiveMode`（`interactive-mode.ts`，7109 行） | 编辑器回车 → `session.prompt(text)`；正在流就 `prompt(text, {streamingBehavior:"steer"})`；`!cmd` 走 `handleBashCommand`；正在压缩就攒进本地队列 | `session.subscribe(handleEvent)`，`handleEvent` 的 `switch` 对 30 种事件各更新对应组件，然后 `ui.requestRender()` |
+| 交互式 TUI | `InteractiveMode`（`interactive-mode.ts`，7127 行） | 编辑器回车 → `session.prompt(text)`；正在流就 `prompt(text, {streamingBehavior:"steer"})`；`!cmd` 走 `handleBashCommand`；正在压缩就攒进本地队列 | `session.subscribe(handleEvent)`，`handleEvent` 的 `switch` 对 30 种事件各更新对应组件，然后 `ui.requestRender()` |
 | RPC | `runRpcMode`（`rpc/rpc-mode.ts`） | stdin 一行一个 JSON 命令，`handleCommand` 的 `switch` 有 33 个 `case`：`prompt` / `steer` / `follow_up` / `abort` / `set_model` / `compact` / `bash` / `fork` / `get_tree` …，几乎一一对应 `AgentSession` 的公开方法。`prompt`、`steer`、`follow_up` 的响应现在带一个 `disposition`，告诉调用方这条输入是被扩展处理掉了（`handled`）、排进了队列（`queued`），还是开始了一次新运行（`started`）。`prompt` 的响应要等预检（扩展命令、输入钩子、鉴权检查）通过才发 | `session.subscribe(e => output(toJsonEvent(e)))`，每个事件一行 NDJSON。`toJsonEvent`（`modes/json-event.ts`）把 `message_update` 里的 `partial` 整条消息去掉只留增量，省带宽 |
 | print / json | `runPrintMode`（`modes/print-mode.ts`） | 命令行参数里的消息依次 `prompt` | `json` 模式同 RPC 的输出；`print` 模式只打最后一条 assistant 文本 |
 
@@ -1870,9 +1890,9 @@ TUI 现在默认是全屏模式（设置项 `tuiMode` 默认 `"fullscreen"`）�
 
 主循环的状态全在内存里：`runLoop` 的局部变量记着跑到第几轮、有没有工具没跑完。进程一退出，这些就没了。会话文件只记了已经完成的消息，没记“正在干什么”。
 
-9 月的时候，pi 在 `packages/agent/src/harness/` 里试过一版解决方案（Lane / Drive / HookRegistry，2 万多行），10 月 1 日整个删掉了（`7fd478a2e`），换成独立的新包 `@earendil-works/pi-durable`（`packages/durable`，约 2 万行，其中一半是存储实现和测试工具）。它的 README 第一句就是“实验性，API 随时会变”。
+9 月的时候，pi 在 `packages/agent/src/harness/` 里试过一版解决方案（Lane / Drive / HookRegistry，2 万多行），10 月 1 日整个删掉了（`7fd478a2e`），换成独立的新包 `@earendil-works/pi-durable`（`packages/durable`，不含测试约 2.2 万行）。它的 README 第一句就是“实验性，API 随时会变”。
 
-目前主产品 `pi` 命令（`AgentSession`）**没有**用它，coding-agent 的 `package.json` 里也没有这个依赖。用到它的只有 `coding-agent/src/experimental/` 下的几个原型：`durable/`（一个基于 durable 的小型 TUI 编码 agent）、`session-worker.ts`、`vacation/`（演示用的旅行规划 agent）。所以第一次读同样可以跳过这一节。
+目前主产品 `pi` 命令（`AgentSession`）**没有**用它。10 月上旬 coding-agent 的 `src/experimental/` 下还有几个基于 durable 的原型（一个小型 TUI 编码 agent、session worker、演示用的旅行规划 agent），10-12 随实验性 server 栈一起删掉了。现在公开仓库里依赖 durable 的只有 `pi-env`（§13.5）；从 chord 的文档看，它真正的使用者是私有仓库里的 p2 应用：p2 的会话 worker 把 durable 的 Harness 作为一个 chord 对象提供出来（§14.4）。所以第一次读同样可以跳过这一节。
 
 ### 13.1 核心概念
 
@@ -2003,143 +2023,180 @@ sequenceDiagram
 | 多会话 | 一个 `AgentSession` 一棵树 | 一个 Harness 多个 Conversation，可 fork，子 agent 是被工具任务拥有的子对话 |
 | 界面 | 订阅事件流，自己维护显示状态 | `conversation.viewState()` 直接给出可订阅的“结构化视图”，包括流式片段、队列、重试、压缩状态 |
 
-可以看出，durable 把主循环里很多“隐式的东西”变成了显式的、可持久化的数据：轮次变成任务，队列变成文档，回调变成具名钩子。代价是复杂度高得多，所以现在还放在实验目录里。
+可以看出，durable 把主循环里很多“隐式的东西”变成了显式的、可持久化的数据：轮次变成任务，队列变成文档，回调变成具名钩子。代价是复杂度高得多，所以现在还标着实验性。
+
+### 13.5 10 月的新进展
+
+10-08 到 10-16 之间 durable 有 40 个提交，比较值得看的是这几块：
+
+**工具调用工具**。工具在 `execute` 里用 `api.executeTool(name, args, context)` 调别的工具，这次调用是一个**归调用方所有的子工具任务**：照样做参数校验、跑 `ToolTask` 钩子、有自己的输出上限和 replay 策略，结果直接返回给调用方，不进对话记录。每个嵌套调用有一个 key（默认是它在调用方里的序号），调用方的结果存在调用方任务的文档里（每个嵌套调用一份，10-10 的 `4ac0bd8c7`）。所以一个 `replay: "safe"` 的工具崩溃后重跑时，只要按同样顺序调用，就能拿回上次已经发起的嵌套调用，不会重复执行；不是 replay-safe 的工具不会重跑，它留下的嵌套调用在重启时整体作废（`abandonOnRestart`）。
+
+**谁能看到、谁能调用**。工具上的 `callers` 声明谁能调它：模型、其他工具，或者都可以（默认）。会话的 `modelTools` 再收窄“给模型看哪些”，但不影响工具之间互相调用。比如只把 `codemode` 给模型看，`read`、`bash`、MCP 工具都只能从脚本里调。`deferred: true` 的工具平时不给模型看，`tool_search` 扩展（`@earendil-works/pi-durable/tool-search`，10-12 的 `77332f7a3`）让模型按关键词搜，搜到的通过 `control.addTools` 写进这个分支的 `modelTools`，压缩之后也一直可见。这和 coding-agent 主线的 `ToolExposure`（§4.4）是同一个思路，只是在 durable 里这些选择也是持久化的。
+
+**能续跑的 Code Mode**（`@earendil-works/pi-durable/codemode`，10-11 的 `7b597d148`）。模型写的 JavaScript 在 `pi-codemode` 的 QuickJS 沙箱里跑，每次 `tools.xxx()` 都是一个嵌套工具调用。难点在于脚本本身是内存里的执行状态，没法存检查点。durable 的做法是让脚本**确定性地**运行：沙箱用虚拟时钟、固定种子的随机数、UTC 时区（`sandbox.start`，`0fb1aee74`），脚本每拿到一个调用结果，先把结果写进日志再交给脚本。重启后把脚本从头再跑一遍，按顺序把日志里的结果喂回去，于是它会发出同样的调用、带同样的参数，这些调用按 key 接回原来的嵌套任务，然后脚本从断的地方继续。如果重跑时脚本走了不同的分支、沙箱指纹或 Code Mode 版本变了、或者超时已过，就以错误结束这次调用。沙箱也可以放在 Cloudflare 的 Durable Object 里远程跑（`RemoteCodemodeSandbox`，`748b351fe`）。
+
+**其他**：
+
+- `read` 工具能返回图片，可选用基于 WebAssembly 的 Photon 做缩放和方向校正，Node 下在 worker 线程里处理（`42a3497d0`、`cdaf6c227`）。
+- SQLite 存储的表名可以加前缀（`{ prefix: "pi_" }`），这样 durable 能和宿主应用自己的表放在同一个数据库里，比如同一个 Cloudflare Durable Object 的存储（`f7e3cb543`）。
+- 压缩可以按模型单独配置（`compaction.modelOverrides`，`c4cf7957b`）；阻塞式压缩失败时这次运行直接失败，不再悄悄继续（`89e5c2c07`）。
+- `pi-env`（`packages/env`）是 durable 的远程执行环境：在远程机器上部署一个 Rust 写的小 daemon（`pi-env`，按 SHA-256 命名、每次启动前校验），通过 SSH 的标准输入输出走一套分帧协议。`RemoteExecutionEnv` 实现了 durable 的 `ExecutionEnv` 接口，所以工具在另一台机器上读写文件、跑命令，而 durable 的 worker、存储、凭据都留在本地。10 月新增了伪终端（交互式命令）和列目录（`listFiles`）。
 
 ---
 
-## 14. chord：插件、服务和可复制状态（实验）
+## 14. chord：跨进程的对象运行时（实验）
 
-`@earendil-works/chord`（`packages/chord`，约 8800 行）是 pi 仓库里一个独立的底层包。它的 README 开头就说明：它在 pi 仓库里开发，但**不是 pi 的一部分**，不依赖任何其他 pi 包。它给自己的定位是“应用组装运行时”。
+`@earendil-works/chord`（`packages/chord`，不含测试约 1.36 万行，只依赖 TypeBox）是 pi 仓库里一个独立的底层包，不依赖任何其他 pi 包。
 
-它要解决的问题是：一个功能常常要拆到好几个进程里跑。比如一个插件，一部分在后台 agent 进程里调模型、改文件，一部分在终端界面里画状态，还有一部分将来可能在网页里。chord 提供一套通用机制，让同一个插件可以拆成几块，分别加载到该去的进程里，几块之间像调本地服务一样互相调用，状态自动同步。
+这个包在 10-12 被整个换掉了（`0104fef1e`）。上一版本文讲的 facet / `FacetHost` / `defineService` / bundler 那套“插件和服务”运行时已经删除，现在的实现来自私有仓库 pi-private 里的 `apps/p2`（代码里叫 chord2），连同测试和文档一起搬了过来。上一版用来举例的实验性 pi server / client 也在同一天删掉了（§1）。所以现在公开仓库里：
 
-现在用到它的是 `pi-durable`（§13）和 coding-agent 的实验性 client/server 架构，主产品 `pi` 命令不用。
+- `pi-durable` 只用它的 `replicatedState`（可观察、可增量同步的 JSON 状态）来放文档、对话视图、任务图；
+- 完整的对象运行时（host、对象、热重载）在公开仓库里没有应用在用，真正的使用者是 p2。下面的例子都来自 chord 自己的 README 和 `docs/guide.md`。
 
-### 14.1 五个概念
+### 14.1 概念
+
+chord 用**对象**来组装一个跨好几个进程（一个 server、若干 worker、浏览器标签页）的应用，而且能在运行中热重载代码。
 
 | 概念 | 是什么 |
 |---|---|
-| Service | 一个带类型的服务标识，`defineService<T>("pi.transcript")`。分单例（一个提供者）和 keyed（按 key 有多个实例）两种。标成 `local` 的只在本进程用，否则可以暴露给其他进程 |
-| Facet | 插件里能单独加载的一块。`setup(env)` 里同步声明：我提供什么服务（`provide` / `provideMany`）、我要用什么服务（`use` / `observe`） |
-| FacetHost | 一个进程里装载 facet 的宿主。所有 facet 声明完后，校验整张依赖图，按“提供者先于使用者”的顺序激活，关闭时倒序释放 |
-| Replicated state | 一份有唯一权威来源的状态。提供者用 `change(context, draft => {...})` 改，一次回调就是一个原子修订；本地和远端的订阅者拿到的都是完整的不可变值 |
-| Context | 类似 Go 的 `context`：带取消信号，也能携带调用范围内的值。chord 里所有异步调用都显式传它 |
+| 契约（contract） | 一种对象的运行时描述：名字、版本、输入（对象的地址）、成员。用 TypeBox schema 写，因为打包后的插件没有 TypeScript 类型，运行时要校验的都得写在契约里。分两种：`remote` 能被其他进程访问，所有跨进程的东西都要有 schema；`local` 只在本进程用，成员可以是函数、原生对象 |
+| 对象（object） | 某种契约的一个实例：一个地址上的状态加代码。每个 `(契约, 输入, principal)` 一个，第一次被 `get` 时创建，最后一个引用释放后销毁 |
+| 引用（reference） | 谁都拿不到对象本身，只能拿到引用。引用在本进程和跨进程用法一样，热重载后仍然有效 |
+| principal | 调用方是谁，由应用自己定义（比如 owner、guest、worker）。同一个对象地址，owner 和 guest 拿到的是两个不同的对象，可以有不同的方法（契约里的 `variants`）。principal 由连接所在的链路打上，调用方没法自己伪造 |
+| 状态 | 可观察的 JSON。远端的订阅者先拿到快照，之后只收增量 |
+| host | 一个进程里的运行时：`createHost` 建，`serve` 提供对象，`root` 开一个调用范围，`load` / `reload` 装载、热重载插件 |
+| 插件和 facet | 一个插件按 host 的种类分成几个 facet（`server.ts`、`worker.ts`、`web.tsx`），每个 facet 在对应的 host 上 `serve` 一些对象类型 |
+| 链路（link） | host 之间交换 JSON 帧的通道：内存、Node IPC、WebSocket |
 
-```mermaid
-classDiagram
-  class Service~T~ {
-    id: string
-    local: boolean
-  }
-  class Facet {
-    id: string
-    setup(env)
-  }
-  class FacetEnvironment {
-    +use(service) T
-    +observe(service, handler)
-    +provide(service, implementation)
-    +provideMany(service) ServiceSpawner
-    +replicatedState(initial) MutableReplicatedState
-    +own(disposal)
-    +onActivate(callback) / onDeactivate(callback)
-  }
-  class FacetHost {
-    services: RemoteServiceProvider
-    +reload(facets)
-    +dispose()
-  }
-  class ServiceSpawner~T~ {
-    +spawn(key, implementation) close
-  }
-  class ReplicatedState~T~ {
-    value: T
-    +subscribe(listener) unsubscribe
-  }
-  class MutableReplicatedState~T~ {
-    +change(context, mutate)
-    +replace(context, value)
-  }
-  class RemoteServiceSource {
-    +catalogue(context)
-    +open(services) RemoteServices
-  }
-  Facet ..> FacetEnvironment : setup 时拿到
-  FacetHost o-- Facet
-  FacetEnvironment ..> ServiceSpawner : provideMany 返回
-  FacetEnvironment ..> MutableReplicatedState : replicatedState 返回
-  ReplicatedState <|-- MutableReplicatedState
-  FacetHost ..> RemoteServiceSource : 解析其他进程提供的服务
-```
-
-一个服务的接口里只能有两种成员：返回 Promise、最后一个参数是 `Context` 的方法，以及 `ReplicatedState`。参数、返回值、状态都必须是严格的 JSON。这个约束在类型层面检查（`RemoteServiceContract<T>`），因为这些东西随时可能要跨进程传。
-
-### 14.2 一个例子：实验性的 pi server / client
-
-`coding-agent/src/experimental/services/` 用 chord 把 pi 拆成了三个部分：
-
-| 范围 | 跑在哪 | 提供的服务 |
-|---|---|---|
-| server | 常驻的服务进程 | `SessionDirectory`（会话列表，可复制状态）、`SessionManagement`（建、删、连接会话）、`PresentationPlugins` |
-| session | 每个会话一个 worker 进程，里面跑 durable 的 Harness | `AgentController`（提问、插话、排队、中断、压缩）、`Transcript`（对话视图，可复制状态）、`Models`、`SessionPlugins` |
-| presentation | 终端界面进程 | `SlashCommands`、`PresentationUI`，都标成 local，只在本进程用 |
-
-服务的定义就是一个接口加一个标识：
+远程契约里还写明了**对象住在哪个 host**，调用方从不指定 host：
 
 ```ts
-// experimental/services/transcript.ts
-export interface Transcript {
-  readonly state: ReplicatedState<ConversationView>;
-}
-export const Transcript = defineService<Transcript>("pi.transcript");
-```
-
-session worker 里提供它的 facet 只有几行，状态直接用 durable 的 `conversation.viewState()`：
-
-```ts
-// experimental/services/transcript-provider.ts
-export async function createTranscriptServiceFacet(conversation: Conversation, context: Context): Promise<Facet> {
-  const state = await conversation.viewState(context);
-  return defineFacet({
-    id: "@pi/transcript",
-    setup(env) {
-      env.own(() => state.dispose());
-      env.provide(Transcript, { state });
+export const Chat = remote("pi.chat", {
+  version: 1,
+  input: Type.Object({ session: Type.String(), conversation: Type.Number() }),
+  host: hostFamily("session:", "session"),  // { session: "S1", … } 的对象住在 session:S1 这个 host 上
+  variants: {
+    viewer: { state: { view: ConversationViewSchema } },
+    participant: {
+      state: { view: ConversationViewSchema },
+      methods: { send: method(SendInputSchema, Type.Object({ submissionId: Type.Number() })), stop: method() },
     },
-  });
-}
+  },
+});
 ```
 
-`AgentController` 是一组方法：`prompt`、`steer`、`followUp`、`cancelQueued`、`abort`、`compact`、`waitForPrompt`，每个都是 `(请求, context) => Promise<JSON 结果>`。
+### 14.2 提供一个对象
 
-终端界面那边的 facet 只写 `env.use(Transcript)`、`env.use(AgentController)`，不用关心这两个服务在哪个进程。宿主会去连上的 server 和 session 那里找；连接建立前，拿到的句柄处于“未连接”状态，连上之后自动接通。
+```ts
+host.serve(Counter, ({ name }, principal, self) => {
+  const count = self.state("count", Type.Number(), 0);   // 有名字的状态格子，热重载后保留
+  return {
+    variant: "default",
+    count,
+    increment: async ({ by }, ctx) => { count.change(ctx, (n) => n + by); },
+  };
+});
+
+await host.root(async (ctx) => {
+  const clicks = await ctx.get(Counter, { name: "clicks" });   // 拿到时状态已经就绪；这个 root 结束时释放
+  clicks.count.subscribe((n) => console.log("count", n));
+  await clicks.increment({ by: 2 }, ctx);
+});
+```
+
+工厂函数是同步的，只**声明**这个对象需要什么，慢的事情（连接、打开文件）在声明之后由运行时去做：
+
+| 声明 | 是什么 | 热重载时 |
+|---|---|---|
+| `self.state(name, schema, initial)` | 一个可观察的 JSON 格子 | 同名格子保留原值；版本号升高时走迁移函数 |
+| `self.get(Type, input)` | 对另一个对象的引用 | 新代码还声明就保留，否则释放 |
+| `self.resource(name, { version, open, close })` | 连接、文件监听、socket 这类资源 | 保留；`version` 变了才重开 |
+| `self.on(name, source, handler)` | 对状态或事件源的订阅 | 同一个订阅，换成新的 handler |
+| `self.task(async (ctx) => …)` | 长期运行的后台任务 | 旧的通过 `ctx.signal` 中止，结束后新代码再启动 |
+| `self.derive(sources, fn)` | 从状态派生出的值 | 重新建 |
+| `self.register(Registry, { key: value })` | 往一张注册表里登记条目 | 提交时整体替换 |
+
+规则很简单：**要跨过热重载保留的状态，必须放在格子里**，不能放在闭包变量里，闭包变量只活到下一次重载。
+
+对象的生命周期靠引用计数：被另一个对象 `self.get`、被一次调用 `ctx.get`、被远端连接持有、或者声明成 `lifetime: "host"`（随 host 一起存在），任何一种引用都能让它活着；最后一个引用释放后（再等 `linger` 这么久）就销毁：中止任务、移除订阅、倒序关闭资源，再释放它自己持有的引用。
+
+### 14.3 进程之间
+
+```ts
+// server
+const server = createHost<Principal>({ name: "server", self: { kind: "host" }, principalKey });
+server.accept(webSocketLink(wss, { principal: (req) => authenticate(req) }));   // 按 cookie 打上 owner 或 guest
+server.route("session:", {
+  authorize: (principal, host) => canReach(principal, host),
+  resolve: (host) => workers.ensure(host),           // 需要时拉起这个会话的 worker 进程
+  principal: (host) => workers.principal(host),
+});
+
+// worker
+const worker = createHost<Principal>({
+  name: `session:${id}`,
+  self: { kind: "host" },
+  principalKey,
+  upstream: { link: ipcLink(process), principal: { kind: "server" } },
+});
+```
 
 ```mermaid
 sequenceDiagram
-  participant TUI as 终端界面 facet
-  participant CH as chord（两端的宿主和传输）
-  participant W as session worker
-  participant H as durable Harness
+  participant B as 浏览器 host
+  participant S as server host
+  participant W as worker host（session:S1）
 
-  TUI->>CH: env.use(Transcript)、env.use(AgentController)
-  CH->>W: 订阅 pi.transcript
-  W-->>CH: 当前 ConversationView 完整快照
-  CH-->>TUI: 状态就绪，渲染
-  TUI->>CH: agentController.prompt({ message }, context)
-  CH->>W: 一次远程调用
-  W->>H: conversation.submit(...)
-  loop 每次 durable 提交
-    H->>W: viewState 发布一个原子修订（一批精确操作）
-    W->>CH: 按这个订阅自己的路径字典编码增量
-    CH-->>TUI: 应用增量，得到新的完整不可变值
+  B->>S: ctx.get(Chat, { session: "S1", conversation: 1 })
+  S->>S: 按契约算出对象在 session:S1；authorize 检查这个 principal 能不能去
+  S->>W: resolve：需要的话拉起 worker，转发 hold（带上浏览器连接的 origin）
+  W->>W: 按 (Chat, 输入, principal) 找到或创建对象，选出 variant
+  W-->>S: shape + 每个状态成员一份快照
+  S-->>B: 转发，引用就绪
+  loop 状态变化
+    W-->>S: 增量
+    S-->>B: 转发增量
   end
+  B->>S: chat.send(...)
+  S->>W: 转发调用
 ```
 
-README 里特别提到：durable 每次提交都直接发布精确的操作，worker 自己不用写任何 reducer；界面拿到的副本、补齐、序号、断档检测全由 chord 负责。
+server 在各个子进程之间做中继：worker 到 worker、浏览器到 worker 都经过它。浏览器断开时，它在各个 worker 里持有的引用正好全部释放。转发来的 principal 只接受来自父链路的，对象自己发起的调用以所在 host 的身份进行。
 
-### 14.3 增量同步
+链路有流控：对方确认处理过的帧，未确认的超过一个窗口（默认 256 KiB）时，状态更新先在发送端按成员合并着等；每条链路等待的增量有上限（默认四个窗口），超出时最老的那些换成一次当前值的整体重置。调用、返回值和新引用的第一份快照不受这个限制，所以一次 `get` 不会排在别人的状态更新后面。代价是负载高时，调用的返回值可能比它引起的状态变化先到。
 
-可复制状态能高效同步，靠的是 `@earendil-works/chord/delta` 里的增量跟踪器（`delta/tracker.ts`，2200 多行）：
+### 14.4 和 durable 的结合
+
+chord 的文档里专门有一段讲 durable：worker 的 host 把 durable 的 Harness 作为一个 `lifetime: "host"` 的本地对象提供出来，插件往一张注册表里登记 durable 扩展，就像登记别的东西一样：
+
+```ts
+host.serve(Harness, (_, _host, self) => {
+  const durable = self.resource("durable", {
+    version: 1,
+    open: () => DurableHarness.open(storage, { models, registry: durableRegistry(host, Extensions) }),
+    close: (h) => h.close(),
+  });
+  return { conversation: (id: number) => durable.value.conversation(id) };
+}, { lifetime: "host" });
+```
+
+热重载换掉一个扩展（比如一个拦危险命令的守卫）时，已经在跑的 durable 阶段继续用旧的注册表快照，下一个阶段用新的，任何时刻都不会有一个阶段没有守卫。
+
+### 14.5 热重载
+
+`host.reload(facets)` 分五步：
+
+1. **加载**新模块。
+2. **准备**：在现有对象上跑新的工厂函数，但没有副作用：写格子会抛错，订阅和任务不启动，注册只收集，变了的资源在旧资源旁边新开一份。再用所有在线的使用方检查契约兼容。任何一步失败，一切保持原样。
+3. **闸门**：只有格子的版本升高、或者独占资源变了时才需要，等到安全点再迁移。
+4. **提交**：一个同步步骤里装上新代码、替换注册表、重启任务、重新绑定订阅，并通知订阅者状态的形状变了。
+5. **退役**：旧代码继续跑完它已经开始的 root，跑完后连同只有它声明的东西一起丢掉。
+
+修 bug、加方法、加格子、加资源这类兼容的修改，不需要等待，立即切换：已经开始的 root 在旧代码上跑完，新的 root 用新代码。跨 host 时由 server 统一协调准备和提交；重载之后才拉起的 worker，会先追上 server 的代码版本再接收请求。浏览器不参与提交，只通过形状和重置消息得知代码变了，契约不兼容时调用会返回 `upgrade_required`。
+
+### 14.6 增量同步
+
+可复制状态能高效同步，靠的是 `@earendil-works/chord/delta` 里的增量跟踪器（`delta/tracker.ts`，2200 多行）。这部分在 10-12 的替换中没有变：
 
 ```ts
 import { applyImmutable, track } from "@earendil-works/chord/delta";
@@ -2157,28 +2214,23 @@ const replica = applyImmutable(prepared.base, prepared.ops);   // 另一端按�
 
 几条约定：
 
-- 不可变：已发布的值不能再改，未改动的子树在前后修订之间共享。
-- 有界：每个订阅最多排队 100 个待发修订；再多就把整个队列换成一次完整快照（reset），订阅者先处理 reset 再接着收增量。
+- 不可变：已发布的值不能再改，未改动的子树在前后修订之间共享。为了性能，它靠约定而不是冻结或深拷贝来保证这一点，改了已发布的值就是违约。
+- 有界：本进程里，每个订阅最多排队 100 个待投递的修订，再多就换成一次完整快照；跨进程时由链路的流控兜底（§14.3）。
 - 远端断线或提供者被替换时，副本变成“未就绪”，重新同步后才恢复。
 
-### 14.4 热重载
-
-`FacetHost.reload(facets)` 先激活新一代的 facet，校验通过后再切换。对单例服务来说，使用者手里的句柄在切换过程中一直可用，不会断开。实验性 TUI 里的 `/reload` 就是这么做的：重新打包插件，加载新一代，切过去，再释放旧的。
-
-chord 还自带打包和加载工具：`@earendil-works/chord/bundler` 用 esbuild 把插件的每个 facet 入口（约定是 `src/session.ts`、`src/tui.ts` 这样）打成独立的 CommonJS 文件，并生成一个清单；`@earendil-works/chord/node` 的加载器校验 SHA-256 后用 `node:vm` 执行，不进 Node 的模块缓存，所以旧一代可以被垃圾回收。
-
-### 14.5 和其他几家的对比
+### 14.7 和其他几家的对比
 
 opencode 和 kimi-code 也都有自己的服务装配机制，但侧重点不同：
 
 | | pi 的 chord | opencode v2 | kimi-code |
 |---|---|---|---|
-| 依赖注入 | facet 声明提供 / 使用，宿主校验依赖图 | Effect 的 Layer + 自己的 `LayerNode` 图 | VS Code 风格的 `createDecorator` / `InstantiationService` |
-| 层级 | 没有固定层级；按进程分（server / session / presentation） | 进程级 / 目录级两级 | App / Session / Agent 三级子容器 |
-| 按 key 的实例 | keyed 服务，由提供者主动 `spawn(key, 实现)`；同一个 key 不能重复建 | 目录级服务由 `LayerMap` 按目录懒建并缓存 | 工作区由 `WorkspaceInstanceManager.getOrCreate` 缓存 |
-| 跨进程 | 核心能力：服务远程调用，状态以增量复制 | 不在装配机制里，靠 HTTP 接口加事件流 | 不在装配机制里，靠 wire 协议 |
+| 依赖怎么声明 | 对象的工厂函数里用 `self.get` 声明对其他对象的引用 | Effect 的 Layer + 自己的 `LayerNode` 图 | VS Code 风格的 `createDecorator` / `InstantiationService` |
+| 层级 | 没有固定层级；按 host 分（server / worker / 浏览器），契约写明对象住在哪个 host | 进程级 / 目录级两级 | App / Session / Agent 三级子容器 |
+| 按 key 的实例 | 每个 `(契约, 输入, principal)` 一个对象，第一次 `get` 时创建，靠引用计数销毁 | 目录级服务由 `LayerMap` 按目录懒建并缓存 | 工作区由 `WorkspaceInstanceManager.getOrCreate` 缓存 |
+| 跨进程 | 核心能力：引用透明地跨进程，状态以增量复制，server 负责中继和权限 | 不在装配机制里，靠 HTTP 接口加事件流 | 不在装配机制里，靠 wire 协议 |
+| 热重载 | 核心能力：两阶段提交，状态格子跨重载保留 | 配置变了，目录级服务整套重建，正在跑的 runner 换一套服务接着跑 | `/reload` 重载配置和插件后关掉会话、从 `wire.jsonl` 恢复；DI 的 `cascadeEngine` 支持运行时增删服务 |
 
-chord 最有特点的是最后一行：把“跨进程”放进了服务模型本身，一个服务在本进程还是在另一个进程，对使用者是透明的。代价是接口必须是严格 JSON，所有调用都是异步的。
+chord 最有特点的是后两行：把“跨进程”和“热重载”都放进了对象模型本身。一个对象在本进程还是在另一个进程、代码是不是刚换过，对使用者都是透明的。代价是跨进程的接口必须是严格 JSON，所有调用都是异步的，要保留的状态必须老老实实放进格子里。
 
 ---
 
@@ -2213,7 +2265,7 @@ chord 最有特点的是最后一行：把“跨进程”放进了服务模型�
 | 1 | 没有 OS 级沙箱，权限只有 `beforeToolCall` 一个钩子且默认没人订阅 | 需要隔离只能自己套容器 |
 | 2 | 循环状态全在内存 | 进程死了运行就没了；`pi-durable` 在解决，但主线还没切过去 |
 | 3 | 事件监听器全部 `await` 串行 | 一个慢监听器拖慢整个流；RPC 模式要专门加背压 |
-| 4 | `AgentSession` 4398 行，`interactive-mode.ts` 7109 行 | 产品层没有再分层，什么都往 `AgentSession` 里放，而且还在变大（9 月分别是 3552 和 6620 行） |
+| 4 | `AgentSession` 4428 行，`interactive-mode.ts` 7127 行 | 产品层没有再分层，什么都往 `AgentSession` 里放，而且还在变大（9 月分别是 3552 和 6620 行） |
 | 5 | 排队队列的 UI 显示靠文本匹配（`_handleAgentEvent` 用 `indexOf(messageText)` 找）| 两条相同文本的插话会错删 |
 | 6 | 重试判定靠正则匹配错误文案 | 新 provider 的新文案要手动加进 `RETRYABLE_PROVIDER_ERROR_PATTERN`（现在在 pi-ai 的 `utils/retry.ts`） |
 | 7 | 回调一层套一层：`prepareRequest`、`finishTurn`、`transformContext` 都被 `AgentSession` 的多个 `_install*` 依次包装 | 一次请求前到底改了几次上下文，要把这些包装按安装顺序串起来看才清楚 |
