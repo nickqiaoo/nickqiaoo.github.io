@@ -8,7 +8,7 @@ series: agents
 seriesOrder: 4
 ---
 
-> 对照的是 MoonshotAI/kimi-code 的 `18c6d6427`（2026-10-16，应用版本 2.2.0）。初版对照的是 `21406fb4c`（09-30，2.1.1），10-16 核对了之后的 42 个提交：循环、状态机、上下文内存、持久化这些主干没有改动，新增的是外部变更通知（§6.5），另有权限开关（§7.4）、MCP 工具按需加载的默认值（§6.3）几处小改动，变化最大的 tower 功能本文没有展开。源码路径省略前缀 `packages/agent-core-v2/src/`，比如 `agent/loop/loopService.ts` 指 `packages/agent-core-v2/src/agent/loop/loopService.ts`。
+> 源码路径省略前缀 `packages/agent-core-v2/src/`，比如 `agent/loop/loopService.ts` 指 `packages/agent-core-v2/src/agent/loop/loopService.ts`。
 >
 > 有两点先说明。一是 `agent-core-v2`、`kap-server`、`transcript` 三个包不允许写注释，JSDoc 也不行，lint 里的 `scripts/check-no-comments.mjs` 会检查。设计说明只能去 `packages/agent-core-v2/docs/zh/` 下找：`llm.md` 讲 LLM 请求库的设计原则，`event-name.md` 讲状态机里状态、事件的命名规范。二是这个仓库重构很频繁，一天合好几个结构性 PR 很常见，所以下文只引文件和函数名，不引行号。
 
@@ -43,7 +43,6 @@ flowchart TD
 | `pi-tui` | 约 1.9 万 | 终端界面库，从 pi-mono 的 `packages/tui` 拷过来单独维护（见包里的 `UPSTREAM.md`） |
 | `minidb` | 约 1.9 万 | 纯 Node 的嵌入式 KV 数据库，给会话索引和搜索用 |
 | `tree-sitter-bash` | 约 5000 | 纯 TypeScript 的 bash 解析器，权限判断危险命令时用 |
-| `kosong` | | 早期的 LLM 抽象层，引擎已经不依赖它。早期的执行环境抽象层 `kaos` 已经在 10-12 删掉了（#4184） |
 
 `apps/` 下除了 `kimi-code`，还有 VS Code 插件、`kimi-inspect`（调试工具）和 `vis`（可视化）。
 
@@ -420,7 +419,7 @@ agent 状态机在 `idle.gating` 里调用 `runPromptGate`。它跑 `onBeforeSub
 
 通知是给系统用的：后台任务完成、cron 到点、goal 功能要求继续，都用 `notify`。每条通知在 kimi 这边有一条记录，带两个回调：`onConsume`（被模型用掉时）和 `onDrop`（被作废时）。
 
-客户端调用的是 `AgentPromptChannel`（`agent/loop/promptChannel.ts`）。原来的 `PromptService` 删掉后只剩这一层转发，服务标识名还叫 `agentPromptService`，所以 klient、kap-server 的调用方不用改。
+客户端调用的是 `AgentPromptChannel`（`agent/loop/promptChannel.ts`）。
 
 ---
 
@@ -520,8 +519,8 @@ turn 状态机调请求函数时，会把 `history + produced`（开轮时的历
 | 模型、服务商 | 本轮第一次请求时算一次（`profile.resolveModelContext()`），存进 `turnConfigs[turnId]` | 本轮内不变。轮中切模型，下一轮才生效 |
 | 请求参数（温度、思考强度等） | 同上，`profile.resolveRequestParams()` | 本轮内不变 |
 | 系统提示词 | 同上，`profile.getSystemPrompt()` | 本轮内不变 |
-| `max_tokens` | 综合模型最大输出、预留上下文、配置上限、当前已用 token 数 | 每次重算。最近的提交（#4091）改成只有显式配置时才传这个上限 |
-| 工具列表 | 工具注册表 → `toolSelect.shapeTools()` → 去掉“延迟披露”的工具（按需加载的 MCP 工具，模型要先调 `select_tools` 才能用；每个 MCP 服务器可以在 `mcp.json` 里设 `deferred`，10-14 起还有全局默认值 `default_deferred`） | 每次重算。MCP 工具刚连上、plan 模式刚切换、`select_tools` 刚加载了新工具，下一步就能看到 |
+| `max_tokens` | 综合模型最大输出、预留上下文、配置上限、当前已用 token 数 | 每次重算。只有显式配置时才传这个上限 |
+| 工具列表 | 工具注册表 → `toolSelect.shapeTools()` → 去掉“延迟披露”的工具（按需加载的 MCP 工具，模型要先调 `select_tools` 才能用；每个 MCP 服务器可以在 `mcp.json` 里设 `deferred`，也可以用 `default_deferred` 设置全局默认值） | 每次重算。MCP 工具刚连上、plan 模式刚切换、`select_tools` 刚加载了新工具，下一步就能看到 |
 | 消息 | `context.get()` → `toolSelect.shapeHistory()` → 上下文投影 `projector.project()` → 解析媒体 | 每次重算。上一步写进去的回复、工具结果、刚消费的通知、钩子注入的提醒都在里面 |
 
 也就是说，模型配置在一轮内固定，工具和消息每一步重新算。用户在一轮中途切模型，不会出现同一轮前后两步用不同模型的情况；而 MCP 工具一连上，下一步就能用。
@@ -568,7 +567,7 @@ turn 状态机调请求函数时，会把 `history + produced`（开轮时的历
 
 系统提示词是绑定 profile 时渲染的，AGENTS.md 的内容、可用技能列表都渲染在里面。渲染结果作为 `ProfileBind` 事件写进 `wire.jsonl`，恢复会话时直接用记录里的文本，不重新渲染，这样提示缓存不会失效。代价是 AGENTS.md 改了、装了新技能、子 agent 的配置变了，系统提示词里写的还是旧的。
 
-以前只有 AGENTS.md 有处理：监听文件变化，提醒模型“这些文件在注入后改过了，去读最新的”。10-16（#4019）把这件事统一交给新的 `AgentChangeNotifierService`（`agent/changeNotifier/`，Agent 作用域，只在主 agent 上工作）：
+`AgentChangeNotifierService`（`agent/changeNotifier/`，Agent 作用域，只在主 agent 上工作）：
 
 1. 绑定 profile 时，把这次渲染进系统提示词的 AGENTS.md、技能列表记成“模型已知的版本”（代码里叫 beliefs），作为状态 `changeNotifier.snapshot` 写进 `wire.jsonl`。
 2. 项目指令、技能目录、子 agent 目录任何一个发出变化事件，就重新读一遍，和记下的版本比较。
@@ -684,16 +683,16 @@ sequenceDiagram
 | 7 | `user-configured-allow` | 用户配置的允许规则 |
 | 8 | `sensitive-file-access-ask` | 读写敏感文件要问 |
 | 9 | `git-control-path-access-ask` | 动 `.git` 里的控制文件要问 |
-| 10 | `yolo-mode-approve` | yolo 模式放行（解析不了的 bash 命令在 yolo 下也放行，#3869） |
+| 10 | `yolo-mode-approve` | yolo 模式放行（解析不了的 bash 命令在 yolo 下也放行） |
 | 11 | `default-tool-approve` | 默认放行的只读工具 |
 | 12 | `git-cwd-write-approve` | 在 git 工作区内写文件放行 |
 | 13 | `fallback-ask` | 兜底：问 |
 
-第 3、8、9 条是三条内置的“守卫”（guard）策略。配置 `[permission] dangerous_command_guard = false`（或环境变量 `KIMI_CODE_DANGEROUS_COMMAND_GUARD=false`）可以把它们一起关掉；10-16（#4250）之前这个开关只管危险命令那一条。关掉之后，“需要时询问”模式下只剩用户自己配的 `ask` 规则会弹审批。`Read` / `Write` / `Edit` 工具对密钥文件的硬拦截不受影响，那不在策略链里。
+第 3、8、9 条是三条内置的“守卫”（guard）策略。配置 `[permission] dangerous_command_guard = false`（或环境变量 `KIMI_CODE_DANGEROUS_COMMAND_GUARD=false`）可以把它们一起关掉。关掉之后，“需要时询问”模式下只剩用户自己配的 `ask` 规则会弹审批。`Read` / `Write` / `Edit` 工具对密钥文件的硬拦截不受影响，那不在策略链里。
 
 ### 7.5 插话怎么打断工具
 
-插话到达时，`AgentLoopService` 会 abort 当前轮的 `steerController`，这个信号作为 `steerSignal` 传进每个工具的执行上下文，要不要响应由工具自己决定。目前只有等待后台任务的 `WaitFor` 工具会响应（`agent/tools/task/task-wait/taskWaitTool.ts`）：被插话打断时返回一个“等待被中断”的正常结果。这样这一批工具很快都有了结果，turn 状态机进 `draining`，把插话带进下一步。最近的提交（#4061）还把它的等待时间上限定成了 90 秒。
+插话到达时，`AgentLoopService` 会 abort 当前轮的 `steerController`，这个信号作为 `steerSignal` 传进每个工具的执行上下文，要不要响应由工具自己决定。目前只有等待后台任务的 `WaitFor` 工具会响应（`agent/tools/task/task-wait/taskWaitTool.ts`）：被插话打断时返回一个“等待被中断”的正常结果。这样这一批工具很快都有了结果，turn 状态机进 `draining`，把插话带进下一步。
 
 ---
 
@@ -789,7 +788,7 @@ sequenceDiagram
 | `maxOverflowCompactionAttempts` | 3 | 连续因溢出压缩的上限 |
 | `maxRecentMessages` / `maxRecentSizeRatio` | 4 / 0.2 | 摘要之后原样保留最近几条消息 |
 
-压缩的过程：取当前上下文，加一条压缩指令（`agent/fullCompaction/compaction-instruction.md`），通过同一个请求服务发出去。发之前先估算一下，如果历史加压缩指令超过模型的有效窗口（扣掉给摘要预留的输出空间），就先从前面丢掉一部分（#3911）。压缩请求本身还是溢出，就再砍掉一部分重试；摘要被截断时丢掉最老的一条再试；最多尝试几次可以配置。成功后检查压缩期间历史有没有被改过，改过就放弃这次结果。
+压缩的过程：取当前上下文，加一条压缩指令（`agent/fullCompaction/compaction-instruction.md`），通过同一个请求服务发出去。发之前先估算一下，如果历史加压缩指令超过模型的有效窗口（扣掉给摘要预留的输出空间），就先从前面丢掉一部分。压缩请求本身还是溢出，就再砍掉一部分重试；摘要被截断时丢掉最老的一条再试；最多尝试几次可以配置。成功后检查压缩期间历史有没有被改过，改过就放弃这次结果。
 
 摘要后面会追加一段 Context Recovery 脚注（`agent/fullCompaction/context-recovery-footer.md`），写明这个 agent 的 `wire.jsonl` 路径和被压缩的行号范围，告诉模型“需要原始的命令输出、文件内容、错误信息时，去这个日志里查，别猜”。压缩掉的细节，模型可以自己用读文件工具查回来。
 
@@ -865,7 +864,7 @@ assistant 消息和工具消息不是整条写，而是按循环片段写（`age
 
 ### 11.2 引擎里有、产品层还没用的功能
 
-`human/` 还在迁移中，下面这些在引擎里实现了、也有测试，但 kimi 产品层没有接：
+下面这些在引擎里实现了、也有测试，但 kimi 产品层没有接：
 
 | 引擎功能 | kimi 实际用的 |
 |---|---|

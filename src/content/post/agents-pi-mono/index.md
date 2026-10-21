@@ -35,14 +35,6 @@ graph LR
 
 `pi-ai`封装了对各个模型厂商的调用，`pi-agent-core`是Agent最核心的事件循环逻辑，是我们需要重点学习的部分，`pi-coding-agent`是基于core封装的完整产品。如果我们想要做自己的 Coding Agent，那么就可以使用 `pi-ai` 和 `pi-agent-core`。
 
-10 月初 `pi-agent-core` 做了一次瘦身（`7fd478a2e`）：以前放在 `packages/agent/src/harness/` 下的 2 万多行实验性 harness 整个删掉了，现在这个包只剩 `Agent`、`agent-loop.ts`、代理流和类型定义，一共 2500 行左右。harness 的思路搬进了新的 `pi-durable` 包，见 §13。
-
-本文对照的是 pi-mono 2026-10-16 的 `790271cd0`（`pi-coding-agent` 1.3.0）。10-08 的上一版对照的是 `1cedd3272`，这之间的 147 个提交里，主线（`pi-agent-core` 一行没改，`AgentSession` 和 `pi-ai` 有几处修改，见 §6、§7.2、§8.3）变化不大，大的变化在实验部分：
-
-- 10-12 的 `7472cda0d` 删掉了实验性的 server 栈：`packages/client`、`packages/protocol`、`packages/server` 三个包，以及 coding-agent 里的 `src/experimental/`、`src/client/`。coding-agent 从此不再依赖 chord，主产品 `pi` 和 durable、chord 完全没有关系了。
-- 同一天的 `0104fef1e` 把 chord 整个换成了一套新运行时（代码里叫 chord2），它来自 pi-private 仓库里的 `apps/p2`（取代原来 Pi Mobile 的新应用，不开源）。§14 按新版重写。
-- durable 继续往前走：工具嵌套调用、按需加载的工具、能在重启后续跑的 Code Mode 等（§13.5）。
-
 ---
 
 ## 2. 数据模型
@@ -206,7 +198,7 @@ classDiagram
 | `AgentToolResult` | 工具执行返回值。`content` 给模型看，`details` 给 UI 看，`structuredContent` 给程序调用方看（比如 codemode 脚本，§4.4）。`isError: true` 表示失败但不抛异常。`terminate` 是"这批工具跑完后停下"的提示。 |
 | `Context` | pi-ai 对外的上下文格式，系统提示词和工具还可以单独放在 `systemPrompt`、`tools` 两个字段里。 |
 | `TranscriptContext` | 协议模块真正收到的上下文，只有 `messages`。`normalizeContext` 把 `Context.systemPrompt` 和 `Context.tools` 折成开头的一条 `SystemMessage`，所以到了协议这一层，提示词和工具只能从 system 消息里读。这个类型带了一个品牌字段，只有 `normalizeContext` 能造出来，防止没折叠过的 `Context` 直接传进协议代码。 |
-| `AgentContext` | 循环用的上下文，消息是 `AgentMessage[]`，工具是 `AgentTool[]`。以前还有 `systemPrompt` 字段，现在去掉了：提示词就在 `messages` 里的 system 消息中。`tools` 只表示“这次运行能执行哪些工具”，模型能看到哪些工具，由 system 消息声明（§2.5）。 |
+| `AgentContext` | 循环用的上下文，消息是 `AgentMessage[]`，工具是 `AgentTool[]`。提示词就在 `messages` 里的 system 消息中。`tools` 只表示“这次运行能执行哪些工具”，模型能看到哪些工具，由 system 消息声明（§2.5）。 |
 
 ### 2.3 两条事件流
 
@@ -302,18 +294,14 @@ classDiagram
 SessionEntry就是持久化存储时的格式，文件是一个JSONL，第一行是 `SessionHeader`（带 `id` / `cwd` / `parentSession`），后面每行一个entry。
 每个entry都有 `id` 和 `parentId`，所以整个文件其实是一棵树，而不是按顺序排下来的一串记录，详见 §11。
 
-现在一共 11 种条目，比 9 月多了两种：
+一共 11 种条目，其中两种值得单独说明：
 
 - `context_edit`：只追加、不改旧条目的“上下文修改”。`replacement` 为 `null` 表示把 `targetId` 指向的那条从模型上下文里拿掉，不为空就替换它的 `content`。原条目还留在文件里，UI 和导出照样能看到。自动重试、溢出恢复丢弃失败的那次回答，用的就是它（§10）。扩展也可以在 `turn_end` 时写（§4.3）。
 - `usage`：记一笔不属于对话本身的花费，比如提示缓存预热（`CacheWarmer`）产生的用量。
 
-`CompactionEntry` 多了 `systemMessage`：压缩那一刻把当前完整的提示词和工具声明存一份，因为压缩会把前面那些 system 消息一起摘要掉（§11）。
+`CompactionEntry` 的 `systemMessage`：压缩那一刻把当前完整的提示词和工具声明存一份，因为压缩会把前面那些 system 消息一起摘要掉（§11）。
 
 ### 2.5 提示词和工具也写进对话记录
-
-9 月中旬以前，系统提示词和工具列表是两个独立的字段：`AgentContext.systemPrompt` 和 `AgentContext.tools`，每次请求都整份带上。现在（#9548，`9e05370b2`）它们变成了对话记录里的 `SystemMessage`，和用户消息、模型回复排在同一个列表里。
-
-为什么要改？一是提示词缓存。以前切一个工具、改一段提示词，请求最前面的 system 部分就变了，整段缓存作废。现在变化写成一条新的 system 消息，追加在对话后面，前面已经缓存的部分不动。二是可以回放：会话文件里记着每次提示词和工具是怎么变的，恢复会话、跳分支时能还原出当时模型看到的东西。
 
 #### system 消息怎么表示变化
 
@@ -322,7 +310,7 @@ SessionEntry就是持久化存储时的格式，文件是一个JSONL，第一行
 | 对话开头第一条 | `content` 是基础提示词，`sections` 是各个具名段落，`toolsAdded` 是初始工具 | 完整声明 |
 | 后面的 system 消息 | `sections` 里只放变了的段落，值为 `null` 表示删掉这段；`toolsAdded` / `toolsRemoved` 是工具的增减；`content` 非空就是追加的说明 | 增量补丁 |
 
-pi-ai 的 `utils/transcript.ts` 提供了一组回放函数：`getCurrentSystemMessage(messages)` 从头扫到尾，把所有 system 消息依次叠上去，得到“现在”的提示词和工具；`getCurrentTools` 只算工具；`getCurrentSystemPrompt` 渲染成一段文本。`agent.state.systemPrompt` 现在是只读的 getter，就是调的这个回放。
+pi-ai 的 `utils/transcript.ts` 提供了一组回放函数：`getCurrentSystemMessage(messages)` 从头扫到尾，把所有 system 消息依次叠上去，得到“现在”的提示词和工具；`getCurrentTools` 只算工具；`getCurrentSystemPrompt` 渲染成一段文本。`agent.state.systemPrompt` 是只读的 getter，就是调的这个回放。
 
 coding-agent 的默认提示词按段落拆好（`system-prompt.ts` 的 `buildSystemPromptSections`）：`preamble`（开场白）、`tools`（工具简介）、`rules`（规则）、`docs`（pi 文档位置）、`addendum`（追加提示词）、`project_context`（AGENTS.md 等）、`skills`、`cwd`，扩展还能加自己的段落。`diffSystemPromptSections` 拿新旧两份逐段比较，只把变了的段落放进补丁。
 
@@ -352,16 +340,14 @@ sequenceDiagram
 
 分工是这样的：提示词段落的变化由产品层 `AgentSession` 算，工具的增减由核心层的 `declareToolChanges`（`agent-loop.ts`）在每次请求前算。`context.tools` 是“能执行的工具”，system 消息里声明的是“模型能看到的工具”，`declareToolChanges` 负责让两者一致。
 
-协议模块那边，每个模型的 `compat.supportsMidConvoSystemMessages` 决定能不能把 system 消息原样留在对话中间。Anthropic 的部分模型还支持 `supportsMidConvoToolChanges`，工具增减直接写成 `tool_addition` / `tool_removal` 块。不支持的模型由 `resolveTranscript` 退回老办法：全部回放成一条，放在请求最前面。
+协议模块那边，每个模型的 `compat.supportsMidConvoSystemMessages` 决定能不能把 system 消息原样留在对话中间。Anthropic 的部分模型还支持 `supportsMidConvoToolChanges`，工具增减直接写成 `tool_addition` / `tool_removal` 块。不支持的模型由 `resolveTranscript` 处理：全部回放成一条，放在请求最前面。
 
 #### 每次请求都从会话文件重新算上下文
-
-另一个相关的变化（`466db0fec`）：产品层不再信任内存里的 `agent.state.messages`，而是在每次请求前，从 `SessionManager` 重新算一遍上下文。
 
 `AgentSession` 给 `Agent` 装了一个 `prepareRequest` 回调（`_installAgentRequestProjection`），它在每次模型请求前、待发送的消息都已经追加之后执行：调 `sessionManager.buildSessionProjection()`，用投影出来的 `messages` 换掉循环里的上下文，再把 `agent.state.tools` 作为可执行工具一起交回去。所以：
 
 - 会话文件（JSONL 里的条目树）是上下文的唯一来源。`context_edit`、压缩、分支摘要这些条目，都在投影时生效。
-- 直接给 `agent.state.messages` 赋值，不会再影响后面的请求（coding-agent 0.87.0 的 Breaking 变更）。想改上下文，就通过 `session.sessionManager` 往会话里追加条目，再调 `session.refreshContext()`；或者用 `navigateTree()` 换分支。
+- 直接给 `agent.state.messages` 赋值，不会影响后面的请求。想改上下文，就通过 `session.sessionManager` 往会话里追加条目，再调 `session.refreshContext()`；或者用 `navigateTree()` 换分支。
 - 恢复旧会话时，历史从 `new Agent({ initialState: { messages } })` 传进去，而不是事后赋值。
 
 ---
@@ -471,12 +457,12 @@ Agent 里存了这些字段：
 
 | 字段 | 含义 |
 |---|---|
-| `_state: MutableAgentState` | 当前模型、思考等级、工具列表、消息列表，以及运行时的流状态。`systemPrompt` 现在是只读的 getter，每次都从 `messages` 里的 system 消息回放出来（§2.5）。构造时传进来的 `initialState.systemPrompt` 和 `tools` 只用来生成开头那条 system 消息，`messages` 本身已经以 system 消息开头时就不再生成。 |
+| `_state: MutableAgentState` | 当前模型、思考等级、工具列表、消息列表，以及运行时的流状态。`systemPrompt` 是只读的 getter，每次都从 `messages` 里的 system 消息回放出来（§2.5）。构造时传进来的 `initialState.systemPrompt` 和 `tools` 只用来生成开头那条 system 消息，`messages` 本身已经以 system 消息开头时就不再生成。 |
 | `listeners` | 订阅者集合。`AgentSession` 是其中一个。 |
 | `steeringQueue` / `followUpQueue` | 两个待投递队列，分别对应"插话"和"追加"。默认模式都是 `one-at-a-time`。 |
 | `activeRun?: ActiveRun` | 当前是否正在运行 |
-| `convertToLlm` / `transformContext` / `streamFunction` / `getApiKey` / `onPayload` / `onResponse` / `onProviderStreamEvent` | 全是公开的可替换回调。产品层构造时传进来（§6）。`onProviderStreamEvent` 是新加的，能拿到 provider 原始的流事件 |
-| `beforeToolCall` / `afterToolCall` / `finishTurn` / `prepareRequest` / `prepareNextTurn` / `prepareNextTurnWithContext` | 也是公开回调。`finishTurn` 取代了原来的 `shouldStopAfterTurn`，`prepareRequest` 是新加的（§3.3）。 |
+| `convertToLlm` / `transformContext` / `streamFunction` / `getApiKey` / `onPayload` / `onResponse` / `onProviderStreamEvent` | 全是公开的可替换回调。产品层构造时传进来（§6）。`onProviderStreamEvent` 能拿到 provider 原始的流事件 |
+| `beforeToolCall` / `afterToolCall` / `finishTurn` / `prepareRequest` / `prepareNextTurn` / `prepareNextTurnWithContext` | 也是公开回调（§3.3）。 |
 | `sessionId` / `thinkingBudgets` / `transport` / `maxRetryDelayMs` / `toolExecution` | 透传给流函数的选项。`toolExecution` 默认 `"parallel"`。 |
 
 主要方法：
@@ -492,7 +478,7 @@ Agent 里存了这些字段：
 | `waitForIdle()` | 等当前这次运行跑完再返回；没在运行就直接返回。 | `AgentSession.waitForIdle` |
 | `reset()` | 清空消息、运行时状态、两个队列。运行中调用会抛错。 | 新会话 |
 | `runPromptMessages(messages, options)` | 核心：`runWithLifecycle` 包住 `runAgentLoop(messages, createContextSnapshot(), createLoopConfig(options), processEvents, signal, streamFunction)`。 | `prompt` / `continue` |
-| `createContextSnapshot()` | 返回 `{ messages: slice(), tools: slice() }`。返回的是拷贝，循环改它不会影响 Agent 自己的状态。提示词已经在 `messages` 里了，不再单独带。 | `runPromptMessages` |
+| `createContextSnapshot()` | 返回 `{ messages: slice(), tools: slice() }`。返回的是拷贝，循环改它不会影响 Agent 自己的状态。提示词在 `messages` 里。 | `runPromptMessages` |
 | `createLoopConfig(options)` | 把 Agent 上所有回调和选项打包成一个 `AgentLoopConfig` 对象。`reasoning` 由 `thinkingLevel === "off" ? undefined : thinkingLevel` 算出。`getSteeringMessages` 就是 `steeringQueue.drain()`，`getFollowUpMessages` 就是 `followUpQueue.drain()`。 | `runPromptMessages` |
 | `runWithLifecycle(executor)` | 建 `ActiveRun`，置 `isStreaming = true`，跑 executor；异常走 `handleRunFailure`（合成一条 `stopReason: "error"` 的 assistant 消息并补发四个事件）；`finally` 走 `finishRun`（清运行时状态，并通知所有在 `waitForIdle()` 上等着的调用方“跑完了”）。 | `runPromptMessages` / `runContinuation` |
 | `processEvents(event)` | 先更新状态，再通知监听器：`message_start`/`message_update` 更新 `streamingMessage`；`message_end` 把消息 push 进 `_state.messages`；`tool_execution_start/end` 增删 `pendingToolCalls`；`turn_end` 记 `errorMessage`。然后按顺序 `await` 每个监听器。 | 循环的 `emit` |
@@ -722,7 +708,7 @@ classDiagram
 | 运行时依赖 | `_modelRuntime` / `_resourceLoader` / `_cwd` / `_scopedModels` | 模型鉴权、扩展和技能加载、工作目录、可循环切换的模型子集 |
 | 扩展 | `_extensionRunner`/ `_extensionRunnerRef` / `_extensionUIContext` / `_extensionMode` / 若干 handler | `_extensionRunnerRef` 是一个 `{ current }` 对象，`Agent` 的 `streamFn` 闭包通过它拿到当前的 runner（reload 后 runner 会换） |
 | 工具 | `_toolRegistry`（名字→`AgentTool`）/ `_toolDefinitions`（名字→定义+来源）/ `_baseToolDefinitions`（内置八个）/ `_toolPromptSnippets` / `_toolPromptGuidelines` / `_allowedTools` / `_excludedTools`（`--tools` 和 `--exclude-tools` 编译成的匹配函数，支持 `+name` / `-name` 和通配）/ `_hiddenDeclarations` | 注册表是"全部可用的"，`agent.state.tools` 是"当前激活的"（§6.4） |
-| 系统提示词 | `_baseSystemPromptOptions` / `_runSystemPromptOptions` | 存的不再是拼好的字符串，而是“怎么拼”的参数：工具、技能、AGENTS.md、自定义段落等。base 由工具集和资源算出；run 是这次运行用的，扩展在 `before_agent_start` 里改的就是它，一次运行结束就清。真正发给模型的是由它算出的段落补丁（§2.5） |
+| 系统提示词 | `_baseSystemPromptOptions` / `_runSystemPromptOptions` | 存的是“怎么拼”的参数：工具、技能、AGENTS.md、自定义段落等。base 由工具集和资源算出；run 是这次运行用的，扩展在 `before_agent_start` 里改的就是它，一次运行结束就清。真正发给模型的是由它算出的段落补丁（§2.5） |
 | 排队 | `_steeringMessages: string[]` / `_followUpMessages: string[]` | 只存文本，用来在 UI 上显示排队的内容；实际的消息对象在 `Agent` 的两个队列里 |
 | 延后投递 | `_pendingNextTurnMessages` / `_pendingCustomMessages` / `_pendingBashMessages` | 三种"现在不能插进去、等合适时机再插"的消息（§9.3） |
 | 运行状态 | `_isAgentRunActive` / `_agentRunAbortRequested` / `_idleWaitPromise` / `_resolveIdleWait` / `_turnIndex` / `_lastAssistantMessage` / `_lastAssistantToolResults` | `isStreaming` 就是 `_isAgentRunActive`；`_lastAssistantMessage` 在 `message_end` 时记下，`_handlePostAgentRun` 用完清掉 |
@@ -768,7 +754,7 @@ classDiagram
 | `buildSessionProjection()` | 调模块级函数 `buildSessionProjection(entries, leafId, byId)`，得到 `{ entries, messages, thinkingLevel, model }`。`entries` 里每一项记着“哪个原始条目贡献了哪些消息”，`context_edit` 就是在这一步生效的。`AgentSession` 每次请求前都调它（§2.5） |
 | `buildSessionContext()` | `buildSessionProjection` 的简化版，只返回 `{ messages, thinkingLevel, model }` |
 | `_appendEntry(entry)` | push 进 `fileEntries`、写 `byId`、`leafId = entry.id`、`_persist` |
-| `_persist(entry)` | 延迟写文件：会话里出现第一条 user 或 assistant 消息之前不写文件（`_hasConversation`）；出现时用 `"wx"`（不存在才创建）一次写出全部条目；之后每条追加。这样用户打开后什么都没问的会话，不会留下空文件。以前的条件是“第一条 assistant 出现”，结果第一轮没跑完时用户的提问会丢，所以改成了从 user 消息开始写（#10000） |
+| `_persist(entry)` | 延迟写文件：会话里出现第一条 user 或 assistant 消息之前不写文件（`_hasConversation`）；出现时用 `"wx"`（不存在才创建）一次写出全部条目；之后每条追加。这样用户打开后什么都没问的会话，不会留下空文件。 |
 | `static create / open / continueRecent / inMemory / forkFrom` | 五种构造方式 |
 
 上下文怎么从这棵树上算出来，靠的是文件里的三个模块级函数，§11 再讲。
@@ -795,14 +781,14 @@ classDiagram
 | `emitMessageEnd(event)` | 允许扩展替换整条消息（要求 role 不变）；`AgentSession` 拿到替换后用 `_replaceMessageInPlace` 原地改对象，这样 agent 状态、后续事件、会话持久化三处看到的是同一个对象 |
 | `emitBeforeProviderRequest(payload)` | 链式改请求体 |
 | `emitBeforeProviderHeaders(headers)` | 处理函数直接改传进来的 headers，返回值被忽略 |
-| `emitUserBash(event)` | 第一个有返回值的处理函数直接生效，用户的 `!cmd` 由它接管。处理函数抛错或返回格式不对，就把异常往上抛，这条命令不执行（以前是吞掉异常、照常执行） |
+| `emitUserBash(event)` | 第一个有返回值的处理函数直接生效，用户的 `!cmd` 由它接管。处理函数抛错或返回格式不对，就把异常往上抛，这条命令不执行 |
 | `emitInput(text, images, source, behavior)` | 返回 `handled`（扩展吃掉了）/ `transform`（改写）/ 什么都不返回（原样） |
 | `emitBeforeAgentStart(...)` | 处理函数拿到可修改的 `systemPromptOptions`（提示词的各个组成部分），后一个能看到前一个的修改；也可以返回要注入的自定义消息，或者用 `systemPrompt` 整个替换这次的提示词 |
 | `emitResourcesDiscover(...)` | 收集扩展补充的技能、提示词模板、主题路径 |
 
 `hasHandlers(type)` 是所有 `emit*` 前的快速检查，没人订阅就不构造事件对象。
 
-`turn_end` 和 `agent_before_settle` 是这次新加的“边界”机制。以前扩展在 `agent_end` 里想补一句话让模型继续，只能 `sendMessage` 塞进队列，再靠 `_handlePostAgentRun` 发现队列非空、重新跑一轮。现在这两个时间点允许扩展直接返回 `{ entries, continue }`：`entries` 由 `AgentSession` 一次性写进会话，`continue: true` 表示要求再请求一次模型。`AgentSession` 会先检查续跑是否可行（比如上下文最后一条已经是 assistant 回复、又没有新输入，就不能续），不可行就报错，不会发出一个必然被拒的请求。
+`turn_end` 和 `agent_before_settle` 允许扩展直接返回 `{ entries, continue }`：`entries` 由 `AgentSession` 一次性写进会话，`continue: true` 表示要求再请求一次模型。`AgentSession` 会先检查续跑是否可行（比如上下文最后一条已经是 assistant 回复、又没有新输入，就不能续），不可行就报错，不会发出一个必然被拒的请求。
 
 为什么要拆这么多方法，监听事件流、按类型分发一个入口不够吗？其实按类型分发的逻辑是有的，写在 `AgentSession._emitExtensionEvent` 里：它订阅 `Agent` 的事件流，把 `agent_start`、`turn_*`、`message_*`、`tool_execution_*` 按类型转给通用的 `emit`。这类事件只是通知，扩展只能看，不能改。
 
@@ -852,7 +838,7 @@ export default function (pi: ExtensionAPI) {
 
 仓库里的 `packages/coding-agent/examples/extensions/` 有近 80 个真实例子，`confirm-destructive.ts` 就是第二个处理函数的完整版。
 
-`pi.on` 的实现很短（`extensions/loader.ts`），现在还会返回一个取消订阅的函数：
+`pi.on` 的实现很短（`extensions/loader.ts`），会返回一个取消订阅的函数：
 
 ```ts
 on(event: string, handler: HandlerFn): () => void {
@@ -952,7 +938,7 @@ jiti 是 Node 上的运行时模块加载器，能直接 `import` 一个 `.ts` �
 3. 兼容老扩展。映射表同时收录新旧两个包名前缀 `@earendil-works/*` 和 `@mariozechner/*`，并把 `@earendil-works/pi-ai` 根入口指到 `compat` 入口，老扩展用旧的全局 API 也能跑。
 4. 支持热重载。`moduleCache: false`，每次都重新读文件。pi 自己在外层按“工作目录 + 代次”缓存工厂函数（`useExtensionCacheCwd`），`/reload` 走到 `ResourceLoader.reload`（`core/resource-loader.ts`），调 `clearExtensionCache` 让代次加一，缓存作废，改过的扩展代码就能生效。
 
-jiti 本身现在也是第一次需要加载扩展时才 `import()` 进来（`loader.ts` 里的 `createJitiPromise`），虚拟模块表同理。普通 Node 环境下还用了 jiti 的“懒转译”：先尝试原生加载，失败了、确实需要转译 TypeScript 时才加载 Babel。没装扩展的用户启动时就不用付这部分开销。
+jiti 本身也是第一次需要加载扩展时才 `import()` 进来（`loader.ts` 里的 `createJitiPromise`），虚拟模块表同理。普通 Node 环境下还用了 jiti 的“懒转译”：先尝试原生加载，失败了、确实需要转译 TypeScript 时才加载 Babel。没装扩展的用户启动时就不用付这部分开销。
 
 ##### `pi` 的方法
 
@@ -983,13 +969,13 @@ jiti 本身现在也是第一次需要加载扩展时才 `import()` 进来（`lo
 
 产品层定义工具用 `ToolDefinition`（`extensions/types.ts`），比 `AgentTool` 多了 `promptSnippet`（进系统提示词的一行简介）、`promptGuidelines`（进系统提示词的规则条目）、`renderCall` / `renderResult`（TUI 渲染），而且 `execute` 多一个参数 `ctx: ExtensionContext`。
 
-进循环前要包一层：`wrapRegisteredTool(tool, runner)` 调 `wrapToolDefinition(def, ctxFactory)`，把 `ToolDefinition` 变成 `AgentTool`，`execute` 调用时补上 `runner.createToolContext(toolCallId, signal)` 造的 `ExtensionToolContext`。以前这里还有第二层包装，专门检查“执行过程中有没有激活新工具”，并把新工具名写进结果的 `addedToolNames`。现在工具的增减由 `declareToolChanges` 统一写成 system 消息（§2.5），这一层就删掉了。
+进循环前要包一层：`wrapRegisteredTool(tool, runner)` 调 `wrapToolDefinition(def, ctxFactory)`，把 `ToolDefinition` 变成 `AgentTool`，`execute` 调用时补上 `runner.createToolContext(toolCallId, signal)` 造的 `ExtensionToolContext`。
 
 内置八个工具在 `tools/index.ts` 的 `ToolName`：`read` / `bash` / `powershell` / `edit` / `write` / `grep` / `find` / `ls`。默认激活四个：`read` / `bash` / `edit` / `write`（`settings-manager.ts` 的 `DEFAULT_TOOL_NAMES`）。
 
 #### 工具的暴露方式与内置扩展
 
-`ToolDefinition` 这次多了几个字段，用来区分“模型能不能看到这个工具”和“能不能调用这个工具”：
+`ToolDefinition` 的字段用来区分“模型能不能看到这个工具”和“能不能调用这个工具”：
 
 | `exposure` | 声明给模型 | 能调用 | 注册时自动激活 |
 |---|---|---|---|
@@ -1007,7 +993,7 @@ jiti 本身现在也是第一次需要加载扩展时才 `import()` 进来（`lo
 |---|---|
 | `codemode` | 注册一个 `codemode` 工具（默认不激活）：模型写一段 JavaScript，在 `pi-codemode` 自带的解释器里跑，脚本通过 `tools.xxx()` 调用其他工具。嵌套调用走 `ctx.executeTool()`，也要经过参数校验、`tool_call` / `tool_result` 钩子和权限检查。只有脚本的输出会回到模型，中间结果不会。`store()` / `load()` 的值写进会话的 `codemode-store` 自定义条目，所以每个分支各自独立 |
 | `tool-search` | 注册 `tool_search` 工具（默认不激活），按关键词搜 `codemode` / `deferred` 工具，搜到就激活，让它们出现在声明里 |
-| `mcp` | 连接 `mcp.json` 里配置的 MCP 服务，工具注册成 `mcp__<server>__<tool>`。默认暴露方式是 `codemode`：MCP 工具不进模型的工具声明，只能从 codemode 脚本里调，同时自动激活 `codemode` 工具。设成 `deferred` 就改为激活 `tool_search`。连接在后台进行，第一次提问只等有 `direct` 工具的服务。会调用其他工具的工具（`codemode`、`tool_search`）在定义里用 `reachesTools(input)` 声明这次调用会碰到哪些工具，MCP 扩展据此只等这次调用需要的服务连好，并决定该激活哪个工具；以前它是自己解析 codemode 脚本来判断的，10-12（`24382bedd`）改成了现在这样，`pi-codemode` 也不再内置任何 MCP 相关的代码 |
+| `mcp` | 连接 `mcp.json` 里配置的 MCP 服务，工具注册成 `mcp__<server>__<tool>`。默认暴露方式是 `codemode`：MCP 工具不进模型的工具声明，只能从 codemode 脚本里调，同时自动激活 `codemode` 工具。设成 `deferred` 就改为激活 `tool_search`。连接在后台进行，第一次提问只等有 `direct` 工具的服务。会调用其他工具的工具（`codemode`、`tool_search`）在定义里用 `reachesTools(input)` 声明这次调用会碰到哪些工具，MCP 扩展据此只等这次调用需要的服务连好，并决定该激活哪个工具 |
 | `llama.cpp` | 把本地 llama.cpp 服务注册成一个服务商：聊天模型走 `openai-completions` 协议，也能当分类模型用；`/llama` 命令可以从 Hugging Face 下载、加载模型 |
 
 这样做的目的是让 MCP 带来的几十上百个工具不撑大请求：它们不进工具声明，模型需要时再去搜、或者在脚本里调。
@@ -1184,7 +1170,7 @@ classDiagram
 | `EventStream<T, R>` | 生产者 `push`，消费者 `for await`。内部两个 FIFO：一个存还没被消费的事件，一个存等着事件的消费者。`isComplete(event)` 为真时流结束，在等 `result()` 的一方拿到最终结果 |
 | `AssistantMessageEventStream` | 特化：`done` 或 `error` 事件算完成，结果是那条 `AssistantMessage` |
 
-模型现在分三类（`ModelTypeMap`）：`chat` 是一般的对话模型，走上面这套流式接口；`image` 是生图模型，只能用 `generateImages()`（目前只有 `openrouter-images` 一种协议）；`classifier` 是分类模型，只能用 `classify()`，协议有 `typesafe-system-one`、`cloudflare-workers-ai-system-one`、`llama-cpp-classify`、`openai-decisions` 四种。`getModels()` 只列聊天模型，`getAllModels()` 才包括三类。coding-agent 里，分类模型和生图模型主要给 codemode 脚本通过 `models.*` 调用。
+模型分三类（`ModelTypeMap`）：`chat` 是一般的对话模型，走上面这套流式接口；`image` 是生图模型，只能用 `generateImages()`（目前只有 `openrouter-images` 一种协议）；`classifier` 是分类模型，只能用 `classify()`，协议有 `typesafe-system-one`、`cloudflare-workers-ai-system-one`、`llama-cpp-classify`、`openai-decisions` 四种。`getModels()` 只列聊天模型，`getAllModels()` 才包括三类。coding-agent 里，分类模型和生图模型主要给 codemode 脚本通过 `models.*` 调用。
 
 ### 5.4 `createProvider`
 
@@ -1374,7 +1360,7 @@ sequenceDiagram
 6. `_installAgentBoundaryHooks()`：给 `agent.finishTurn` 赋值，发 `turn_end` 边界事件（§4.3）
 7. `_installHiddenDeclarationsProjection()` 和 `_installAgentForcedPromptProjection()`：在 `agent.transformContext` 外面各套一层。前者把 `prepareLoadout` 要求隐藏的工具声明从请求里去掉；后者在扩展用 `before_agent_start` 整个替换了提示词时，把所有 system 消息折成一条带新提示词的，只影响这次请求，不写进记录
 8. `_buildRuntime({ activeToolNames, includeAllExtensionTools: true })`
-9. 用的是默认工具集（没有用 `--tools` 白名单点名工具）时，`_restoreToolsFromTranscript(modifiers)` 按会话记录里最后声明的工具恢复激活列表，再套用命令行里 `--tools +name` / `-name` 这种增减项。以前的判断条件是“没传初始工具”，而 SDK 总会传，所以这一步其实从来没执行过，恢复的会话会丢掉中途激活的工具；10-13（`6f2f164ab`）修好了
+9. 用的是默认工具集（没有用 `--tools` 白名单点名工具）时，`_restoreToolsFromTranscript(modifiers)` 按会话记录里最后声明的工具恢复激活列表，再套用命令行里 `--tools +name` / `-name` 这种增减项。
 
 每个 `_install*` 都先把 `Agent` 上原来的回调存下来，新回调里再调用它，所以多层安装可以叠加，SDK 调用方自己设的回调也不会被覆盖。
 
@@ -1396,7 +1382,7 @@ sequenceDiagram
 4. 算出"这次要激活哪些"：有白名单就激活白名单里全部；首次装配时激活全部扩展工具；reload 时只把新出现的工具加进激活列表
 5. `setActiveToolsByName(names)` → `_applyToolLoadout(names)`：从注册表挑出对象（`hidden` 的和不允许激活的跳过），跑一遍各工具的 `prepareLoadout`，结果赋给 `agent.state.tools`；然后 `_rebuildSystemPrompt(validToolNames)` 重算提示词参数
 
-`_rebuildSystemPrompt` 不再直接生成提示词字符串，而是把激活工具的 snippet 和 guidelines、`resourceLoader` 给的自定义提示词/追加提示词/技能/AGENTS.md 内容，整理成 `_baseSystemPromptOptions`。下一次请求前，`_preparePromptAndToolLoadout` 用它调 `buildSystemPromptSections`，和记录里当前的段落比较，有变化才生成一条 system 消息（§2.5）。所以激活的工具一变，提示词也会跟着变，但只追加变了的段落。
+`_rebuildSystemPrompt` 把激活工具的 snippet 和 guidelines、`resourceLoader` 给的自定义提示词/追加提示词/技能/AGENTS.md 内容，整理成 `_baseSystemPromptOptions`。下一次请求前，`_preparePromptAndToolLoadout` 用它调 `buildSystemPromptSections`，和记录里当前的段落比较，有变化才生成一条 system 消息（§2.5）。所以激活的工具一变，提示词也会跟着变，但只追加变了的段落。
 
 ---
 
@@ -1472,8 +1458,6 @@ sequenceDiagram
 | ⑦ | `_startRun({ messageType: "user", prompt, images })`，见 §7.2 | — |
 
 ### 7.2 `_startRun`
-
-10-12（`a447ba11f`）原来的 `_runAgentPrompt` 拆成了 `_startRun(trigger)` 和 `_prepareRun(trigger)` 两个方法。拆分的原因是：以前只有用户输入开跑时才会走“补查压缩 → `before_agent_start` → 组消息”这一套，扩展用 `sendMessage({ triggerTurn: true })` 发 custom 消息开跑时直接调 `_runAgentPrompt`，扩展收不到 `before_agent_start`，提示词补丁也不会生成。现在两条路都走 `_startRun`，区别只在 `trigger` 是 `{ messageType: "user", prompt, images }` 还是 `{ messageType: "custom", message }`，扩展可以从事件的 `messageType` 看出这次是哪种。
 
 `_prepareRun(trigger)` 做开跑前的准备，返回这次运行的起始消息：
 
@@ -1586,10 +1570,10 @@ await emit({ type: "agent_end", messages: newMessages });
 
 内层循环在没有工具调用、也没有插话时退出；退出后外层再看有没有追加消息，有就继续跑。
 
-和 9 月比，这段循环有三处变化：
+这段循环有三处值得注意：
 
-- `shouldStopAfterTurn` 换成了 `finishTurn`。它在 `turn_end` 事件**之前**调，能返回 `{action:"end"}`（立刻结束，不再看队列）或 `{action:"continue"}`（保证至少再请求一次模型）。如果本来就有工具结果或插话要继续，`continue` 不会多请求一次；只有本来要停的时候，它才让循环带着当前上下文再跑一轮。出错和中断时也会调，但结果被忽略。
-- 新增的 `prepareRequest` 在**每次**请求前都调，包括第一次。`prepareNextTurn` 只在第二轮起的每轮开头调，不会覆盖第一次请求，所以“每次请求都从会话投影上下文”这件事只能放在 `prepareRequest` 里。
+- `finishTurn` 在 `turn_end` 事件**之前**调，能返回 `{action:"end"}`（立刻结束，不再看队列）或 `{action:"continue"}`（保证至少再请求一次模型）。如果本来就有工具结果或插话要继续，`continue` 不会多请求一次；只有本来要停的时候，它才让循环带着当前上下文再跑一轮。出错和中断时也会调，但结果被忽略。
+- `prepareRequest` 在**每次**请求前都调，包括第一次。`prepareNextTurn` 只在第二轮起的每轮开头调，不会覆盖第一次请求，所以“每次请求都从会话投影上下文”这件事只能放在 `prepareRequest` 里。
 - 注入消息前都过一遍 `declareToolChanges`，保证 system 消息里声明的工具和 `context.tools` 一致（§2.5）。
 
 为什么只在为空时才补拉？`prepareNextTurn` 可能很慢（比如在压缩），这期间用户说的话不应该被拖到再下一轮，所以要补拉一次；但如果上一次已经拉到了，`one-at-a-time` 模式下再拉就会在同一轮塞进两条，所以只在为空时补拉。
@@ -1600,7 +1584,7 @@ await emit({ type: "agent_end", messages: newMessages });
 |---|---|
 | ① | `transformContext`（扩展改 `AgentMessage[]`） |
 | ② | `convertToLlm`（`AgentMessage[]` → `Message[]`） |
-| ③ | `llmContext = normalizeContext({ messages: llmMessages })`。不再单独传 `systemPrompt` 和 `tools`，它们都在 system 消息里 |
+| ③ | `llmContext = normalizeContext({ messages: llmMessages })`。`systemPrompt` 和 `tools` 都在 system 消息里 |
 | ④ | `getApiKey?.(provider) \|\| config.apiKey`：每次都重新取，为了会过期的 OAuth token |
 | ⑤ | `streamFunction(config.model, llmContext, { ...config, apiKey, signal })`。注意 `config` 整个展开进去，所以 `reasoning` / `sessionId` / `transport` / `thinkingBudgets` / `onPayload` / `onResponse` / `maxRetryDelayMs` 都到了 provider |
 | ⑥ | 消费流：`start` 事件时把 `partial` push 进 `context.messages`，之后每个增量事件用 `context.messages[last] = event.partial` 替换，并发 `message_update`；`done` / `error` 时用 `response.result()` 拿最终消息替换掉，发 `message_end`。最终消息上会记下这次请求用的 `thinkingLevel` |
@@ -1672,7 +1656,7 @@ sequenceDiagram
 | 执行 | `executePreparedToolCall` | `prepared` → `{ result, isError, durationMs }`。`tool.execute` 抛错就包成错误结果；也可以不抛错、直接返回 `isError: true`，这样 `details` 和 `structuredContent` 能保留给 UI。`durationMs` 是用单调时钟量的执行耗时，会带到 `tool_execution_end` 事件和 toolResult 消息上。`onUpdate` 回调在 `execute` 返回后失效 |
 | 收尾 | `finalizeExecutedToolCall` | 调 `afterToolCall`，逐字段合并覆盖，`afterToolCall` 自己抛错也变成错误结果 |
 
-这三个阶段现在还被包成一个单独导出的函数 `runToolCall(toolCall, options)`，给循环之外的调用方用，比如下面要讲的嵌套调用。
+这三个阶段被包成一个单独导出的函数 `runToolCall(toolCall, options)`，给循环之外的调用方用，比如下面要讲的嵌套调用。
 
 串行版三个阶段对每个调用依次做完再做下一个。并行版的准备阶段仍然是串行的（保证 `beforeToolCall` 的调用顺序确定），执行和收尾用 `Promise.all`。`tool_execution_end` 按完成顺序发，但 `toolResult` 消息按原始顺序发，保证上下文里的顺序和模型请求的顺序一致。
 
@@ -1688,7 +1672,7 @@ sequenceDiagram
 
 `stopReason === "length"` 时不执行任何一个工具调用，每个都生成一条错误 `toolResult`，文案让模型重新发完整参数。源码注释里写了原因：流式返回的工具参数是边收边用一个容错的 JSON 解析器补全的，截断的消息里，工具调用可能解析成功、校验也通过，但参数其实不完整。自己写 agent 时要注意这一点。
 
-没有截断、但模型写出来的参数本身不是合法 JSON 时，以前也是这个容错解析器兜底：只保留出错位置之前解析出的字段，工具照样执行。10-14（`87f9a3641`）起，`pi-ai` 对**已经结束**的工具调用改用严格解析（只保留修复非法字符串转义这类小修补），解析失败时参数记为 `{}`，原因和原始文本放进 `argumentsError`，`validateToolArguments` 会把它作为校验错误返回给模型，工具不执行。opencode 在同一周做了同样的修改（见 opencode 篇 §7.1）。
+`pi-ai` 对**已经结束**的工具调用使用严格解析（只保留修复非法字符串转义这类小修补），解析失败时参数记为 `{}`，原因和原始文本放进 `argumentsError`，`validateToolArguments` 会把它作为校验错误返回给模型，工具不执行。
 
 ### 8.4 `edit` 工具
 
@@ -1800,12 +1784,12 @@ sequenceDiagram
 | 判定 | 规则 |
 | --- | --- |
 | 是不是溢出 | 三种：错误文案匹配溢出模式；`stop` 但 `input + cacheRead > contextWindow`（静默溢出）；`length` 且 `output === 0` 且输入占满 99%（服务端截断输入）。溢出归压缩管，不重试 |
-| 可不可以重试 | `isRetryableAssistantError`：`stopReason === "error"` 且文案先排除"配额/账单"类（`NON_RETRYABLE_PROVIDER_LIMIT_ERROR_PATTERN`），再匹配"过载/限流/5xx/网络/超时/流提前结束"这一大串正则。这套判定已经从 coding-agent 挪进了 pi-ai 的 `utils/retry.ts`，压缩和分支摘要的模型调用也用同一套（`retryAssistantCall`） |
+| 可不可以重试 | `isRetryableAssistantError`：`stopReason === "error"` 且文案先排除"配额/账单"类（`NON_RETRYABLE_PROVIDER_LIMIT_ERROR_PATTERN`），再匹配"过载/限流/5xx/网络/超时/流提前结束"这一大串正则。这套判定在 pi-ai 的 `utils/retry.ts` 中，压缩和分支摘要的模型调用也用同一套（`retryAssistantCall`） |
 | 延迟 | `retryDelayMs`：`baseDelayMs * 2^(attempt-1)`，上限 `maxAgentDelayMs`（默认 60 秒）。设置默认 `maxRetries: 3`，`baseDelayMs: 2000`（`settings-manager.ts`） |
 
 `_prepareRetry` 做的事：计数、发 `auto_retry_start`、调 `_omitRecoveryAttempt` 把失败的那条 assistant 消息“从模型上下文里拿掉”、可中断地睡眠、返回 `true`。然后 `agent.continue()` 看到最后一条是 user 或 toolResult，走 `runContinuation`。
 
-“拿掉”的做法变了。以前是直接从 `agent.state.messages` 里删，会话文件里还留着，内存和文件就对不上了。现在会话文件是唯一来源（§2.5），删内存没有用，所以 `_omitRecoveryAttempt` 往会话里追加一条 `context_edit(targetId, null)`，再用新的投影刷新 `agent.state.messages`。原始消息还在文件里，UI 能看到失败记录，但之后的请求和恢复都不会再带上它。消息对象和条目 id 的对应关系靠 `_entryIdsByMessage` 找。
+`_omitRecoveryAttempt` 往会话里追加一条 `context_edit(targetId, null)`，再用新的投影刷新 `agent.state.messages`。原始消息还在文件里，UI 能看到失败记录，但之后的请求和恢复都不会再带上它。消息对象和条目 id 的对应关系靠 `_entryIdsByMessage` 找。
 
 失败的那次回答还会记进 `_failedResponse`，下一次请求如果用的是虚拟模型，路由时会知道“上一次失败了”（`reason: "retry"`），可以换一个实际模型。
 
@@ -1836,7 +1820,7 @@ sequenceDiagram
 
 | 函数 | 做什么 |
 |---|---|
-| `prepareCompaction(pathEntries, settings)` | 找上一次压缩的位置当边界；`findCutPoint` 从最新往回累加估算 token，累到 `keepRecentTokens`（默认 20000）就切。切点可以是 user 或 assistant 消息，不会是 toolResult。切在一轮中间时 `isSplitTurn = true`，那一轮的前半段单独摘要。如果最后一批工具结果本身就超过了保留预算，就退到最近一个安全的 assistant 边界再切，保证更早的历史还能被压掉（#9740）。同时用 `extractFileOpsFromMessage`（`utils.ts`）从 assistant 的 toolCall 参数里抽出 read/write/edit 的路径 |
+| `prepareCompaction(pathEntries, settings)` | 找上一次压缩的位置当边界；`findCutPoint` 从最新往回累加估算 token，累到 `keepRecentTokens`（默认 20000）就切。切点可以是 user 或 assistant 消息，不会是 toolResult。切在一轮中间时 `isSplitTurn = true`，那一轮的前半段单独摘要。如果最后一批工具结果本身就超过了保留预算，就退到最近一个安全的 assistant 边界再切，保证更早的历史还能被压掉。同时用 `extractFileOpsFromMessage`（`utils.ts`）从 assistant 的 toolCall 参数里抽出 read/write/edit 的路径 |
 | `compact(preparation, model, apiKey, ...)` | `generateSummaryWithUsage`（外面包了 `retryAssistantCall`，流断了会按重试设置再试）：把要压的消息 `convertToLlm` 后 `serializeConversation` 成文本，包进 `<conversation>` 标签，有上次摘要就再包一个 `<previous-summary>`，加上 `SUMMARIZATION_PROMPT` 或 `UPDATE_SUMMARIZATION_PROMPT` 发给模型。`maxTokens = min(0.8 * reserveTokens, model.maxTokens)`。摘要末尾追加 `formatFileOperations(readFiles, modifiedFiles)` |
 | 结果 | `{ summary, firstKeptEntryId, tokensBefore, usage, details: { readFiles, modifiedFiles } }` |
 
@@ -1846,7 +1830,7 @@ sequenceDiagram
 
 ## 11. 会话树
 
-前面说过会话文件是一棵树。`session-manager.ts` 里的几个模块级函数负责从树和当前叶子出发，算出要发给模型的消息列表。因为现在每次请求都要走一遍（§2.5），这几个函数就是模型上下文的唯一出处：
+前面说过会话文件是一棵树。`session-manager.ts` 里的几个模块级函数负责从树和当前叶子出发，算出要发给模型的消息列表。因为每次请求都要走一遍（§2.5），这几个函数就是模型上下文的唯一出处：
 
 ```mermaid
 flowchart TD
@@ -1877,12 +1861,12 @@ flowchart TD
 | 模式 | 入口 | 怎么进 | 怎么出 |
 |---|---|---|---|
 | 交互式 TUI | `InteractiveMode`（`interactive-mode.ts`，7127 行） | 编辑器回车 → `session.prompt(text)`；正在流就 `prompt(text, {streamingBehavior:"steer"})`；`!cmd` 走 `handleBashCommand`；正在压缩就攒进本地队列 | `session.subscribe(handleEvent)`，`handleEvent` 的 `switch` 对 30 种事件各更新对应组件，然后 `ui.requestRender()` |
-| RPC | `runRpcMode`（`rpc/rpc-mode.ts`） | stdin 一行一个 JSON 命令，`handleCommand` 的 `switch` 有 33 个 `case`：`prompt` / `steer` / `follow_up` / `abort` / `set_model` / `compact` / `bash` / `fork` / `get_tree` …，几乎一一对应 `AgentSession` 的公开方法。`prompt`、`steer`、`follow_up` 的响应现在带一个 `disposition`，告诉调用方这条输入是被扩展处理掉了（`handled`）、排进了队列（`queued`），还是开始了一次新运行（`started`）。`prompt` 的响应要等预检（扩展命令、输入钩子、鉴权检查）通过才发 | `session.subscribe(e => output(toJsonEvent(e)))`，每个事件一行 NDJSON。`toJsonEvent`（`modes/json-event.ts`）把 `message_update` 里的 `partial` 整条消息去掉只留增量，省带宽 |
+| RPC | `runRpcMode`（`rpc/rpc-mode.ts`） | stdin 一行一个 JSON 命令，`handleCommand` 的 `switch` 有 33 个 `case`：`prompt` / `steer` / `follow_up` / `abort` / `set_model` / `compact` / `bash` / `fork` / `get_tree` …，几乎一一对应 `AgentSession` 的公开方法。`prompt`、`steer`、`follow_up` 的响应带一个 `disposition`，告诉调用方这条输入是被扩展处理掉了（`handled`）、排进了队列（`queued`），还是开始了一次新运行（`started`）。`prompt` 的响应要等预检（扩展命令、输入钩子、鉴权检查）通过才发 | `session.subscribe(e => output(toJsonEvent(e)))`，每个事件一行 NDJSON。`toJsonEvent`（`modes/json-event.ts`）把 `message_update` 里的 `partial` 整条消息去掉只留增量，省带宽 |
 | print / json | `runPrintMode`（`modes/print-mode.ts`） | 命令行参数里的消息依次 `prompt` | `json` 模式同 RPC 的输出；`print` 模式只打最后一条 assistant 文本 |
 
 `InteractiveMode` 和 `pi-tui` 的关系：`InteractiveMode` 持有一个 `TUI`（`tui/src/tui.ts` 接口），往里 `addChild` 各种 `Component`（只有 `render(width): string[]` 和可选的 `handleInput`）。`TuiBase.requestRender` 把多次请求合并成一帧。
 
-TUI 现在默认是全屏模式（设置项 `tuiMode` 默认 `"fullscreen"`）：`TuiAltScreen`（`tui-alt-screen.ts`）切到终端的备用屏幕，整个界面由程序自己管理滚动，支持鼠标滚轮、选中复制、在对话记录里搜索。旧的 `TuiMainScreen`（`tui-main-screen.ts`）在终端原本的滚动区里输出，作为普通模式保留。两种都是和上一帧逐行比较，只重写变了的行。
+TUI 默认是全屏模式（设置项 `tuiMode` 默认 `"fullscreen"`）：`TuiAltScreen`（`tui-alt-screen.ts`）切到终端的备用屏幕，整个界面由程序自己管理滚动，支持鼠标滚轮、选中复制、在对话记录里搜索。`TuiMainScreen`（`tui-main-screen.ts`）在终端原本的滚动区里输出，作为普通模式保留。两种都是和上一帧逐行比较，只重写变了的行。
 
 ---
 
@@ -1890,9 +1874,7 @@ TUI 现在默认是全屏模式（设置项 `tuiMode` 默认 `"fullscreen"`）�
 
 主循环的状态全在内存里：`runLoop` 的局部变量记着跑到第几轮、有没有工具没跑完。进程一退出，这些就没了。会话文件只记了已经完成的消息，没记“正在干什么”。
 
-9 月的时候，pi 在 `packages/agent/src/harness/` 里试过一版解决方案（Lane / Drive / HookRegistry，2 万多行），10 月 1 日整个删掉了（`7fd478a2e`），换成独立的新包 `@earendil-works/pi-durable`（`packages/durable`，不含测试约 2.2 万行）。它的 README 第一句就是“实验性，API 随时会变”。
-
-目前主产品 `pi` 命令（`AgentSession`）**没有**用它。10 月上旬 coding-agent 的 `src/experimental/` 下还有几个基于 durable 的原型（一个小型 TUI 编码 agent、session worker、演示用的旅行规划 agent），10-12 随实验性 server 栈一起删掉了。现在公开仓库里依赖 durable 的只有 `pi-env`（§13.5）；从 chord 的文档看，它真正的使用者是私有仓库里的 p2 应用：p2 的会话 worker 把 durable 的 Harness 作为一个 chord 对象提供出来（§14.4）。所以第一次读同样可以跳过这一节。
+目前主产品 `pi` 命令（`AgentSession`）**没有**用它。现在公开仓库里依赖 durable 的只有 `pi-env`（§13.5）；从 chord 的文档看，它真正的使用者是私有仓库里的 p2 应用：p2 的会话 worker 把 durable 的 Harness 作为一个 chord 对象提供出来（§14.4）。所以第一次读同样可以跳过这一节。
 
 ### 13.1 核心概念
 
@@ -2023,24 +2005,24 @@ sequenceDiagram
 | 多会话 | 一个 `AgentSession` 一棵树 | 一个 Harness 多个 Conversation，可 fork，子 agent 是被工具任务拥有的子对话 |
 | 界面 | 订阅事件流，自己维护显示状态 | `conversation.viewState()` 直接给出可订阅的“结构化视图”，包括流式片段、队列、重试、压缩状态 |
 
-可以看出，durable 把主循环里很多“隐式的东西”变成了显式的、可持久化的数据：轮次变成任务，队列变成文档，回调变成具名钩子。代价是复杂度高得多，所以现在还标着实验性。
+可以看出，durable 把主循环里很多“隐式的东西”变成了显式的、可持久化的数据：轮次变成任务，队列变成文档，回调变成具名钩子。代价是复杂度高得多，所以标着实验性。
 
-### 13.5 10 月的新进展
+### 13.5 工具调用与远程执行
 
-10-08 到 10-16 之间 durable 有 40 个提交，比较值得看的是这几块：
+durable 的工具调用与执行环境有几块值得看：
 
-**工具调用工具**。工具在 `execute` 里用 `api.executeTool(name, args, context)` 调别的工具，这次调用是一个**归调用方所有的子工具任务**：照样做参数校验、跑 `ToolTask` 钩子、有自己的输出上限和 replay 策略，结果直接返回给调用方，不进对话记录。每个嵌套调用有一个 key（默认是它在调用方里的序号），调用方的结果存在调用方任务的文档里（每个嵌套调用一份，10-10 的 `4ac0bd8c7`）。所以一个 `replay: "safe"` 的工具崩溃后重跑时，只要按同样顺序调用，就能拿回上次已经发起的嵌套调用，不会重复执行；不是 replay-safe 的工具不会重跑，它留下的嵌套调用在重启时整体作废（`abandonOnRestart`）。
+**工具调用工具**。工具在 `execute` 里用 `api.executeTool(name, args, context)` 调别的工具，这次调用是一个**归调用方所有的子工具任务**：照样做参数校验、跑 `ToolTask` 钩子、有自己的输出上限和 replay 策略，结果直接返回给调用方，不进对话记录。每个嵌套调用有一个 key（默认是它在调用方里的序号），调用方的结果存在调用方任务的文档里（每个嵌套调用一份）。所以一个 `replay: "safe"` 的工具崩溃后重跑时，只要按同样顺序调用，就能拿回上次已经发起的嵌套调用，不会重复执行；不是 replay-safe 的工具不会重跑，它留下的嵌套调用在重启时整体作废（`abandonOnRestart`）。
 
-**谁能看到、谁能调用**。工具上的 `callers` 声明谁能调它：模型、其他工具，或者都可以（默认）。会话的 `modelTools` 再收窄“给模型看哪些”，但不影响工具之间互相调用。比如只把 `codemode` 给模型看，`read`、`bash`、MCP 工具都只能从脚本里调。`deferred: true` 的工具平时不给模型看，`tool_search` 扩展（`@earendil-works/pi-durable/tool-search`，10-12 的 `77332f7a3`）让模型按关键词搜，搜到的通过 `control.addTools` 写进这个分支的 `modelTools`，压缩之后也一直可见。这和 coding-agent 主线的 `ToolExposure`（§4.4）是同一个思路，只是在 durable 里这些选择也是持久化的。
+**谁能看到、谁能调用**。工具上的 `callers` 声明谁能调它：模型、其他工具，或者都可以（默认）。会话的 `modelTools` 再收窄“给模型看哪些”，但不影响工具之间互相调用。比如只把 `codemode` 给模型看，`read`、`bash`、MCP 工具都只能从脚本里调。`deferred: true` 的工具平时不给模型看，`tool_search` 扩展（`@earendil-works/pi-durable/tool-search`）让模型按关键词搜，搜到的通过 `control.addTools` 写进这个分支的 `modelTools`，压缩之后也一直可见。这和 coding-agent 主线的 `ToolExposure`（§4.4）是同一个思路，只是在 durable 里这些选择也是持久化的。
 
-**能续跑的 Code Mode**（`@earendil-works/pi-durable/codemode`，10-11 的 `7b597d148`）。模型写的 JavaScript 在 `pi-codemode` 的 QuickJS 沙箱里跑，每次 `tools.xxx()` 都是一个嵌套工具调用。难点在于脚本本身是内存里的执行状态，没法存检查点。durable 的做法是让脚本**确定性地**运行：沙箱用虚拟时钟、固定种子的随机数、UTC 时区（`sandbox.start`，`0fb1aee74`），脚本每拿到一个调用结果，先把结果写进日志再交给脚本。重启后把脚本从头再跑一遍，按顺序把日志里的结果喂回去，于是它会发出同样的调用、带同样的参数，这些调用按 key 接回原来的嵌套任务，然后脚本从断的地方继续。如果重跑时脚本走了不同的分支、沙箱指纹或 Code Mode 版本变了、或者超时已过，就以错误结束这次调用。沙箱也可以放在 Cloudflare 的 Durable Object 里远程跑（`RemoteCodemodeSandbox`，`748b351fe`）。
+**能续跑的 Code Mode**（`@earendil-works/pi-durable/codemode`）。模型写的 JavaScript 在 `pi-codemode` 的 QuickJS 沙箱里跑，每次 `tools.xxx()` 都是一个嵌套工具调用。难点在于脚本本身是内存里的执行状态，没法存检查点。durable 的做法是让脚本**确定性地**运行：沙箱用虚拟时钟、固定种子的随机数、UTC 时区（`sandbox.start`），脚本每拿到一个调用结果，先把结果写进日志再交给脚本。重启后把脚本从头再跑一遍，按顺序把日志里的结果喂回去，于是它会发出同样的调用、带同样的参数，这些调用按 key 接回原来的嵌套任务，然后脚本从断的地方继续。如果重跑时脚本走了不同的分支、沙箱指纹或 Code Mode 版本变了、或者超时已过，就以错误结束这次调用。沙箱也可以放在 Cloudflare 的 Durable Object 里远程跑（`RemoteCodemodeSandbox`）。
 
 **其他**：
 
-- `read` 工具能返回图片，可选用基于 WebAssembly 的 Photon 做缩放和方向校正，Node 下在 worker 线程里处理（`42a3497d0`、`cdaf6c227`）。
-- SQLite 存储的表名可以加前缀（`{ prefix: "pi_" }`），这样 durable 能和宿主应用自己的表放在同一个数据库里，比如同一个 Cloudflare Durable Object 的存储（`f7e3cb543`）。
-- 压缩可以按模型单独配置（`compaction.modelOverrides`，`c4cf7957b`）；阻塞式压缩失败时这次运行直接失败，不再悄悄继续（`89e5c2c07`）。
-- `pi-env`（`packages/env`）是 durable 的远程执行环境：在远程机器上部署一个 Rust 写的小 daemon（`pi-env`，按 SHA-256 命名、每次启动前校验），通过 SSH 的标准输入输出走一套分帧协议。`RemoteExecutionEnv` 实现了 durable 的 `ExecutionEnv` 接口，所以工具在另一台机器上读写文件、跑命令，而 durable 的 worker、存储、凭据都留在本地。10 月新增了伪终端（交互式命令）和列目录（`listFiles`）。
+- `read` 工具能返回图片，可选用基于 WebAssembly 的 Photon 做缩放和方向校正，Node 下在 worker 线程里处理。
+- SQLite 存储的表名可以加前缀（`{ prefix: "pi_" }`），这样 durable 能和宿主应用自己的表放在同一个数据库里，比如同一个 Cloudflare Durable Object 的存储。
+- 压缩可以按模型单独配置（`compaction.modelOverrides`）；阻塞式压缩失败时这次运行直接失败。
+- `pi-env`（`packages/env`）是 durable 的远程执行环境：在远程机器上部署一个 Rust 写的小 daemon（`pi-env`，按 SHA-256 命名、每次启动前校验），通过 SSH 的标准输入输出走一套分帧协议。`RemoteExecutionEnv` 实现了 durable 的 `ExecutionEnv` 接口，所以工具在另一台机器上读写文件、跑命令，而 durable 的 worker、存储、凭据都留在本地。它还支持伪终端（交互式命令）和列目录（`listFiles`）。
 
 ---
 
@@ -2048,7 +2030,7 @@ sequenceDiagram
 
 `@earendil-works/chord`（`packages/chord`，不含测试约 1.36 万行，只依赖 TypeBox）是 pi 仓库里一个独立的底层包，不依赖任何其他 pi 包。
 
-这个包在 10-12 被整个换掉了（`0104fef1e`）。上一版本文讲的 facet / `FacetHost` / `defineService` / bundler 那套“插件和服务”运行时已经删除，现在的实现来自私有仓库 pi-private 里的 `apps/p2`（代码里叫 chord2），连同测试和文档一起搬了过来。上一版用来举例的实验性 pi server / client 也在同一天删掉了（§1）。所以现在公开仓库里：
+公开仓库里：
 
 - `pi-durable` 只用它的 `replicatedState`（可观察、可增量同步的 JSON 状态）来放文档、对话视图、任务图；
 - 完整的对象运行时（host、对象、热重载）在公开仓库里没有应用在用，真正的使用者是 p2。下面的例子都来自 chord 自己的 README 和 `docs/guide.md`。
@@ -2196,7 +2178,7 @@ host.serve(Harness, (_, _host, self) => {
 
 ### 14.6 增量同步
 
-可复制状态能高效同步，靠的是 `@earendil-works/chord/delta` 里的增量跟踪器（`delta/tracker.ts`，2200 多行）。这部分在 10-12 的替换中没有变：
+可复制状态能高效同步，靠的是 `@earendil-works/chord/delta` 里的增量跟踪器（`delta/tracker.ts`，2200 多行）。用法如下：
 
 ```ts
 import { applyImmutable, track } from "@earendil-works/chord/delta";
@@ -2263,9 +2245,9 @@ chord 最有特点的是后两行：把“跨进程”和“热重载”都放�
 | # | 问题 | 影响 |
 |---|---|---|
 | 1 | 没有 OS 级沙箱，权限只有 `beforeToolCall` 一个钩子且默认没人订阅 | 需要隔离只能自己套容器 |
-| 2 | 循环状态全在内存 | 进程死了运行就没了；`pi-durable` 在解决，但主线还没切过去 |
+| 2 | 循环状态全在内存 | 进程死了运行就没了 |
 | 3 | 事件监听器全部 `await` 串行 | 一个慢监听器拖慢整个流；RPC 模式要专门加背压 |
-| 4 | `AgentSession` 4428 行，`interactive-mode.ts` 7127 行 | 产品层没有再分层，什么都往 `AgentSession` 里放，而且还在变大（9 月分别是 3552 和 6620 行） |
+| 4 | `AgentSession` 4428 行，`interactive-mode.ts` 7127 行 | 产品层没有再分层，什么都往 `AgentSession` 里放 |
 | 5 | 排队队列的 UI 显示靠文本匹配（`_handleAgentEvent` 用 `indexOf(messageText)` 找）| 两条相同文本的插话会错删 |
-| 6 | 重试判定靠正则匹配错误文案 | 新 provider 的新文案要手动加进 `RETRYABLE_PROVIDER_ERROR_PATTERN`（现在在 pi-ai 的 `utils/retry.ts`） |
+| 6 | 重试判定靠正则匹配错误文案 | 新 provider 的新文案要手动加进 `RETRYABLE_PROVIDER_ERROR_PATTERN`（在 pi-ai 的 `utils/retry.ts`） |
 | 7 | 回调一层套一层：`prepareRequest`、`finishTurn`、`transformContext` 都被 `AgentSession` 的多个 `_install*` 依次包装 | 一次请求前到底改了几次上下文，要把这些包装按安装顺序串起来看才清楚 |
