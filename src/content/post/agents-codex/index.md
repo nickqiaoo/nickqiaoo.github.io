@@ -1,12 +1,14 @@
 ---
 title: "codex 源码解析"
 description: ""
-updatedDate: "2026-10-16"
+updatedDate: "2026-10-23"
 publishDate: "2026-09-11"
 tags: ["codex", "agent"]
 series: agents
 seriesOrder: 3
 ---
+
+> 本文核对至 2026-10-23 的 [`openai/codex` main，`96a0d8d551`](https://github.com/openai/codex/tree/96a0d8d551)。默认行为和实验开关以这份源码为准，已安装的发行版可能不同。
 
 ## 1. crate 与源码目录
 
@@ -429,7 +431,7 @@ classDiagram
     UserInput(content, client_id, acceptance_order)
     ResponseItem(ResponseItemEnvelope)
     FunctionCallOutput(ResponseItem)
-    InterAgentCommunication(InterAgentCommunication)
+    InterAgentCommunication(PendingAgentMessage)
   }
   TurnInputRequest --> TurnInput_protocol
   TurnInputRequest --> TurnStartOptions
@@ -797,6 +799,8 @@ sequenceDiagram
 
 MCP binding 和工具推荐并行准备。拿到 binding 之后，`built_tools` 再结合模型能力、权限、环境、Apps/plugins、扩展工具，生成最终的 `ToolRouter`。做好的 `StepContext` 记到当前 `TurnState` 上，再交回 `run_turn`，后面构造 `WorldState` 和第一次模型请求都用它。这一步不写对话历史。
 
+活跃的普通轮次在准备下一步时，还可以刷新云端 plugin / skill 目录，处理轮次中途的认证变化。普通 MCP server 的工具清单通知则由默认关闭的 `mcp_tool_list_changed` 开关控制。变化要等新一步捕获快照后才进入模型声明和执行绑定，不会改掉已经发出的那次请求。
+
 之后内层循环如果收到 steer，或者要重新读动态设置，`run_turn` 会再捕获一份新的 `StepContext`，下一次请求和工具执行就换成新快照，请求前把 `WorldState` 的变化记下来。
 
 ### `SessionState` 与 `ContextManager`
@@ -868,14 +872,14 @@ classDiagram
 
 | 请求字段 | 来源 | 更新时机 |
 |---|---|---|
-| `input` | 开头是 base instructions（`Session::get_prompt_base_instructions()`），后面是 `ContextManager::for_prompt()` 整理后的历史 | base instructions 每次请求都放在最前面，创建 Session 时按“配置显式覆盖 → 恢复记录中的 base instructions → 当前模型模板”的顺序确定。历史部分是用户消息、模型输出、工具结果，以及 Codex 追加的 developer / user 上下文 |
-| `tools` | `StepContext.tool_router.model_visible_specs()` | 每次捕获新的 `StepContext` 时确定，和实际执行工具使用同一份绑定 |
+| `input` | `ContextManager::for_prompt()` 整理后的历史；base instructions 和工具声明按下文的模式放入请求 | base instructions 创建时按“配置显式覆盖 → 恢复记录中的 base instructions → 当前模型模板”确定；默认的 Lite 增量模式把它作为历史的一部分记录，其他模式在构造请求时前置 |
+| `tools` | 定义来自 `StepContext.tool_router.model_visible_specs()`；普通 Responses 放在这个字段，Lite 放进 `input` | 每次捕获新的 `StepContext` 时确定，和实际执行工具使用同一份绑定 |
 
-base instructions 相当于常说的 system prompt。`build_responses_request` 把 base instructions 包成一条 developer 消息，插到 `input` 最前面。这条消息不存进历史，每次请求都重新生成；它的 id 由线程 id 和指令文本算出来（UUID v5），所以重试和恢复会话时 id 都不变。这样一来，普通 Responses 和 `Responses Lite` 的写法就统一了，只剩一个区别：Lite 模式下工具定义也会变成 `input` 开头的一条 `AdditionalTools` 条目（排在 base instructions 前面），`tools` 字段留空。
+base instructions 相当于常说的 system prompt。普通 Responses 模式下，`build_responses_request` 把它包成一条 developer 消息，插到 `input` 最前面。这条消息不存进历史，每次请求都重新生成；它的 id 由线程 id 和指令文本算出来（UUID v5），所以重试和恢复会话时 id 都不变。Lite 关闭增量工具时也这样处理，只是工具定义还会变成更靠前的一条 `AdditionalTools`，`tools` 字段留空。
 
 要注意，AGENTS.md、权限、工作目录、skill 清单、多 agent 模式这些都不在 base instructions 里，而是历史里另外的消息。
 
-还有一个开发中、默认关闭的开关 `incremental_tools`，只对 Lite 模式生效。打开后，工具定义和 base instructions 不再每次请求都拼到 `input` 前面，而是作为两个 `WorldState` section（`TopLevelToolsState`、`ModelInstructionsState`）在每个上下文窗口开头写进历史一次。之后工具有增删，只追加一条描述变化的 `AdditionalTools` 或说明消息，不再整份重发。每批新增或变化的命名空间前面统一加一条 developer 说明，告诉模型“之前的工具除非明确移除都还能用，新定义覆盖旧定义”（措辞可以由模型目录的 `model_messages.tools.incremental_tools` 覆盖）；模型或指令内容任一变化都会追加一条 `model_instructions` developer 消息，压缩后的新窗口直接用最新的指令。
+`incremental_tools` 已是 Stable 且默认开启，但只对 Lite 模式生效。启用增量模式的上下文窗口里，工具定义和 base instructions 不再每次请求都拼到 `input` 前面，而是作为两个 `WorldState` section（`TopLevelToolsState`、`ModelInstructionsState`）在窗口开头写进历史一次。之后工具有增删，只追加一条描述变化的 `AdditionalTools` 或说明消息，不再整份重发。每批新增或变化的命名空间前面统一加一条 developer 说明，告诉模型“之前的工具除非明确移除都还能用，新定义覆盖旧定义”（措辞可以由模型目录的 `model_messages.tools.incremental_tools` 覆盖）；模型或指令内容任一变化都会追加一条 `model_instructions` developer 消息，压缩后的新窗口直接用最新的指令。是否使用增量模式按上下文窗口保持一致，不会因为中途翻转开关就混用两套格式。
 
 #### `WorldState` 的全量注入与增量更新
 
@@ -1248,7 +1252,8 @@ classDiagram
   class ModelClient {
     state: Arc~ModelClientState~
     agent_identity_policy
-    prompt_cache_key_override: Option~String~
+    prompt_cache_key_policy: PromptCacheKey
+    session_id_override: Option~String~
     event_sender: Option~Sender~Event~~
     +new(auth_manager, policy, thread_id, provider, session_source, originator, ...)
     +new_session() ModelClientSession
@@ -1327,7 +1332,7 @@ classDiagram
 |---|---|
 | `ModelClient` | 会话级的模型客户端，管连接和认证，认证恢复之类的状态也从这里报出去 |
 | `ModelClientSession` | 一个 `run_turn` 用一个，新建或者拿预热的。里面缓存了 WebSocket 状态和 `x-codex-turn-state` 路由 token。源码里明确说它是 turn-scoped 的，不能跨轮复用 |
-| `WebsocketSession` | 记着上一次的请求和响应。配置没变、新输入又是在上次基础上追加的，就只发新增的部分。base instructions 是 `input` 的第一条，它一变，新输入就不再是旧输入的延续，会自动退回发完整请求（不带 `previous_response_id`） |
+| `WebsocketSession` | 记着上一次的请求和响应。请求兼容、新输入又是在上次基础上追加的，就只发新增部分；前缀被改写时退回完整请求，不带 `previous_response_id`。普通模式替换前置 base instructions 会破坏前缀，Lite 增量模式则可把指令变化追加到历史 |
 | `Prompt` | 一次请求的数据结构。`tools` 是 `Arc<[ToolSpec]>` 直接指向 `ToolRouter.model_visible_specs` |
 | `ResponsesApiRequest` | 真正序列化的请求体，字段见 §7 |
 | `ResponseEvent` | provider 流被归一化成的 17 种事件。`Completed.end_turn` 是 `Option<bool>`：`Some(false)` 表示模型明确说"我还没完"，会置 `needs_follow_up` |
@@ -1340,18 +1345,20 @@ classDiagram
 | 字段 | 来源 | 每步会变吗 |
 |---|---|---|
 | `model` | `StepContext` 里选定的模型 | 轮次中途 `Op::TurnSettings` 换模型时下一步变 |
-| `input` | 开头一条 developer 消息放 base instructions（lite 模式下前面还有一条 `AdditionalTools`），后面是 `for_prompt` 整理后的历史，加上工具调用记录。发给非 OpenAI 提供方时会去掉内部字段 | 每步增长；压缩后整体替换 |
-| `tools` | `ToolRouter.model_visible_specs()` | 同一轮内只在重新 `capture` 时变（steer 提到新 MCP） |
+| `input` | `for_prompt` 整理后的历史，加上工具调用记录。普通模式另外前置 base instructions；Lite 默认通过历史里的 `WorldState` 记录指令和工具增量（§6）。发给非 OpenAI 提供方时会去掉内部字段 | 每步增长；压缩后整体替换 |
+| `tools` | 普通模式用 `ToolRouter.model_visible_specs()`；Lite 在 `input` 声明工具，这个字段为空 | 捕获新的 `StepContext` 时重新确定，包括 MCP 和目录刷新后的变化 |
 | `tool_choice` | 常量 `"auto"` | 不变 |
 | `parallel_tool_calls` | `Prompt.parallel_tool_calls`（`build_prompt` 写死 `true`）且非 lite | 不变 |
 | `reasoning` | 推理强度：用户指定的 > pin 住的 > 模型默认 | 换设置时变 |
 | `store` / `stream` | `false` / `true` | 不变 |
 | `include` | `["reasoning.encrypted_content"]` | 不变 |
 | `service_tier` | `model_info.service_tier_for_request(turn 级 service_tier)` | `TurnStartOptions.service_tier` 只管这一轮 |
-| `prompt_cache_key` | `prompt_cache_key(responses_metadata)`：默认线程 id，审查子会话用父线程 id | 不变 |
+| `prompt_cache_key` | `PromptCacheKey` 策略：`SessionDerived` 默认从会话身份派生，内部子会话可结合来源和父线程 id 派生；`Custom(key)` 显式指定；`Omit` 不发送 | 随创建客户端时选择的策略确定 |
 | `text` | 回答详细程度 + 本轮的输出 schema | 不变 |
 | `client_metadata` | 会话、线程、轮次 id，触发原因，客户端名称等 | 每轮变 |
 | 请求头 | 路由、客户端身份、能力标记等；路由 token 存在 `ModelClientSession` 里 | 同轮内固定 |
+
+`prompt_cache_key` 的策略与 session-id 请求头分开控制：自定义或省略请求体里的缓存 key，不会因此把会话身份也改掉。客户端还可提供 `session_id_override` 作为默认派生身份；非根 agent 的 Responses session-id 仍保留自己的实际会话 id。
 
 ---
 
@@ -1401,7 +1408,7 @@ sequenceDiagram
 
 有几点要注意。工具调用项在工具启动前就写进历史了，就算后来被取消，也能看到模型调过什么。工具可以并发跑，`FuturesOrdered` 保证结果按提交顺序记录。future 入队后就接着读响应，不等工具，所以收到 `Completed` 的时候工具可能还没跑完。
 
-另外，处理完一条 `OutputItemDone`，如果发现邮箱里有新消息，也可能提前不读了，让新消息进下一次请求。所以退出这个循环不一定是因为收到了 `Completed`；退出后还要等正在跑的工具，并检查任务有没有被取消。
+另外，处理完一条 `OutputItemDone`，如果发现邮箱里有新消息，也可能让新消息优先进入下一次请求。普通路径会提前结束响应读取；Lite 有可用的中断通道时，则发送 `ResponseInterrupt::Drain`，把当前响应读完，保留已完成条目和 response id，供增量续接使用。drain 期间收到的新工具调用不再执行，避免它们抢在邮件前面运行。所以退出这个循环不一定是因为收到了 `Completed`；退出后还要等已经启动的工具，并检查任务有没有被取消。
 
 ### 流事件类型
 
@@ -1412,12 +1419,18 @@ sequenceDiagram
 | `OutputTextDelta` | 文字增量，发给 UI，顺便处理 plan 标记之类的内部格式 |
 | `ToolCallInputDelta` | 工具参数的增量，比如让文件改动边生成边显示 |
 | `ReasoningSummaryDelta` 等推理事件 | 推理内容的增量或摘要，发哪种看功能开关 |
-| `OutputItemDone` | 一条输出完整了，写进历史。消息就通知 UI 完成，工具调用就交给工具执行。这时邮箱里有消息的话，可能提前结束这次响应 |
+| `OutputItemDone` | 一条输出完整了，写进历史。消息就通知 UI 完成，工具调用就交给工具执行；同步 Post hook 和邮箱 drain 会延后或取消执行。邮箱有消息时，可能提前结束读取或转入 drain |
 | `Completed` | 这次响应结束，带上用量。工具可能还没跑完，模型也可能说还要继续，所以不代表任务结束 |
 | `RateLimits` | 服务端的额度和限流，和用量一起发给客户端 |
 | 模型信息、安全状态等事件 | 实际用的是哪个模型之类的附加信息 |
 
 不读响应之后，还要等已经启动的工具跑完，按顺序记下结果，然后才发 token 用量和文件改动。任务被取消的话，就交给中断流程。
+
+### 模型请求的观察 hook
+
+`PreModelRequest` 和 `PostModelRequest` 包住一次实际的模型请求尝试，重试也会产生新的 hook。Post 事件带 `completed / failed / cancelled` 状态、错误和可用的 token 用量。它们的输出只记录，不作为修改请求或拦截任务的指令（`hooks/src/events/model_request.rs`）。
+
+同步的 `PostModelRequest` 会改变工具执行时序：读流时仍然记录调用、准备结果 future，但工具要等响应结束、Post hook 完成后才派发。异步 Post hook 不阻塞工具。所以下面的“边读流边执行工具”描述的是没有同步 Post hook 的通常路径。
 
 ---
 
@@ -1465,6 +1478,7 @@ sequenceDiagram
 | 规则 | 相关函数 | 说明 |
 |---|---|---|
 | 工具调用项在执行前就入历史 | `record_completed_response_item` | 就算任务中途被取消，历史里也能看到模型调过什么。下次请求前会给缺结果的调用补一条合成输出。 |
+| 同步 Post hook 完成后才派发工具 | `defer_tool_dispatch` | 配了同步 `PostModelRequest` 时，工具等待 hook；邮箱 drain 期间的新调用走取消路径，不执行。 |
 | 结果按提交顺序写入历史 | `FuturesOrdered` | 工具可以并发跑，但结果按模型调用的顺序存，不按谁先跑完。 |
 | 独占工具不能和别的调用同时跑 | `supports_parallel_tool_calls` | 能并行的可以一起跑，要独占的得等别的都结束。比如两个 `exec_command` 可以并发，`apply_patch` 要独占。 |
 
@@ -1750,7 +1764,7 @@ sequenceDiagram
 
 ## 11. steer、邮箱与中断
 
-任务跑着的时候用户补一句“再加个测试”，`steer_input` 只是把它放进 `TurnState.pending_input`，别的什么都不做。要不要因为它再请求一次模型，是 `run_turn` 在这次请求和工具都处理完之后才判断的。
+任务跑着的时候用户补一句“再加个测试”，`steer_input` 把它放进 `TurnState.pending_input` 并通知当前任务。输入在后续边界被写入历史，`run_turn` 再决定是否请求模型；默认开启的即时打断还能提前停止当前采样或唤醒等待，不必等旧响应自然结束（见下文）。
 
 入队之后，`run_turn` 会检查队列，在下一圈把输入取出来。邮箱消息比 steer 多一个投递阶段的限制；中断则是靠取消令牌。
 
@@ -1779,7 +1793,7 @@ needs_follow_up |= output_result.needs_follow_up;
 | 收到可执行的工具调用 | `handle_output_item_done` 将 `output.needs_follow_up` 设为 `true`，随后通过 `|=` 合并 | 需要把工具结果交回模型 |
 | 工具调用解析返回 `RespondToModel` 错误 | 写入可供模型读取的错误结果，同样将 `output.needs_follow_up` 设为 `true` | 让模型看到错误并继续处理 |
 | 收到 `Completed`，且 `end_turn == Some(false)` | 直接将请求内的 `needs_follow_up` 设为 `true` | 模型明确表示还没有结束 |
-| 一条 commentary、partial answer 或 reasoning 输出完成后，发现邮箱有待处理消息 | 提前退出响应读取，返回 `SamplingRequestResult { needs_follow_up: true, ... }` | 让下一次请求能处理新邮件 |
+| 一条 commentary、partial answer 或 reasoning 输出完成后，发现邮箱有待处理消息，且未开启延后抢占 | 普通路径提前返回；Lite 有中断通道时先 drain 响应，再以 `needs_follow_up: true` 返回 | 让下一次请求能处理新邮件，同时保留 Lite 的响应续接信息 |
 
 `end_turn` 是 `Some(true)` 或 `None` 时，不会把已经置上的标记清掉。响应读完后还要等工具跑完，结果才返回 `run_turn`。
 
@@ -1899,6 +1913,8 @@ assistant 消息的 phase 有三种（`MessagePhase`）：`Commentary` 是过程
 
 - 用户下次发消息开新一轮时，`start_task` 先把邮箱里的邮件取出来并进这一轮（§5）。
 - 如果邮件带 `trigger_turn = true`，会话一空闲，`maybe_start_turn_for_pending_work`（`tasks/mod.rs:457`）就自动开一轮去处理它，不用等用户。
+
+还有一个默认关闭的实验开关 `wake_on_agent_messages`：开启后，符合调度条件的普通 agent 邮件也能唤醒已结束一轮的空闲根会话，不必显式带 `trigger_turn`。这是邮件触发的新工作，不是重启后自动恢复上一次执行。通知式上下文注入现在也会作为 `InputQueueActivity::Steer` 唤醒正在等待或 sleep 的任务；被动追加的上下文仍不唤醒。
 
 ### 中断的传播路径
 
@@ -2136,7 +2152,7 @@ sequenceDiagram
 四个时机的压缩，不管走本地还是远程 V2，都调用 `build_compaction_replacement_history(sess, step_context, world_state, compacted)`：
 
 1. 用传进来的 `StepContext` 和 `WorldState` 渲染一遍完整上下文，同时得到对应的 `WorldStateSnapshot`。
-2. 把渲染结果按位置分两类。大部分是普通上下文，合并后插到最后一条真实用户消息前面；没有用户消息就插到摘要前面。摘要始终是最后一条。少数标成 `Placement::Prefix` 的放到整份历史最前面，目前只有开了 `incremental_tools` 时的工具定义和 base instructions（§7）。
+2. 把渲染结果按位置分两类。大部分是普通上下文，合并后插到最后一条真实用户消息前面；没有用户消息就插到摘要前面。摘要始终是最后一条。少数标成 `Placement::Prefix` 的放到整份历史最前面，目前只有 Lite 增量模式下的工具定义和 base instructions（§6）。
 3. `replace_compacted_history` 必须传 `TurnContextItem` 和 `WorldStateSnapshot`。所以压缩完锚点和 diff 基线都是现成的，下一轮直接算 diff。
 
 `TokenBudget` 分支只重置窗口、不生成替换历史，不走这条路。

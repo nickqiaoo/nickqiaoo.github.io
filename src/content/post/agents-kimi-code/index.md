@@ -1,12 +1,14 @@
 ---
 title: "kimi-code 源码解析"
 description: ""
-updatedDate: "2026-10-16"
+updatedDate: "2026-10-23"
 publishDate: "2026-10-08"
 tags: ["kimi", "agent"]
 series: agents
 seriesOrder: 4
 ---
+
+> 本文核对至 2026-10-23 的 [`MoonshotAI/kimi-code` main，`759958afd`](https://github.com/MoonshotAI/kimi-code/tree/759958afd)。默认行为和实验开关以这份源码为准，已安装的发行版可能不同。
 
 > 源码路径省略前缀 `packages/agent-core-v2/src/`，比如 `agent/loop/loopService.ts` 指 `packages/agent-core-v2/src/agent/loop/loopService.ts`。
 >
@@ -352,6 +354,7 @@ classDiagram
     pendingMachineTurn?
     quiescenceDepth: number
     engine: MachineEngine
+    runGate: ISessionRunGate
     +submit(entry, options) id
     +steer(promptIds)
     +notify(note) handle
@@ -391,6 +394,7 @@ classDiagram
   AgentLoopService *-- ActiveTurn : active
   AgentLoopService --> MachineEngine
   AgentPromptChannel --> AgentLoopService
+  AgentLoopService --> SessionRunGateService : submit 前检查占用和历史
 ```
 
 ### 5.1 两种“轮次”
@@ -421,6 +425,14 @@ agent 状态机在 `idle.gating` 里调用 `runPromptGate`。它跑 `onBeforeSub
 
 客户端调用的是 `AgentPromptChannel`（`agent/loop/promptChannel.ts`）。
 
+### 5.4 提交前的跨进程会话检查
+
+`submit()` 在把输入交给状态机之前先调用 `SessionRunGateService.begin()`（`session/sessionActivity/sessionRunGateService.ts`）。它先通过 `ISessionLockService.hold(sessionId)` 占住会话，再检查当前已加载 agent 的 wire 是否被外部修改。其他进程正在占用时返回 `SESSION_OCCUPIED`；拿到锁但发现磁盘历史已变化时，释放锁并报 `SESSION_STALE`，要求先 reload。这样两个客户端不能在各自的旧内存历史上继续追加。
+
+锁是会话级的，主 agent 和子 agent 共用这次占用。会话不忙后延迟 3 秒，flush 日志，再确认仍空闲才释放；恢复、分叉等操作还可以用 lease 延长占用。手动压缩和撤销也经过 run gate，所以这不只是发消息入口上的检查。
+
+本地实现用数据目录下的 `locks/sessions` 锁文件，记录 token、pid、主机和客户端身份；会回收确认已退出或成为 zombie 的进程留下的占用，也提供接管已退出进程遗留锁的入口。它是协调本地客户端的机制：`KIMI_CODE_SESSION_LOCK=false` 可以关闭，锁文件系统不可用时也会记日志后继续，不能把它当成无条件的写入隔离保证。
+
 ---
 
 ## 6. 一次 prompt 的完整流程
@@ -432,6 +444,7 @@ sequenceDiagram
   autonumber
   participant Client as 客户端
   participant LS as AgentLoopService
+  participant Gate as SessionRunGate
   participant AM as agent 状态机
   participant TM as turn 状态机
   participant Req as MachineRequester
@@ -439,6 +452,8 @@ sequenceDiagram
   participant Ctx as 上下文内存
 
   Client->>LS: submit(entry)
+  LS->>Gate: begin：占用会话，检查 wire 外部修改
+  Gate-->>LS: 通过；占用或历史过时则抛错
   LS->>AM: input.submit
   AM->>LS: runPromptGate
   LS-->>AM: 放行
@@ -829,7 +844,7 @@ assistant 消息和工具消息不是整条写，而是按循环片段写（`age
 
 ### 10.2 写和读
 
-`EventDispatcherService`（`state/eventDispatcherService.ts`，Agent 作用域）是所有持久化状态的唯一写入口：
+`EventDispatcherService`（`state/eventDispatcherService.ts`，Agent 作用域）负责正常运行时持久化状态的事件派发：
 
 1. 对所有关心这个事件的状态，用 immer 算出新状态。
 2. 事件是 durable 就 `wire.appendRecord(...)`。
@@ -839,13 +854,21 @@ assistant 消息和工具消息不是整条写，而是按循环片段写（`age
 
 恢复（`restore()`）时，先重放可撤销的状态（比如上下文内存，沿当前分支），再重放其余状态，然后把外置的图片等大块内容换回来，最后跑 `onDidRestore` 钩子。重放时不写盘、不发事件总线，所以恢复只重建内存状态，不会重新调模型或执行工具。
 
-读文件时还有三层保护：没有元数据行就当最老的格式迁移；版本旧就逐条迁移并整个文件重写；最后一行被截断（写到一半崩了）就修复，修复失败则之后的写入全部拒绝。
+大历史重放有一条优化路径：声明了 `mutableReplay` 的状态，在静默恢复阶段可以原地折叠，全部重放完再统一冻结并发布，避免每条事件都复制增长中的消息数组。它不支持检查点式撤销；正常运行时的事件派发仍走不可变更新。引擎事件存储也会先批量折叠恢复记录，再发布恢复结果。
+
+wire 写入还受会话锁保护：`WireService` 给 append log 绑定 write guard，在写日志时尝试占用会话。读文件时，没有元数据行就按最老格式迁移；版本旧就迁移并重写；尾行被截断就修复。但迁移重写和尾部修复也必须拿到锁、确认文件没有外部修改，暂时做不了就记成 pending，之后追加前先完成。修复或迁移写入失败时，不继续往不一致的日志后面追加。
 
 `prompt.submitted` 和 `prompt.queued` 不写盘，引擎的排队也只在内存里。所以进程重启后，还没开始跑的排队输入会丢。
 
 ### 10.3 撤销：追加分支，不删行
 
 撤销最近几轮（`agent/undo/undoService.ts`）的过程：先拿静默锁（没有活动轮次、没有待办时才能拿到，拿到就暂停引擎），追加一条 `agent.switched` 分支记录，然后整个重放一遍。这次沿新分支走，被撤销的轮次就不在了；再按新分支重建引擎的存储。文件里的行不会删，撤销掉的内容还在磁盘上。
+
+### 10.4 服务端的空闲会话回收
+
+kap-server 的 `SessionIdleReaper`（`packages/kap-server/src/services/sessionIdleReaper.ts`）默认每分钟检查一次，尝试关闭空闲超过 30 分钟的已加载会话。`KIMI_CODE_SESSION_IDLE_RECLAIM_MS` 可以改这个时间，设为 `0` 就关闭回收。
+
+是否能关由引擎的 `closeIfIdle()` 再判断，并用会话锁 lease 保护关闭过程。回收释放的是内存里的会话和服务，不删除 wire 等持久化记录，之后仍可恢复。它与 §5.4 的 3 秒释放占用不同：释放锁让其他客户端能使用会话，空闲回收则释放当前服务端的运行资源。
 
 ---
 
@@ -885,6 +908,7 @@ assistant 消息和工具消息不是整条写，而是按循环片段写（`age
 5. 模型配置按轮固定，工具和消息每步重算。
 6. 错误分层处理：请求层处理只需重发的错误，上层处理需要改上下文的错误。
 7. 撤销是追加分支记录而不是删行，再加上 Context Recovery 脚注，模型可以自己去日志里查被压缩或撤销掉的原文。
+8. 在状态机外先做跨进程会话占用和历史过时检查，日志写入也有 guard；长历史则用静默批量重放减少恢复开销。
 
 ### 11.4 问题
 

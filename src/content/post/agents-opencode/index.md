@@ -1,12 +1,14 @@
 ---
 title: "opencode 源码解析"
 description: ""
-updatedDate: "2026-10-16"
+updatedDate: "2026-10-23"
 publishDate: "2026-09-14"
 tags: ["opencode", "agent"]
 series: agents
 seriesOrder: 2
 ---
+
+> 本文核对至 2026-10-23 的 [`sst/opencode` dev，`6a5973d263`](https://github.com/sst/opencode/tree/6a5973d263)。默认行为和实验开关以这份源码为准，已安装的发行版可能不同。
 
 > 下文的源码路径都相对 `packages/`。
 
@@ -624,7 +626,7 @@ return {
 
 `context.load` 调 `SessionHistory.entriesForRunner`，在一个事务里读出两样东西：指令基线（`InstructionState.initial` 渲染出的文本），和最近一次完成的压缩之后的所有消息（含压缩消息本身）。
 
-“最近一次压缩”要看压缩的种类：本地生成的摘要对任何模型都有效；provider 原生压缩生成的加密窗口只能在同一个服务端上回放（§10）。所以按当前模型的“来源”（provenance）挑，换了模型就跳过不兼容的原生压缩，往前找本地摘要，或者干脆用原始记录。
+“最近一次压缩”要看压缩的种类：本地生成的文本摘要可以给其他模型读；provider 原生压缩的替换窗口则按当前模型的 `providerID + id` 挑，且 `native.messages` 必须能解码。模型不匹配或窗口无效时，跳过这次原生压缩，往前找可用的压缩或原始记录（§10）。这里已不再按 endpoint、route 等信息组成的 provenance 判断，不能把它理解成完整的部署兼容检查。
 
 会话消息再由 `toLLMMessages`（`runner/to-llm-message.ts`）转成模型消息：
 
@@ -640,6 +642,8 @@ return {
 | `location-switched` | user 消息：“工作目录改成了……” |
 | `agent-switched` / `idle` | 不进上下文 |
 
+新写入的本地摘要用 `metadata.keepID` 指向保留原文的第一条消息。`session/history.ts` 的 `withRecentText` 读取那条消息到压缩之前的记录，在内存中重建 `metadata.recent`，再交给 `toLLMMessages`。旧记录里直接保存的 recent 文本仍能读取。
+
 ### 6.4 `baseTranscript`：system 部分
 
 ```ts
@@ -647,7 +651,7 @@ system: [
   input.agent.system ? input.agent.system : SessionSystemPrompt.make(toolNames),  // agent 自带的提示词，或者默认提示词
   input.initial,                                                                   // 指令基线
 ].filter((part) => part.length > 0).map(SystemPart.make),
-messages: toLLMMessages(input.messages, input.model.ref, providerMetadataKey),
+messages: toLLMMessages(input.messages, input.model.ref),
 ```
 
 所以 system 只有两块：agent 的提示词和指令基线。后续的指令变化都在 `messages` 里。
@@ -667,7 +671,7 @@ messages: toLLMMessages(input.messages, input.model.ref, providerMetadataKey),
 |---|---|
 | `model` | 会话选的模型；`model.request` 钩子改了 baseURL 时换路由 |
 | `system` | §6.4 的两块，经过 `session.context` 钩子 |
-| `messages` | §6.3 的历史，经过钩子；模型不支持的媒体换成一句错误说明；图片总量超过 25 MiB 时从前往后删图，删到 15 MiB 以下，并写明“这张图被删了，别凭记忆描述它” |
+| `messages` | §6.3 的历史，经过钩子；模型不支持的媒体换成一句错误说明；图片按历史顺序累计，每次超过 25 MiB 就从最旧图片起裁到 15 MiB 以下。下次请求重放同一规则，新增图片没再次越线时保留同一个裁剪边界，避免不断改写提示缓存前缀 |
 | `tools` | 工具快照的定义（§8），经过钩子 |
 | `toolChoice` | 平时不设；到步数上限时为 `"none"` |
 | `generation` / `providerOptions` | 钩子给的 options 里，`maxTokens`、`temperature` 这类通用字段放 `generation`，其他放 `providerOptions` |
@@ -808,7 +812,7 @@ classDiagram
 
 ### 7.3 重试策略
 
-`runner/retry.ts`：
+`runner/retry.ts` 调共用的 `model-retry.ts` 策略，再交给会话的 `session.retry` 钩子；压缩和其他缓冲式生成也能复用同一套退避规则：
 
 | 项 | 值 |
 |---|---|
@@ -1015,13 +1019,13 @@ return event.effect
 | `overflow` | `attempt` 里 | 服务端在输出开始前就说“太长”。一个 Step 只给一次机会；第二次溢出、已经有输出后溢出、关了自动压缩时溢出，都算失败 |
 | `manual` | `advanceToStep` 处理收件箱的压缩控制项 | 用户主动 `/compact`。关了自动压缩也照样能做 |
 
-阈值（`calculateCeiling`）：取模型的输入上限，没有就用上下文窗口。配置了 `buffer` 就是 `窗口 − buffer`；否则留 10% 和 16000 中较大的那个（窗口小于 32000 时只留 10%）。窗口未知时自动压缩不触发，只有服务端拒绝才会触发溢出压缩。
+阈值（`calculateCeiling`）：取模型的输入上限，没有就用上下文窗口。配置了 `buffer` 就是 `窗口 − buffer`；否则留 15% 和 16000 中较大的那个（窗口小于 32000 时只留 15%）。窗口未知时自动压缩不触发，只有服务端拒绝才会触发溢出压缩。
 
-默认设置：`auto: true`，`keep: 15000`（摘要旁边原样保留最近约 15000 token 的对话）。
+默认设置：`auto: true`，`keep: 15000`（摘要旁边原样保留最近约 15000 token 的对话），`precompute: false`（不提前生成后台摘要，见 §10.3）。
 
 溢出压缩时，既然服务端已经拒绝了，说明估算偏低，第一次就把目标定在估算值的 70%；如果压缩请求本身也太长，再依次降到 50%、35%。
 
-压缩请求的输出上限要按实际发出去的请求来算。拼请求时按目标大小留了输出空间，但对话已经压不动时，真正发出去的请求可能比目标大，输入加输出就超过了窗口。每次发压缩请求前都按这次请求的估算大小重新算一遍输出上限，只往小调。
+压缩请求和普通请求共用模型输出上限，不再单独把摘要封顶为 32000 token。发出前，`fitOutput` 再按实际请求大小收窄输出空间，同时避免估算误差把摘要预算挤得过小：把 32000 token 作为保底目标，但仍受模型上限、原请求上限和实际剩余窗口约束。这不是摘要的总上限，自动压缩的 15% 预留也与它分开计算。
 
 ### 10.2 两种压缩方式
 
@@ -1029,8 +1033,8 @@ return event.effect
 |---|---|---|
 | 条件 | 模型没声明原生压缩 | 模型配置 `compaction.type = "native"` |
 | 谁来做 | `compaction` agent（可以配一个便宜的模型） | 服务端自己 |
-| 结果 | 一段按模板写的摘要（`text`）+ 最近 `keep` token 原文（`recent`） | 一个加密的压缩窗口，存在 `providerContext` 里 |
-| 以后怎么用 | 一条 user 消息：`<conversation-checkpoint><summary>…</summary><recent-context>…</recent-context></conversation-checkpoint>` | 原样回放给同一个服务端；换了服务端就不能用，退回原始记录 |
+| 结果 | 摘要存在 `summary`，`metadata.keepID` 指向保留原文的起点；生成函数内部返回摘要字段 `text` | 替换窗口存在 `native.messages`，里面是可解码的模型消息，可能包含 provider 的不透明压缩内容 |
+| 以后怎么用 | 按 keepID 重建 recent 文本，再组成一条 user 消息：`<conversation-checkpoint><summary>…</summary><recent-context>…</recent-context></conversation-checkpoint>` | `providerID + model.id` 相同且窗口有效时回放；否则往前找兼容历史。旧 `providerContext` 记录通过兼容转换读取 |
 
 本地摘要再次压缩时，会把上一次的摘要也作为输入，生成覆盖全部内容的新摘要：
 
@@ -1041,7 +1045,17 @@ return event.effect
 
 模型的回复不符合模板时，会追加一句提醒再试一次；还是不行就算压缩失败。
 
+生成摘要时，优先把当前完整对话（包括随后要原样保留的尾部）连同摘要提示发给模型，让请求前缀尽量和刚才的正常请求一致，复用 provider 的提示缓存。窗口装不下时，才退回只发送保留尾部之前的历史，并按预算缩减。再次压缩时，上一份摘要和之后的对话共同生成新摘要；原文尾部用消息引用保留，不必再复制一份进压缩记录。
+
 压缩不会删除任何原始记录。读历史时从最近一次完成的压缩开始读（§6.3），之前的消息还在库里，界面照样能翻看。
+
+### 10.3 提前生成后台摘要（实验，默认关闭）
+
+配置 `experimental.precompute_compaction: true` 后，`precompute()` 可以在真正需要压缩之前起一个后台摘要任务。它要求自动压缩开启、使用本地摘要、窗口已知，估算上下文达到压缩阈值的 85%，且作为锚点的实测输入至少 64000 token。满足条件后，摘要覆盖锚点回答之前的前缀，最新回答及其后的内容留到切换时原样保留。
+
+摘要先放在内存里，不立即改变模型上下文；提前换进去会破坏仍可复用的缓存前缀。真正压缩时，再检查模型、对话起点、保留段和尾部大小是否仍匹配：能用就采用，尚未完成就等它；不能用就取消并按正常流程重新摘要。同一段有效历史里连续两次后台摘要失败后，下一次压缩之前不再启动新的预计算。
+
+后台摘要不向界面推流式 delta，但每次请求完成时仍发布 `UsageRecorded`，计入会话用量；被采用后，其累计用量还会显示在那条压缩消息上。即使摘要最终没用上，请求也已经消耗了 token，所以这个开关默认关闭。
 
 ---
 
@@ -1177,7 +1191,9 @@ Instance.node.replace(
 )
 ```
 
-`map` 是一个 `LayerMap`（按 key 懒建、缓存的 layer 集合），key 是会话的 `location`（目录 + 工作区）。第一次用到某个目录时才建那套服务，之后一直缓存。`SessionExecution.drain` 里的 `instances.provide(session)`（§4.2）就是从这里取的。
+`map` 是一个 `LayerMap`（按 key 懒建、缓存的 layer 集合），key 是会话的 `location`（目录 + 工作区）。第一次用到某个目录时才建那套服务，后续复用。`SessionExecution.drain` 里的 `instances.provide(session)`（§4.2）就是从这里取的。
+
+`LayerMap` 自己的空闲 TTL 是无限，但进程级的 `LocationActivity` 会另外回收长期不活跃的目录服务，默认 60 分钟，每分钟检查一次。`experimental.location_idle_timeout` 可以按目录覆盖，设为 `false` 就不回收。正在执行的会话、等待交互的调用和后台任务会保护对应目录，不能只因为一段时间没发事件就把服务拆掉。
 
 配置变了要重载时，`LocationServiceMap.reload` 让所有目录的缓存失效并立即重建。正在跑的 runner 会看到 `LocationLifecycle.isClosed()` 为真，返回 `Reloaded`，由 `SessionExecution` 用新的那套服务接着跑（§5.3 第 1 步）。
 
@@ -1227,7 +1243,7 @@ core 把它包成一个叫 `execute` 的工具（`core/src/codemode/tool.ts`）�
 
 ### 13.4 回退和分叉
 
-- **回退**分两步。先 `revert.stage`：用工作区快照把文件恢复到那条消息时的样子（也可以只回退对话、不动文件），并记下回退前的快照，这时还能 `revert.clear` 撤销，把文件恢复回去。下一次提交新输入时才 `commit`：删掉那条消息之后的对话记录，清空指令状态，下一步重新建立基线。
+- **回退**分两步。先 `revert.stage`：用工作区快照把文件恢复到那条消息时的样子（也可以只回退对话、不动文件），并记下回退前的快照，这时还能 `revert.clear` 撤销，把文件恢复回去。下一次提交新输入时才 `commit`：删掉回退边界起的对话记录，并调用 `InstructionState.rewind`。如果保留下来的历史仍覆盖当前指令基线，就继续复用；只有被删掉的部分涉及指令更新或纪元起点时，才清掉状态、下一步重新建立基线。这样普通回退不会无故破坏提示缓存。
 - **分叉**（`session.fork`）从某条消息处复制出一个新会话，复制到那里为止的消息，指令基线直接用父会话最新的值。
 
 ### 13.5 从 v1 迁移

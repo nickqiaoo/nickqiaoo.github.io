@@ -1,12 +1,14 @@
 ---
 title: "pi-agent 源码解析"
 description: ""
-updatedDate: "2026-10-16"
+updatedDate: "2026-10-23"
 publishDate: "2026-09-13"
 tags: ["pi", "agent"]
 series: agents
 seriesOrder: 1
 ---
+
+> 本文核对至 2026-10-23 的 [`pi-mono` main，`74f468640`](https://github.com/badlogic/pi-mono/tree/74f468640)。默认行为和实验包 API 以这份源码为准，已安装的发行版可能不同。
 
 ## 1. 核心包与依赖
 
@@ -31,7 +33,7 @@ graph LR
 | `@earendil-works/pi-codemode` / `pi-mcp` | `packages/codemode`、`packages/mcp` | 让模型写 JS 脚本批量调工具；MCP 客户端。coding-agent 用它们做了两个内置扩展 | §4.4 |
 | `@earendil-works/pi-durable` | `packages/durable` | 把会话、模型调用、工具调用都先写进存储再往下走的 harness，进程死了能接着跑。还是实验性的 | §13 |
 | `@earendil-works/pi-env` | `packages/env` | 给 durable 用的远程执行环境：工具通过 SSH 在另一台机器上跑 | §13.5 |
-| `@earendil-works/chord` | `packages/chord` | 跨进程的对象运行时：契约、对象、可复制状态、热重载，只依赖 TypeBox | §14 |
+| `@earendil-works/chord` | `packages/chord` | 跨进程的对象运行时：契约、对象、可复制状态、热重载，以及 SQLite 和遥测存储；依赖 TypeBox、pi-telemetry | §14 |
 
 `pi-ai`封装了对各个模型厂商的调用，`pi-agent-core`是Agent最核心的事件循环逻辑，是我们需要重点学习的部分，`pi-coding-agent`是基于core封装的完整产品。如果我们想要做自己的 Coding Agent，那么就可以使用 `pi-ai` 和 `pi-agent-core`。
 
@@ -586,7 +588,7 @@ classDiagram
     -_checkCompaction(msg) boolean
     -_runAutoCompaction(reason, willRetry) boolean
     -_isRetryableError(msg) / _prepareRetry(msg)
-    -_omitRecoveryAttempt(msg, toolResults)
+    -_omitRecoveryAttempt(msg)
     -_installAgentToolHooks()
     -_installAgentNextTurnRefresh()
     -_installAgentRequestProjection()
@@ -1314,7 +1316,7 @@ sequenceDiagram
   AS->>ER: bindCore(actions, state, providers)
   AS->>AS: _refreshToolRegistry() → setActiveToolsByName() → _rebuildSystemPrompt()
   AS->>AG: agent.state.tools = [...]；提示词只算出 _baseSystemPromptOptions，等第一次 prompt 时才写成 system 消息
-  AS->>AS: 恢复的会话且用默认工具集：_restoreToolsFromTranscript(modifiers) 按记录里最后声明的工具恢复激活列表
+  AS->>AS: 恢复的会话且用默认工具集：重放分支工具增删，合入后来注册的扩展工具，再应用 modifiers
   SDK-->>M: { session, extensionsResult }
   M->>Mode: runRpcMode(runtime) / new InteractiveMode(runtime).run() / runPrintMode(runtime)
   Mode->>AS: bindExtensions({ uiContext, mode, commandContextActions, ... })
@@ -1360,7 +1362,7 @@ sequenceDiagram
 6. `_installAgentBoundaryHooks()`：给 `agent.finishTurn` 赋值，发 `turn_end` 边界事件（§4.3）
 7. `_installHiddenDeclarationsProjection()` 和 `_installAgentForcedPromptProjection()`：在 `agent.transformContext` 外面各套一层。前者把 `prepareLoadout` 要求隐藏的工具声明从请求里去掉；后者在扩展用 `before_agent_start` 整个替换了提示词时，把所有 system 消息折成一条带新提示词的，只影响这次请求，不写进记录
 8. `_buildRuntime({ activeToolNames, includeAllExtensionTools: true })`
-9. 用的是默认工具集（没有用 `--tools` 白名单点名工具）时，`_restoreToolsFromTranscript(modifiers)` 按会话记录里最后声明的工具恢复激活列表，再套用命令行里 `--tools +name` / `-name` 这种增减项。
+9. 用的是默认工具集（没有用 `--tools` 白名单点名工具）时，`_restoreToolsFromTranscript(modifiers)` 重放当前分支的所有 system 工具增删记录，包括压缩之前的记录。历史明确移除的工具保持关闭；历史从未提到、后来才注册且默认激活的扩展工具会补进来；内置工具仍遵守 `defaultTools`。最后再套用命令行的 `--tools +name` / `-name`。MCP 等尚未完成注册的已记录工具先记在 pending 集合，注册后再激活。
 
 每个 `_install*` 都先把 `Agent` 上原来的回调存下来，新回调里再调用它，所以多层安装可以叠加，SDK 调用方自己设的回调也不会被覆盖。
 
@@ -1789,7 +1791,7 @@ sequenceDiagram
 
 `_prepareRetry` 做的事：计数、发 `auto_retry_start`、调 `_omitRecoveryAttempt` 把失败的那条 assistant 消息“从模型上下文里拿掉”、可中断地睡眠、返回 `true`。然后 `agent.continue()` 看到最后一条是 user 或 toolResult，走 `runContinuation`。
 
-`_omitRecoveryAttempt` 往会话里追加一条 `context_edit(targetId, null)`，再用新的投影刷新 `agent.state.messages`。原始消息还在文件里，UI 能看到失败记录，但之后的请求和恢复都不会再带上它。消息对象和条目 id 的对应关系靠 `_entryIdsByMessage` 找。
+`_omitRecoveryAttempt(message)` 从当前投影里找到这条失败回答，按 tool call id 收集它后面、下一条 assistant 之前的配对工具结果，对这些条目逐个追加 `context_edit(targetId, null)`，再刷新 `agent.state.messages`。这样恢复旧会话后也不会只删调用、留下孤立结果。原始条目还在文件里，UI 能看到失败记录，但之后的请求和恢复都不会再带上它们。消息对象和条目 id 的对应关系靠 `_entryIdsByMessage` 找。
 
 失败的那次回答还会记进 `_failedResponse`，下一次请求如果用的是虚拟模型，路由时会知道“上一次失败了”（`reason: "retry"`），可以换一个实际模型。
 
@@ -1821,10 +1823,12 @@ sequenceDiagram
 | 函数 | 做什么 |
 |---|---|
 | `prepareCompaction(pathEntries, settings)` | 找上一次压缩的位置当边界；`findCutPoint` 从最新往回累加估算 token，累到 `keepRecentTokens`（默认 20000）就切。切点可以是 user 或 assistant 消息，不会是 toolResult。切在一轮中间时 `isSplitTurn = true`，那一轮的前半段单独摘要。如果最后一批工具结果本身就超过了保留预算，就退到最近一个安全的 assistant 边界再切，保证更早的历史还能被压掉。同时用 `extractFileOpsFromMessage`（`utils.ts`）从 assistant 的 toolCall 参数里抽出 read/write/edit 的路径 |
-| `compact(preparation, model, apiKey, ...)` | `generateSummaryWithUsage`（外面包了 `retryAssistantCall`，流断了会按重试设置再试）：把要压的消息 `convertToLlm` 后 `serializeConversation` 成文本，包进 `<conversation>` 标签，有上次摘要就再包一个 `<previous-summary>`，加上 `SUMMARIZATION_PROMPT` 或 `UPDATE_SUMMARIZATION_PROMPT` 发给模型。`maxTokens = min(0.8 * reserveTokens, model.maxTokens)`。摘要末尾追加 `formatFileOperations(readFiles, modifiedFiles)` |
+| `compact(preparation, model, apiKey, ...)` | `generateSummaryWithUsage`（外面包了 `retryAssistantCall`，流断了会按重试设置再试）：把要压的消息 `convertToLlm` 后 `serializeConversation` 成文本，包进 `<conversation>` 标签，有上次摘要就再包一个 `<previous-summary>`，加上 `SUMMARIZATION_PROMPT` 或 `UPDATE_SUMMARIZATION_PROMPT` 发给模型。请求不显式指定 `maxTokens`，由 provider 层按模型上限和实际剩余窗口处理。摘要末尾追加 `formatFileOperations(readFiles, modifiedFiles)` |
 | 结果 | `{ summary, firstKeptEntryId, tokensBefore, usage, details: { readFiles, modifiedFiles } }` |
 
 摘要末尾附上文件清单这个做法很实用，压缩之后模型最容易忘掉的就是自己改过哪些文件。
+
+`reserveTokens` 现在只决定何时触发压缩，不再决定摘要能输出多少。原来的 `0.8 × reserveTokens` 摘要上限、`0.5 × reserveTokens` 轮次前缀摘要上限，以及分支摘要的固定 4096 上限都已移除。原因是有些模型把思考和正文算在同一个输出预算里，固定的小上限会让思考耗尽空间，摘要正文还没写完就被截断。
 
 ---
 
@@ -1874,11 +1878,11 @@ TUI 默认是全屏模式（设置项 `tuiMode` 默认 `"fullscreen"`）：`TuiA
 
 主循环的状态全在内存里：`runLoop` 的局部变量记着跑到第几轮、有没有工具没跑完。进程一退出，这些就没了。会话文件只记了已经完成的消息，没记“正在干什么”。
 
-目前主产品 `pi` 命令（`AgentSession`）**没有**用它。现在公开仓库里依赖 durable 的只有 `pi-env`（§13.5）；从 chord 的文档看，它真正的使用者是私有仓库里的 p2 应用：p2 的会话 worker 把 durable 的 Harness 作为一个 chord 对象提供出来（§14.4）。所以第一次读同样可以跳过这一节。
+目前主产品 `pi` 命令（`AgentSession`）**没有**用它。仓库里有 `pi-env` 对接远程执行环境（§13.5），以及 Durable Object 等宿主示例和测试。chord 的文档还以私有 p2 应用说明会话 worker 如何把 Harness 作为对象提供出来（§14.4）；这里能核对的是公开接口和示例，不能据此确认私有应用的部署状态。所以第一次读同样可以跳过这一节。
 
 ### 13.1 核心概念
 
-durable 的原则只有一条：**任何东西在显示出来之前，都已经提交到存储里了**。用户输入、模型的每个流式片段、工具调用的意图、工具结果，都是先写进去再往下走。进程在任何地方被杀掉，重新打开存储就能从断的地方接着跑。
+durable 的原则只有一条：**对外观察到的状态，先提交到存储里**。用户输入、流式进展、工具调用的意图、工具结果，都走这条提交线。进程被杀掉后，重新打开存储可以恢复已提交的进展，再按任务的恢复策略续跑；副作用工具能不能重跑要看 replay 声明，连续崩溃的任务也会被停驻（§13.6）。
 
 | 概念 | 是什么 | 对应主循环里的什么 |
 |---|---|---|
@@ -1886,7 +1890,7 @@ durable 的原则只有一条：**任何东西在显示出来之前，都已经�
 | `Conversation` | 一份对话记录。`root()` 是根对话，还可以新建、fork | 一个会话分支 |
 | Entry | 对话里不可变的一条记录：`pi.user`、`pi.assistant`、`pi.tool-result`、`pi.system`（提示词或工具变化）、`pi.reset`（开始新上下文）、`pi.compaction`，也可以自定义 | `SessionEntry` |
 | Commit | 一次原子写：`conversation.commit(tx => …)` 里追加条目、改文档、建任务，要么全成功要么全不写 | 无（主循环每条消息单独追加） |
-| Document | 和对话记录放在一起的类型化 JSON 状态，由 chord 管理。内置的有 `pi.agent`（模型、扩展等选择）、`pi.provider`（提示缓存用的会话 id）、`pi.live`（正在进行的生成和工具）、`pi.inbox`（排队的输入）、`pi.usage`（花费） | `Agent` 的内存状态、两个队列 |
+| Document | 和对话记录放在一起的类型化 JSON 状态，由 durable 持久化，用 chord 的增量类型表示变化。内置的有 `pi.agent`（模型、扩展等选择）、`pi.provider`（提示缓存用的会话 id）、`pi.live`（正在进行的生成和工具）、`pi.inbox`（排队的输入）、`pi.usage`（花费） | `Agent` 的内存状态、两个队列 |
 | Task | 一个持久化的状态机，每走一步都存一个检查点（checkpoint），重启后从最后一个检查点继续 | `runLoop` 的局部变量 |
 | Submission | 交给对话的东西：用户输入或者一条要写入的条目，可以等它完成 | `prompt()` / `steer()` / `followUp()` |
 | Extension / Registry | 一组工具、提示词段落、钩子、任务的打包；Registry 是本进程装了哪些扩展，运行中也能改 | coding-agent 的扩展 |
@@ -1900,10 +1904,10 @@ classDiagram
     +open(storage, options, context)$
     +root(context, options) Conversation
     +createConversation(options) Conversation
-    +resume()
+    +resume() / wake()
     +getTask(id) / waitForTask(id)
-    +abortTask(id) / abortSubmission(id)
-    +inspect() / usage() / taskGraph()
+    +abortTask(id) / abortSubmission(id) / retryTask(id)
+    +inspect() / usage() / watchTaskGraph()
   }
   class Conversation {
     <<interface>>
@@ -1915,7 +1919,7 @@ classDiagram
     +fork(at, options) Conversation
     +context(options) ContextView
     +abort() / waitForIdle()
-    +viewState() / watch()
+    +watch()
   }
   class Submission {
     id
@@ -1939,7 +1943,7 @@ classDiagram
   }
   class Storage {
     <<interface>>
-    MemoryStorage / JSONL / SQLite
+    MemoryStorage / JSONL / SQLite / IndexedDB
   }
   Harness o-- Conversation
   Harness *-- TaskScheduler
@@ -2001,11 +2005,13 @@ sequenceDiagram
 | 运行状态 | 内存里的局部变量 | 每步一个检查点，写进存储 |
 | 排队 | 两个内存队列（steer / followUp） | `pi.inbox` 文档，`whenBusy: "steer"` / 默认跟进 / `"reject"` |
 | 扩展点 | `AgentLoopConfig` 上的匿名回调 + coding-agent 的 41 种事件 | 具名钩子：生成任务的 `beforeRequest` / `afterResponse` / `onYield` / `afterTools`，工具任务的 `beforeTool` / `afterTool`，压缩任务的 `beforeCompact` |
-| 存储 | 一个 JSONL 文件 | `Storage` 接口，自带内存、JSONL、SQLite 三种实现 |
+| 存储 | 一个 JSONL 文件 | `Storage` 接口，自带内存、JSONL、SQLite、IndexedDB 实现 |
 | 多会话 | 一个 `AgentSession` 一棵树 | 一个 Harness 多个 Conversation，可 fork，子 agent 是被工具任务拥有的子对话 |
-| 界面 | 订阅事件流，自己维护显示状态 | `conversation.viewState()` 直接给出可订阅的“结构化视图”，包括流式片段、队列、重试、压缩状态 |
+| 界面 | 订阅事件流，自己维护显示状态 | `conversation.watch(context)` 返回结构化视图的 watch，包括流式片段、队列、重试、压缩状态；任务图用 `watchTaskGraph(context)` |
 
 可以看出，durable 把主循环里很多“隐式的东西”变成了显式的、可持久化的数据：轮次变成任务，队列变成文档，回调变成具名钩子。代价是复杂度高得多，所以标着实验性。
+
+watch 的接口来自 chord 的 `WatchHandle<T>`：`value` 是当前不可变值，`start(async (value, ops, context) => …)` 安装唯一的异步监听器，后续帧串行交付、待交付队列有界；`stop()` 停止观察，`closed` 给出结束原因。旧的 `viewState()`、`taskGraph()` 已移除，不能再把它们当成另一套可选入口。
 
 ### 13.5 工具调用与远程执行
 
@@ -2024,16 +2030,38 @@ durable 的工具调用与执行环境有几块值得看：
 - 压缩可以按模型单独配置（`compaction.modelOverrides`）；阻塞式压缩失败时这次运行直接失败。
 - `pi-env`（`packages/env`）是 durable 的远程执行环境：在远程机器上部署一个 Rust 写的小 daemon（`pi-env`，按 SHA-256 命名、每次启动前校验），通过 SSH 的标准输入输出走一套分帧协议。`RemoteExecutionEnv` 实现了 durable 的 `ExecutionEnv` 接口，所以工具在另一台机器上读写文件、跑命令，而 durable 的 worker、存储、凭据都留在本地。它还支持伪终端（交互式命令）和列目录（`listFiles`）。
 
+### 13.6 睡眠、恢复和宿主接口
+
+任务要等到某个时刻再继续时，用 `TaskRuntime.sleepUntil(until, checkpoint, context)` 提交一个持久化的 `sleeping` 状态，而不是在内存里挂一个长时间的 sleep。生成任务的重试退避、延迟响应轮询也能沿这条路径等待。重启后仍能知道截止时间和该从哪个检查点继续。
+
+`Harness.wake()` 返回 `{ active, at? }`：现在是否有工作需要进程运行，以及最早的未来唤醒时间。默认由运行中的调度器用定时器唤醒；宿主提供 `onWake` 时，Harness 不再替睡眠任务挂定时器，而是通知宿主设置自己的唤醒机制，比如 Cloudflare Durable Object 的 alarm。宿主被唤醒后调用 `resume()`，让到期任务重新进入调度。
+
+任务连续因崩溃、驱逐或重置中断、而没有提交状态进展时，会累计 `restarts`。默认 `restartLimit: 5`，达到上限后停驻为 `blocked / restart_limit`，用 `retryTask(id, context)` 清掉计数再试。正常 `close()` 不计作崩溃，提交了新状态也会清掉连续中断计数。这样坏任务不会在每次打开存储时无限重启。
+
+一次运行失败后，排队输入由 `afterFailedRun` 决定：默认 `keep` 留到下次输入或排队写入再启动；`continue` 接着处理队列；`withdraw` 将它们结算为未回答。`onReport(error, info)` 还会区分整个 session 失败、单个 task 故障或被停驻，宿主不用只靠错误文案猜发生了什么。
+
+### 13.7 存储、只读观察和遥测
+
+`IndexedDbStorage`（`@earendil-works/pi-durable/storage/indexeddb`）让同一套持久化接口也能放进浏览器。SQLite 的通用驱动和迁移能力则移到了 `chord/sqlite`，durable 仍负责自己的表和存储语义。
+
+文档定义必须提供 `checkpointWhen(value, ops, info)`：普通更新是继续存 delta，还是写一份完整 base，由定义自己决定；`info.deltasSinceBase` 告诉它已经积累了多少增量。这里的文档 base 用于控制重放成本，和任务从哪个执行阶段恢复的 checkpoint 是两回事。
+
+`Harness.open` 可以带 `readOnly: true`，读取另一个进程驱动的会话副本。它不修复或重置存活任务，已提交的 `running` 就保持原样；读和 watch 可用，带写入的 commit、`resume()` 等启用调度的调用会拒绝。此时 `wake()` 始终不活跃，也不调用 `onWake`。要执行任务必须重新以可写模式打开。
+
+模型目录和设置都可传函数（`models: () => Models`、`settings: () => …`），使用时读取当前值，宿主换配置不必重开 Harness。请求身份统一交给 pi-ai 的 `ClientIdentity`：Agent 和 Harness 默认附带 pi attribution，嵌入方可以逐字段覆盖，或用 `attribution: null` 去掉归因头。
+
+遥测通过 `pi-telemetry` 贯穿 pi-ai、durable 和 chord 的 `Context.telemetry`。宿主可以观察请求、提交和任务阶段，以及它们之间的 span 关系；chord 另提供 `telemetry-sqlite` 存储。这是运行诊断数据，不能代替会话和任务的恢复记录。
+
 ---
 
 ## 14. chord：跨进程的对象运行时（实验）
 
-`@earendil-works/chord`（`packages/chord`，不含测试约 1.36 万行，只依赖 TypeBox）是 pi 仓库里一个独立的底层包，不依赖任何其他 pi 包。
+`@earendil-works/chord`（`packages/chord`）是 pi 仓库里的底层对象运行时。它依赖 TypeBox 和 `pi-telemetry`，不依赖 agent 或 coding-agent；除了对象、增量状态和 RPC，还提供通用 SQLite 驱动、迁移和遥测存储入口。
 
 公开仓库里：
 
-- `pi-durable` 只用它的 `replicatedState`（可观察、可增量同步的 JSON 状态）来放文档、对话视图、任务图；
-- 完整的对象运行时（host、对象、热重载）在公开仓库里没有应用在用，真正的使用者是 p2。下面的例子都来自 chord 自己的 README 和 `docs/guide.md`。
+- `pi-durable` 使用它的增量操作、`Context`、`WatchHandle` 和 SQLite 能力来实现文档、视图、任务图的持久化与观察；不再以 `replicatedState` 作为这些公开观察接口；
+- 完整的对象运行时（host、对象、热重载）与上面的基础能力要分开看。下面的宿主例子来自 chord 自己的 README 和 `docs/guide.md`，包括文档以 p2 说明的集成方式，不代表 `pi` 命令已采用对象运行时。
 
 ### 14.1 概念
 
