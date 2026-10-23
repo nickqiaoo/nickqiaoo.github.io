@@ -8,12 +8,6 @@ series: agents
 seriesOrder: 4
 ---
 
-> 本文核对至 2026-10-23 的 [`MoonshotAI/kimi-code` main，`759958afd`](https://github.com/MoonshotAI/kimi-code/tree/759958afd)。默认行为和实验开关以这份源码为准，已安装的发行版可能不同。
-
-> 源码路径省略前缀 `packages/agent-core-v2/src/`，比如 `agent/loop/loopService.ts` 指 `packages/agent-core-v2/src/agent/loop/loopService.ts`。
->
-> 有两点先说明。一是 `agent-core-v2`、`kap-server`、`transcript` 三个包不允许写注释，JSDoc 也不行，lint 里的 `scripts/check-no-comments.mjs` 会检查。设计说明只能去 `packages/agent-core-v2/docs/zh/` 下找：`llm.md` 讲 LLM 请求库的设计原则，`event-name.md` 讲状态机里状态、事件的命名规范。二是这个仓库重构很频繁，一天合好几个结构性 PR 很常见，所以下文只引文件和函数名，不引行号。
-
 ## 1. 包结构
 
 ```mermaid

@@ -8,10 +8,6 @@ series: agents
 seriesOrder: 2
 ---
 
-> 本文核对至 2026-10-23 的 [`sst/opencode` dev，`6a5973d263`](https://github.com/sst/opencode/tree/6a5973d263)。默认行为和实验开关以这份源码为准，已安装的发行版可能不同。
-
-> 下文的源码路径都相对 `packages/`。
-
 ## 1. 包与进程模型
 
 ```mermaid

@@ -8,8 +8,6 @@ series: agents
 seriesOrder: 3
 ---
 
-> 本文核对至 2026-10-23 的 [`openai/codex` main，`96a0d8d551`](https://github.com/openai/codex/tree/96a0d8d551)。默认行为和实验开关以这份源码为准，已安装的发行版可能不同。
-
 ## 1. crate 与源码目录
 
 ```mermaid

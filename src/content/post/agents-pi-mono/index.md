@@ -8,8 +8,6 @@ series: agents
 seriesOrder: 1
 ---
 
-> 本文核对至 2026-10-23 的 [`pi-mono` main，`74f468640`](https://github.com/badlogic/pi-mono/tree/74f468640)。默认行为和实验包 API 以这份源码为准，已安装的发行版可能不同。
-
 ## 1. 核心包与依赖
 
 ```mermaid
